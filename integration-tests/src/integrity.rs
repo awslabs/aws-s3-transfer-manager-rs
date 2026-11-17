@@ -107,6 +107,24 @@
 //! through this matrix. Representative algorithms are used: CRC32 for full
 //! object, SHA-256 for the composite case.
 
+mod algorithm_tests;
+mod bulk_tests;
+mod coverage_tests;
+mod download_tests;
+mod liveness_tests;
+mod negative_control_tests;
+mod service_tests;
+pub(crate) mod test_util;
+mod upload_tests;
+
+/// Every case in the two case tables.
+fn table_cases() -> test_util::vocab::Cases {
+    let mut cases = Vec::new();
+    algorithm_tests::cases(&mut cases);
+    download_tests::cases(&mut cases);
+    cases
+}
+
 use crate::assertions::{
     assert_integrity_error, assert_not_validated, assert_same_content, assert_validated,
 };
@@ -336,7 +354,6 @@ async fn multipart_full_object(target: Target) {
             );
             assert_not_validated(&output, NotValidatedReason::Unavailable);
         }
-        #[cfg(e2e_test)]
         BucketKind::Express => {
             assert!(
                 part.checksum_crc32().is_some(),

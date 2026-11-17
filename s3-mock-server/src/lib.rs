@@ -14,6 +14,7 @@ mod bucket;
 mod error;
 mod express;
 mod faults;
+mod journal;
 mod list;
 mod operation;
 mod rename;
@@ -30,6 +31,7 @@ pub use error::Error;
 pub use error::Result;
 pub use error::ServerError;
 pub use faults::{BodyCadence, FaultTarget, FaultType, Occurrence};
+pub use journal::{BodyEnd, BodyEnding, ChecksumScope, HoldEnd, RequestRecord, SentChecksum};
 pub use operation::Operation;
 pub use server::{
     AddObjectRequest, MultipartUploadEntry, ObjectData, ObjectListEntry, S3MockServer,

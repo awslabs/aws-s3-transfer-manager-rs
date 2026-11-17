@@ -342,12 +342,18 @@ jobs:
       - name: Run real-S3 tests
         run: |
           RUSTFLAGS="-Dwarnings --cfg e2e_test" cargo test --locked --test e2e_transfer_test
-          integration_test_args=()
+          integration_test_args=(--)
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             # Mock integration tests start local servers and concurrent
             # transfers. Serial execution avoids exhausting macOS socket
             # buffers while preserving each test's internal concurrency.
-            integration_test_args+=(-- --test-threads 1)
+            integration_test_args+=(--test-threads 1)
+          fi
+          if [[ "$RUNNER_OS" != "Linux" ]]; then
+            # Integrity cases in the `extended` tier cross object shapes
+            # with algorithms, which is the same logic on every platform.
+            # Linux runs them; the other platforms run the rest.
+            integration_test_args+=(--skip ::extended::)
           fi
           RUSTFLAGS="-Dwarnings --cfg e2e_test" \
             cargo test --locked -p integration-tests "${integration_test_args[@]}"
@@ -810,10 +816,19 @@ jobs:
             test_args: --test-threads 1 --nocapture
           # TSan uses the pre-instrumented standard-library target so happens-
           # before edges inside std synchronization remain visible.
+          # The integrity suites skipped here run the same download and upload
+          # paths as `integrity::download_tests` with other objects or
+          # assertions; download_tests keeps the held, cut-short and
+          # out-of-order cases that exercise concurrency.
           - sanitizer: thread
             target: x86_64-unknown-linux-gnutsan
             cfg: s3_tm_tsan
-            test_args: --test-threads 1 --nocapture
+            test_args: >-
+              --test-threads 1 --nocapture
+              --skip integrity::algorithm_tests
+              --skip integrity::upload_tests
+              --skip integrity::service_tests
+              --skip integrity::negative_control_tests
     steps:
       - uses: actions/checkout@v4
       - name: Install llvm
