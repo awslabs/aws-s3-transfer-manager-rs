@@ -207,7 +207,7 @@ fn alive_tasks() -> usize {
 async fn client_construction(store: Store, _work: &Path) -> Result<String, String> {
     let before = alive_tasks();
     let client = store.client(|config| config);
-    let capacity = client.metrics().memory().configured_capacity_bytes();
+    let capacity = client.metrics().memory().capacity_bytes();
     ensure!(
         capacity == AUTO_MEMORY_BYTES,
         "automatic memory capacity is {capacity} bytes, expected {AUTO_MEMORY_BYTES}"

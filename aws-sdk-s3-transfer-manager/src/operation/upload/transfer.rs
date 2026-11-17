@@ -44,9 +44,10 @@ use tracing::Instrument;
 
 use crate::error::{Error, ErrorKind};
 use crate::io::part_reader::{Builder as PartReaderBuilder, PartReadStart};
-use crate::io::{InputStream, PartData};
+use crate::io::{InputStream, PartData, SizeHint};
 use crate::operation::upload::context::{
-    apply_content_length, validate_distinct_part_numbers, validate_part_number, validate_size_hint,
+    apply_content_length, validate_content_md5_for_multipart, validate_distinct_part_numbers,
+    validate_part_checksum_has_strategy, validate_part_number, validate_size_hint,
     AbortMpuProgress, MultipartCompletion, PartPlan, PartReadWake, PartTransferState,
     PendingPartRead, UploadFailure, UploadPartWork, UploadState,
 };
@@ -206,6 +207,16 @@ pub(crate) enum UploadResult {
     Aborted(AbortedUpload),
 }
 
+/// Whether an upload is sent as a multipart upload rather than one PutObject:
+/// `size_hint` has no upper bound, the source is a `PartStream` (`mpu_only`), or
+/// the upper bound is at least `mpu_threshold`.
+fn uses_multipart(size_hint: SizeHint, mpu_only: bool, mpu_threshold: u64) -> bool {
+    match size_hint.upper() {
+        None => true,
+        Some(upper) => mpu_only || upper >= mpu_threshold,
+    }
+}
+
 impl UploadTransfer {
     pub(crate) fn try_new(
         ctx: TransferContext,
@@ -219,6 +230,13 @@ impl UploadTransfer {
         // and at completion hold the body to exactly that many bytes.
         let size_hint = apply_content_length(size_hint, request.content_length())
             .map_err(crate::error::invalid_input)?;
+        if uses_multipart(
+            size_hint,
+            stream.is_mpu_only(),
+            ctx.handle.mpu_threshold_bytes(),
+        ) {
+            validate_content_md5_for_multipart(&request).map_err(crate::error::invalid_input)?;
+        }
         let observability =
             UploadObservability::new(ctx.handle.config.diagnostics().transfer(), size_hint);
 
@@ -562,13 +580,11 @@ impl UploadTransfer {
                         return PollWork::Pending;
                     }
 
-                    let use_mpu = match size_hint.upper() {
-                        None => true,
-                        Some(upper) => {
-                            stream.as_ref().is_some_and(|stream| stream.is_mpu_only())
-                                || upper >= self.inner.ctx.handle.mpu_threshold_bytes()
-                        }
-                    };
+                    let use_mpu = uses_multipart(
+                        *size_hint,
+                        stream.as_ref().is_some_and(|stream| stream.is_mpu_only()),
+                        self.inner.ctx.handle.mpu_threshold_bytes(),
+                    );
                     return if use_mpu {
                         *init_in_flight = true;
                         self.inner.observability.select_mode(UploadMode::Multipart);
@@ -865,7 +881,7 @@ impl UploadTransfer {
                 let state = self.inner.state.lock().expect("lock poisoned");
                 return self.fail(
                     state,
-                    e.into(),
+                    crate::error::service_error(e),
                     FailedRequest::CreateMpu { upload_id: None },
                 );
             }
@@ -1153,6 +1169,13 @@ impl UploadTransfer {
                     FailedRequest::Other,
                 );
             }
+            if let Err(error) = validate_part_checksum_has_strategy(&self.inner.request, &data) {
+                return self.fail(
+                    state,
+                    crate::error::invalid_input(error),
+                    FailedRequest::Other,
+                );
+            }
         }
 
         // A custom source that was blocked is available again. Refill the work withheld while the
@@ -1272,7 +1295,7 @@ impl UploadTransfer {
                         part_number,
                     ))
                     .await
-                    .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
+                    .map_err(|e| crate::retry::GuardError::Inner(crate::error::service_error(e)))
             }
         })
         .instrument(tracing::trace_span!(
@@ -1454,7 +1477,7 @@ impl UploadTransfer {
                         "send-put-object",
                     ))
                     .await
-                    .map_err(|e| crate::retry::GuardError::Inner(crate::error::Error::from(e)))
+                    .map_err(|e| crate::retry::GuardError::Inner(crate::error::service_error(e)))
             }
         })
         .instrument(tracing::trace_span!(
@@ -1623,7 +1646,7 @@ impl UploadTransfer {
         let resp = match response {
             Ok(resp) => resp,
             Err(e) => {
-                let error: Error = e.into();
+                let error = crate::error::service_error(e);
                 // The TM SEP requires a warning with the upload ID and cause.
                 tracing::warn!(
                     target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
@@ -1747,7 +1770,7 @@ impl UploadTransfer {
                     // and its error says nothing about the object.
                     return WorkOutcome::Success { data: None };
                 }
-                let error: Error = e.into();
+                let error = crate::error::service_error(e);
                 tracing::warn!(
                     target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
                     upload_id = %upload_id,

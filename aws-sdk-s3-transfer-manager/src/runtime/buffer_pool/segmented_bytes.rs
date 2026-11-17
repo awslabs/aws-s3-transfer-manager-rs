@@ -846,9 +846,9 @@ mod tests {
         assert_eq!(frozen.len(), 3);
         assert_eq!(frozen.chunk(), b"abc");
         assert_eq!(frozen.segments.len(), 1);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         drop(frozen);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -860,7 +860,7 @@ mod tests {
 
         assert!(frozen.is_empty());
         assert_eq!(frozen.segments.len(), 0);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1161,9 +1161,9 @@ mod tests {
         assert_eq!(combined.segments[0].owners.len(), 2);
         assert_eq!(combined.chunk(), b"abcdef");
         combined.advance(3);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         combined.advance(3);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1202,9 +1202,9 @@ mod tests {
         assert!(pool.inner.arena.select_trim_candidate().is_none());
         value.advance(3);
         assert_eq!(value.chunk(), b"def");
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         value.advance(3);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
         assert!(pool.inner.arena.select_trim_candidate().is_some());
     }
 
@@ -1228,9 +1228,9 @@ mod tests {
         assert_eq!(value.segments[0].owners.len(), 2);
         assert_eq!(value.chunk(), input);
         value.advance(carrier_size);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         value.advance(carrier_size);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1303,17 +1303,11 @@ mod tests {
         let combined = builder.finish();
 
         assert_eq!(combined.segments.len(), 2);
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            (carrier_size * 3) as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), (carrier_size * 3) as u64);
         drop(gap);
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            (carrier_size * 2) as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), (carrier_size * 2) as u64);
         drop(combined);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1363,9 +1357,9 @@ mod tests {
 
         assert_eq!(frozen.len(), carrier_size);
         assert_eq!(frozen.chunk(), &input[carrier_size..]);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         drop(frozen);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1385,9 +1379,9 @@ mod tests {
 
         assert_eq!(frozen.len(), carrier_size - 7);
         assert_eq!(frozen.chunk(), &input[advanced..]);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         drop(frozen);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1399,14 +1393,11 @@ mod tests {
         let second = first.clone();
 
         first.advance(carrier_size);
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            (carrier_size * 2) as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), (carrier_size * 2) as u64);
         drop(second);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         drop(first);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1476,9 +1467,9 @@ mod tests {
 
         assert_eq!(copied, input[..copied_len]);
         assert_eq!(frozen.chunk(), &input[copied_len..]);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         drop(frozen);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1495,7 +1486,7 @@ mod tests {
 
         assert_eq!(value, 0x0123_4567);
         assert!(frozen.is_empty());
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1511,12 +1502,9 @@ mod tests {
 
         assert_eq!(contiguous.as_ptr(), source_ptr);
         assert_eq!(contiguous, input);
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            (carrier_size * 2) as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), (carrier_size * 2) as u64);
         drop(contiguous);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1531,15 +1519,15 @@ mod tests {
         let advanced = carrier_size + 7;
         frozen.advance(advanced);
         let source_ptr = frozen.chunk().as_ptr();
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
 
         let contiguous = frozen.into_contiguous();
 
         assert_eq!(contiguous.as_ptr(), source_ptr);
         assert_eq!(contiguous, input[advanced..]);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         drop(contiguous);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1555,7 +1543,7 @@ mod tests {
         let contiguous = frozen.into_contiguous();
 
         assert_eq!(contiguous, input);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1574,7 +1562,7 @@ mod tests {
         let contiguous = frozen.into_contiguous();
 
         assert_eq!(contiguous, input[advanced..]);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1610,14 +1598,11 @@ mod tests {
 
         assert_eq!(first, input[carrier_size - 3..carrier_size]);
         assert_eq!(second, input[carrier_size..]);
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            (carrier_size * 2) as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), (carrier_size * 2) as u64);
         drop(first);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
         drop(second);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
     }
 
     #[test]
@@ -1869,7 +1854,7 @@ mod loom_tests {
             drop(raced_claim);
             drop(holder);
             drop(granted);
-            assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+            assert_eq!(pool.metrics().in_use_bytes(), 0);
         });
     }
 
@@ -1887,7 +1872,7 @@ mod loom_tests {
             left.join().unwrap();
             right.join().unwrap();
 
-            assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+            assert_eq!(pool.metrics().in_use_bytes(), 0);
         });
     }
 
@@ -1912,9 +1897,9 @@ mod loom_tests {
 
             assert_eq!(advanced.len(), carrier_size);
             assert_eq!(advanced.chunk(), vec![0xa5; carrier_size]);
-            assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+            assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
             drop(advanced);
-            assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+            assert_eq!(pool.metrics().in_use_bytes(), 0);
         });
     }
 
@@ -1937,9 +1922,9 @@ mod loom_tests {
             dropping.join().unwrap();
 
             assert_eq!(reader.chunk(), b"immutable");
-            assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+            assert_eq!(pool.metrics().in_use_bytes(), carrier_size as u64);
             drop(reader);
-            assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+            assert_eq!(pool.metrics().in_use_bytes(), 0);
         });
     }
 
@@ -2022,7 +2007,7 @@ mod loom_tests {
             publishing.join().unwrap();
             freezing.join().unwrap();
 
-            assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+            assert_eq!(pool.metrics().in_use_bytes(), 0);
         });
     }
 }

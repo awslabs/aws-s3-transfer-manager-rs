@@ -133,8 +133,8 @@ fn bind_interface(partition: Partition, index: usize, interfaces: &[String]) -> 
     }
 }
 
-/// Interface binding is unavailable on this platform, and the public setters
-/// that populate `interfaces` are not compiled.
+/// Interface binding is unavailable on this platform: `partition` is returned
+/// unbound and `interfaces` is ignored.
 #[cfg(not(any(
     target_os = "android",
     target_os = "fuchsia",

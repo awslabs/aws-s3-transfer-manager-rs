@@ -1555,16 +1555,16 @@ mod tests {
 
         let metrics = pool.metrics();
         assert_eq!(metrics.active_planned_demand_bytes(), 0);
-        assert_eq!(metrics.charged_capacity_bytes(), chunk_bytes as u64);
-        assert_eq!(metrics.admission_used_bytes(), chunk_bytes as u64);
+        assert_eq!(metrics.in_use_bytes(), chunk_bytes as u64);
+        assert_eq!(metrics.admitted_bytes(), chunk_bytes as u64);
 
         let chunk = consumer.try_take_next().expect("chunk delivered");
         assert_eq!(chunk.data.clone().into_contiguous().as_ref(), b"hello");
-        assert_eq!(pool.metrics().charged_capacity_bytes(), chunk_bytes as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), chunk_bytes as u64);
 
         drop(chunk);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
-        assert_eq!(pool.metrics().admission_used_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
+        assert_eq!(pool.metrics().admitted_bytes(), 0);
     }
 
     #[test]
@@ -1585,21 +1585,21 @@ mod tests {
         let clone = chunk.clone();
         assert_eq!(pool.metrics().active_planned_demand_bytes(), 0);
         assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
+            pool.metrics().in_use_bytes(),
             chunk_bytes as u64,
             "one physical buffer, charged once"
         );
 
         drop(chunk);
         assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
+            pool.metrics().in_use_bytes(),
             chunk_bytes as u64,
             "a surviving clone still holds the resident bytes"
         );
 
         drop(clone);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
-        assert_eq!(pool.metrics().admission_used_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
+        assert_eq!(pool.metrics().admitted_bytes(), 0);
     }
 
     #[test]
@@ -1625,11 +1625,11 @@ mod tests {
         });
 
         assert_eq!(pool.metrics().active_planned_demand_bytes(), 0);
-        assert_eq!(pool.metrics().charged_capacity_bytes(), chunk_bytes as u64);
+        assert_eq!(pool.metrics().in_use_bytes(), chunk_bytes as u64);
 
         writer.terminal_drain().unwrap();
-        assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
-        assert_eq!(pool.metrics().admission_used_bytes(), 0);
+        assert_eq!(pool.metrics().in_use_bytes(), 0);
+        assert_eq!(pool.metrics().admitted_bytes(), 0);
         assert_eq!(&std::fs::read(&path).unwrap()[..7], b"flushed");
     }
 }

@@ -159,8 +159,8 @@ scan effort, reclamation timing, or topology policy.
 
 ### Report admission and physical pressure
 
-Callers can inspect configured capacity, admitted demand, outstanding ownership, prepared capacity,
-and queued reservations without depending on the internal ledger or bitmap representation. The
+Callers can inspect capacity, admitted memory, memory in use, committed memory, and waiting
+requests without depending on the internal ledger, bitmap representation, or allocation unit. The
 memory metrics form one coherent admission sample. Diagnostic events identify allocation failure,
 degraded reclamation, and repeated serialized fallback without adding carrier-return work to the
 common path.
@@ -222,7 +222,7 @@ struct PoolInner {
 /// Closing or dropping the reservation revokes acquisition of new carriers.
 /// Buffers and carriers already acquired through it retain the private state
 /// needed for growth checks and final return.
-pub struct Reservation {
+pub(crate) struct Reservation {
     state: Option<Arc<ReservationState>>,
 }
 
@@ -231,7 +231,7 @@ pub struct Reservation {
 /// Dropping the future cancels a queued request or retires an assigned
 /// reservation that has not been observed.
 #[must_use = "a reservation request does nothing unless polled or awaited"]
-pub struct ReserveFuture {
+pub(crate) struct ReserveFuture {
     state: ReserveFutureState,
 }
 ```
@@ -242,10 +242,10 @@ executors while pending; it updates its registered waker on the next poll. Neith
 
 Concurrent calls to `BufferPool::acquire(&reservation, ..)` are supported. The packed reservation
 owner state linearizes their direct-acquisition-authority debits. `close_acquisition(self)` requires
-exclusive ownership of the public handle, so safe code cannot race close with an outstanding shared
+exclusive ownership of the handle, so safe code cannot race close with an outstanding shared
 borrow.
 
-`PooledBufMut` and `SegmentedBytes` are public data-plane types. `PooledBufMut` owns exclusive
+`SegmentedBytes` is a public data-plane type; `PooledBufMut` is crate-private. `PooledBufMut` owns exclusive
 writable carrier ranges. `SegmentedBytes` presents immutable bytes retained by pooled or foreign
 owners. Their complete layouts appear under [Ownership and delivery](#ownership-and-delivery).
 
@@ -362,7 +362,7 @@ another carrier owner to return memory.
 initialized ranges to `Bytes` or `SegmentedBytes` without changing the carrier charge. Immutable
 views can outlive both the work item and the public pool handle.
 
-`close_acquisition` consumes the public `Reservation`, revokes acquisition of new carriers through
+`close_acquisition` consumes the `Reservation`, revokes acquisition of new carriers through
 that reservation state, and retires planned demand while preserving the charges held by mutable or
 immutable owners. Existing buffers may continue writing, publishing, freezing, and dropping.
 Growth that fits in an existing writable tail remains valid; growth requiring another carrier
@@ -591,16 +591,16 @@ memory. A fixed split can strand one portion while another path creates avoidabl
 
 #### Reservation admission
 
-The public reservation surface accepts bytes and keeps carrier counts internal:
+The crate-private reservation surface accepts bytes and keeps carrier counts internal:
 
 ```rust
 impl BufferPool {
-    pub fn try_reserve(
+    pub(crate) fn try_reserve(
         &self,
         bytes: usize,
     ) -> Result<Option<Reservation>, ReserveError>;
 
-    pub fn reserve(&self, bytes: usize) -> ReserveFuture;
+    pub(crate) fn reserve(&self, bytes: usize) -> ReserveFuture;
 }
 
 impl Future for ReserveFuture {
@@ -608,7 +608,7 @@ impl Future for ReserveFuture {
 }
 
 #[non_exhaustive]
-pub enum ReserveError {
+pub(crate) enum ReserveError {
     InvalidSize,
     PhysicalPreparationFailed,
     MetadataAllocationFailed,
@@ -638,7 +638,7 @@ first poll
 
 The immediate path allocates no waiter and stores no waker. The queued path rechecks eligibility
 while admission is serialized before linking the waiter, so capacity released before registration
-is not lost. Public methods reject zero before converting bytes to internal carrier counts.
+is not lost. Byte-count methods reject zero before converting bytes to internal carrier counts.
 
 Internally, reservation admission operates on carrier counts:
 
@@ -792,24 +792,24 @@ The buffer can extend that stream without moving initialized bytes:
 
 ```rust
 impl BufferPool {
-    pub fn acquire(
+    pub(crate) fn acquire(
         &self,
         reservation: &Reservation,
         min_bytes: usize,
     ) -> Result<PooledBufMut, AcquireError>;
 
-    pub fn acquire_unreserved(
+    pub(crate) fn acquire_unreserved(
         &self,
         min_bytes: usize,
     ) -> Result<PooledBufMut, AcquireError>;
 }
 
 impl PooledBufMut {
-    pub fn reserve(&mut self, min_writable: usize) -> Result<(), AcquireError>;
+    pub(crate) fn reserve(&mut self, min_writable: usize) -> Result<(), AcquireError>;
 }
 
 #[non_exhaustive]
-pub enum AcquireError {
+pub(crate) enum AcquireError {
     InvalidSize,
     ForeignReservation,
     ReservationClosed,
@@ -904,12 +904,12 @@ succeeds; rollback leaves the reservation and pool usable.
 
 #### Close and return
 
-Closing consumes the public handle and revokes retained direct-acquisition authority. Dropping an
+Closing consumes the handle and revokes retained direct-acquisition authority. Dropping an
 open reservation performs the same transition:
 
 ```rust
 impl Reservation {
-    pub fn close_acquisition(self);
+    pub(crate) fn close_acquisition(self);
 }
 
 impl Drop for Reservation {
@@ -917,7 +917,7 @@ impl Drop for Reservation {
 }
 ```
 
-`acquire` is synchronous and borrows the non-cloneable public `Reservation`, so consuming that
+`acquire` is synchronous and borrows the non-cloneable `Reservation`, so consuming that
 handle makes another initial acquire structurally impossible. Existing reserved buffers retain
 private `Arc<ReservationState>` values and may race growth with close. The aggregate charge is
 published before the packed reservation owner state linearizes that race:
@@ -1726,8 +1726,8 @@ SegmentedBytes -> Hold::Pooled ----+
 ```
 
 `WritableCarrier`, `CarrierRun`, `PooledWindow`, `Segment`, `OwnedRange`, and `Hold` are private.
-`PooledBufMut` is the public mutable acquisition result. `SegmentedBytes` is the public immutable
-output type.
+`PooledBufMut` is the crate-private mutable acquisition result. `SegmentedBytes` is the public
+immutable output type.
 
 #### Carrier ownership
 
@@ -1751,7 +1751,7 @@ unsafe impl Sync for CarrierGuard {}
 
 The guard owns one carrier and one aggregate charge. `direct` records optional
 reservation provenance; it does not assign available coverage to that reservation. Byte containers
-do not retain the public `Reservation` handle. Reserved mutable buffers and direct carrier guards
+do not retain the `Reservation` handle. Reserved mutable buffers and direct carrier guards
 retain its private state, so close may race buffer growth and may precede final carrier return.
 
 `CarrierGuard` is allocated behind `Arc` but is not itself cloneable. Every owner of a range within
@@ -1794,7 +1794,7 @@ Adjacency is opportunistic. Acquisition returns the requested carrier count even
 requires several runs. `CarrierRun` has no independent ownership or accounting.
 
 ```rust
-pub struct PooledBufMut {
+pub(crate) struct PooledBufMut {
     // Selects reserved or unreserved acquisition for every later growth.
     growth: GrowthAuthority,
     // Preserves logical byte order; entries after the fourth spill to heap.
@@ -1861,14 +1861,14 @@ publish cursor:
 
 ```rust
 impl PooledBufMut {
-    pub fn capacity(&self) -> usize;
-    pub fn len(&self) -> usize;
-    pub fn is_empty(&self) -> bool;
-    pub fn initialized_chunk(&self) -> &[u8];
+    pub(crate) fn capacity(&self) -> usize;
+    pub(crate) fn len(&self) -> usize;
+    pub(crate) fn is_empty(&self) -> bool;
+    pub(crate) fn initialized_chunk(&self) -> &[u8];
     /// Ensures at least `min_writable` uninitialized writable bytes remain.
-    pub fn reserve(&mut self, min_writable: usize) -> Result<(), AcquireError>;
-    pub fn publish_prefix(&mut self, count: usize) -> Bytes;
-    pub fn freeze(self) -> SegmentedBytes;
+    pub(crate) fn reserve(&mut self, min_writable: usize) -> Result<(), AcquireError>;
+    pub(crate) fn publish_prefix(&mut self, count: usize) -> Bytes;
+    pub(crate) fn freeze(self) -> SegmentedBytes;
 }
 
 unsafe impl BufMut for PooledBufMut {
@@ -2313,16 +2313,17 @@ Each in-flight upload part has two memory lifetimes:
 1. mutable storage while the source produces bytes; and
 2. immutable storage retained until every network attempt using those bytes completes.
 
-`PartBuffer` joins those lifetimes without copying between them. Custom streams and adapters create
-one through `StreamContext::part_buffer`, retain it with their source state, and poll
-`PartBuffer::poll_acquire` before writing through `BufMut`. Creating the facade itself does not
-reserve or allocate payload memory.
+`PartBuffer` joins those lifetimes without copying between them. Built-in streams and adapters
+create one charged to the client's pool. A producer retains the buffer with its source state and
+polls `PartBuffer::poll_acquire` before writing. `PartBuffer::fill_from_slice` copies bytes in;
+built-in readers write into its uninitialized runs through crate-private methods. Creating the
+facade itself does not reserve or allocate payload memory.
 
 An acquisition request admits one logical envelope. The first envelope supplied while admission is
 pending remains fixed until the request completes. A producer normally requests the complete
 effective part size, but may use smaller envelopes when its source is incrementally available to
 limit the shared pool capacity held by one input stream while it waits for more data.
-`BufMut::remaining_mut` exposes only writable bytes covered by the active envelope;
+`PartBuffer::writable` exposes only writable bytes covered by the active envelope;
 carrier-rounded padding is not part of the logical allowance.
 
 ```text
@@ -2333,7 +2334,7 @@ PartBuffer::poll_acquire(envelope)
     |
     +-- Pending: retain PartBuffer and source progress
     |
-    `-- Ready: write initialized bytes through BufMut
+    `-- Ready: write initialized bytes into the envelope
                    |
                    +-- envelope has capacity: continue filling
                    |
@@ -2579,7 +2580,7 @@ pub struct BufferPoolBuilder {
 impl BufferPool {
     pub fn builder() -> BufferPoolBuilder;
     /// Returns the fixed writable allocation unit used by this pool.
-    pub fn carrier_size(&self) -> usize;
+    pub(crate) fn carrier_size(&self) -> usize;
     pub fn metrics(&self) -> MemoryMetrics;
 }
 
@@ -2594,9 +2595,11 @@ fallible pool builder is its only resolution boundary; pooled storage does not i
 capacity enum or preserve a second clamping path. A transfer-manager client either constructs its
 default pool with `Auto` or accepts an already validated explicit pool.
 
-The crate's top-level `memory` module is the public facade for pool construction, reservation,
-acquisition, and pooled byte containers. Client and pool memory samples remain in the top-level
-`metrics` module with other observability types. The private implementation stays under
+The crate's top-level `memory` module is the public facade for pool construction and sharing and
+for immutable pooled bytes. `io::PartBuffer` is the public way to write an upload part into pooled
+memory. Reservation, acquisition, mutable pooled buffers, and the allocation unit are
+crate-private. Client and pool memory samples remain in the top-level `metrics` module with other
+observability types. The private implementation stays under
 `runtime::buffer_pool`; that layout is not part of the public API.
 
 Pool construction resolves the policy after selecting carrier geometry. Effective memory is the
@@ -2833,37 +2836,40 @@ pub struct MemoryMetrics {
 
 impl MemoryMetrics {
     /// Normal admission ceiling after policy and carrier rounding.
-    pub fn configured_capacity_bytes(&self) -> u64;
+    pub fn capacity_bytes(&self) -> u64;
 
     /// Active planned demand plus charges outside active demand.
-    pub fn admission_used_bytes(&self) -> u64;
-
-    /// Complete envelopes whose direct-acquisition authority remains open.
-    pub fn active_planned_demand_bytes(&self) -> u64;
+    pub fn admitted_bytes(&self) -> u64;
 
     /// Aggregate charges held by carrier owners or in-flight acquisition debits.
-    pub fn charged_capacity_bytes(&self) -> u64;
-
-    /// Admission use above the configured ceiling.
-    pub fn admission_overage_bytes(&self) -> u64;
+    pub fn in_use_bytes(&self) -> u64;
 
     /// Capacity whose mapping, placement, and registration are complete.
     ///
     /// Preparation rounds its current floor up to whole blocks and may exceed
     /// that floor by less than one block. Explicit unreserved acquisition may
-    /// also place prepared capacity above the configured ceiling.
-    pub fn prepared_capacity_bytes(&self) -> u64;
+    /// also place prepared capacity above the configured ceiling. `None` is
+    /// reserved for a pool that cannot report it; this pool returns `Some`.
+    pub fn committed_bytes(&self) -> Option<u64>;
 
     /// Reservation requests retained in FIFO order.
-    pub fn queued_reservations(&self) -> usize;
+    pub fn waiting_requests(&self) -> usize;
 
     /// Cumulative reservation requests that entered the FIFO.
-    pub fn reservation_enqueues_total(&self) -> u64;
+    pub fn waits_total(&self) -> u64;
+
+    /// Complete envelopes whose direct-acquisition authority remains open.
+    pub(crate) fn active_planned_demand_bytes(&self) -> u64;
+
+    /// Admission use above the configured ceiling.
+    pub(crate) fn admission_overage_bytes(&self) -> u64;
 }
 ```
 
 The representation and fields remain private. Adding a signal adds a getter; callers cannot
-construct or destructure metrics values. The API does not expose `available_coverage`,
+construct or destructure metrics values. Public getter names and documentation describe memory
+behavior that any bounded pool can report, without naming carriers, envelopes, or reservations.
+The API does not expose active planned demand, admission overage, `available_coverage`,
 `uncovered_charges`, bitmap population, block states, or scan hints. Those are implementation
 details rather than durable user contracts.
 
@@ -2871,13 +2877,14 @@ details rather than durable user contracts.
 Configured capacity, planned demand, charged capacity, overage, prepared capacity, and queue state
 therefore form one coherent admission sample. It does not scan live bitmaps or add a carrier-return
 counter to the common path. Values are carrier-rounded bytes and exclude foreign `Bytes`, protocol
-scratch, copied contiguous output, and other process memory.
+scratch, copied contiguous output, and other process memory. The public documentation states only
+that values may be rounded to the pool's allocation unit.
 
 Prepared capacity follows whole-block geometry and the current admission floor. Block rounding may
 raise it by less than one block beyond that floor. It can exceed configured capacity through that
 rounding or because explicit unreserved acquisition raised the admission floor.
 
-`reservation_enqueues_total` is copied from the admission state in the same sample. It increments
+`waits_total` is copied from `reservation_enqueues_total` in the admission state in the same sample. It increments
 saturating exactly once when a request first enters the FIFO and never decrements on grant or
 cancellation. It is monotonic for the lifetime of the pool and does not count an immediate grant.
 

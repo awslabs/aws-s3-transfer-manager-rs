@@ -5,57 +5,105 @@
 
 use aws_sdk_s3_transfer_manager::types::ByteSize;
 use std::error::Error;
+use std::io;
+use std::task::{Context, Poll, Waker};
 
 use aws_sdk_s3_transfer_manager::config::{MemoryBudgetConfig, MemoryConfig};
+use aws_sdk_s3_transfer_manager::io::PartBuffer;
 use aws_sdk_s3_transfer_manager::memory::{
-    AcquireError, BufferPool, BufferPoolBuildError, BufferPoolBuilder, PooledBufMut, Reservation,
-    ReserveError, ReserveFuture, SegmentedBytes,
+    BufferPool, BufferPoolBuildError, BufferPoolBuilder, SegmentedBytes,
 };
-use bytes::{Buf, BufMut};
+use bytes::Buf;
+
+const POOL_BUDGET: ByteSize = ByteSize::mib(1);
 
 fn assert_public_error<T: Error + Send + Sync + 'static>() {}
 
+fn test_pool() -> BufferPool {
+    let builder: BufferPoolBuilder =
+        BufferPool::builder().memory_budget(MemoryBudgetConfig::Limit(POOL_BUDGET));
+    builder.build().expect("valid explicit pool")
+}
+
+fn pool_capacity(pool: &BufferPool) -> usize {
+    usize::try_from(pool.metrics().capacity_bytes()).expect("pool capacity fits usize")
+}
+
+fn poll_acquire(buffer: &mut PartBuffer, envelope: usize) -> Poll<io::Result<()>> {
+    let mut cx = Context::from_waker(Waker::noop());
+    buffer.poll_acquire(&mut cx, envelope)
+}
+
+/// A caller-built pool charges a part written through `PartBuffer` until the frozen bytes are
+/// consumed, and the same pool can be handed to a client.
 #[test]
 fn public_memory_api_supports_an_explicit_pool_flow() {
-    assert_public_error::<AcquireError>();
     assert_public_error::<BufferPoolBuildError>();
-    assert_public_error::<ReserveError>();
 
-    let builder: BufferPoolBuilder =
-        BufferPool::builder().memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(1024 * 1024)));
-    let pool: BufferPool = builder.build().expect("valid explicit pool");
+    let pool = test_pool();
     let _client_config = MemoryConfig::Explicit(pool.clone());
-    let carrier_size = pool.carrier_size();
+    assert_eq!(pool.metrics().in_use_bytes(), 0);
 
-    let reservation: Reservation = pool
-        .try_reserve(carrier_size * 2)
-        .expect("reservation attempt")
-        .expect("immediate reservation");
-    let mut buffer: PooledBufMut = pool
-        .acquire(&reservation, carrier_size)
-        .expect("reserved acquisition");
-    buffer.put_slice(b"abc");
+    let payload = b"abc";
+    let mut buffer = PartBuffer::new(&pool, payload.len());
+    assert!(matches!(
+        poll_acquire(&mut buffer, payload.len()),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(buffer.fill_from_slice(payload), payload.len());
 
     let mut data: SegmentedBytes = buffer.freeze();
-    reservation.close_acquisition();
+    assert_eq!(data.chunk(), payload);
+    let in_use = pool.metrics().in_use_bytes();
+    assert!(
+        in_use >= payload.len() as u64,
+        "frozen part is not charged: {in_use} bytes in use"
+    );
 
-    assert_eq!(data.chunk(), b"abc");
-    assert_eq!(pool.metrics().charged_capacity_bytes(), carrier_size as u64);
+    data.advance(payload.len());
+    assert_eq!(pool.metrics().in_use_bytes(), 0);
+}
 
-    data.advance(3);
-    assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
-
-    let unpolled: ReserveFuture = pool.reserve(carrier_size);
-    drop(unpolled);
-    assert_eq!(pool.metrics().reservation_enqueues_total(), 0);
-
-    let oversized = usize::try_from(pool.metrics().configured_capacity_bytes())
-        .expect("configured capacity fits usize")
-        .checked_add(carrier_size)
-        .expect("oversized request fits usize");
+/// A `PartBuffer` waiting for admission withdraws its request when dropped, so it cannot hold
+/// a place ahead of later requests.
+#[test]
+fn dropping_a_pending_part_buffer_leaves_no_waiting_request() {
+    let pool = test_pool();
+    let capacity = pool_capacity(&pool);
+    let mut holder = PartBuffer::new(&pool, capacity);
     assert!(matches!(
-        pool.try_reserve(oversized),
-        Err(ReserveError::ExceedsCapacity)
+        poll_acquire(&mut holder, capacity),
+        Poll::Ready(Ok(()))
     ));
-    assert_eq!(pool.metrics().reservation_enqueues_total(), 0);
+
+    let mut waiter = PartBuffer::new(&pool, 1);
+    assert!(poll_acquire(&mut waiter, 1).is_pending());
+    assert_eq!(pool.metrics().waiting_requests(), 1);
+
+    drop(waiter);
+    assert_eq!(pool.metrics().waiting_requests(), 0);
+
+    drop(holder);
+    assert_eq!(pool.metrics().admitted_bytes(), 0);
+    assert_eq!(pool.metrics().in_use_bytes(), 0);
+}
+
+/// An envelope larger than the pool's capacity can never be admitted, so it fails on the first
+/// poll instead of waiting.
+#[test]
+fn oversized_envelope_fails_with_io_error() {
+    let pool = test_pool();
+    let oversized = pool_capacity(&pool) + 1;
+    let mut buffer = PartBuffer::new(&pool, oversized);
+
+    let Poll::Ready(result) = poll_acquire(&mut buffer, oversized) else {
+        panic!("oversized envelope waited for admission");
+    };
+    let error = result.expect_err("oversized envelope was admitted");
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert!(error.get_ref().is_some(), "pool error source was dropped");
+
+    assert_eq!(pool.metrics().waiting_requests(), 0);
+    assert_eq!(pool.metrics().waits_total(), 0);
+    assert_eq!(pool.metrics().admitted_bytes(), 0);
 }

@@ -15,18 +15,18 @@ use super::CarrierCount;
 
 /// Point-in-time memory state for one shared pool domain.
 ///
-/// The representation remains private so ledger changes do not become API
-/// compatibility constraints. Values are carrier-rounded bytes.
+/// All values come from one coherent sample. Byte values may be rounded to the
+/// pool's allocation unit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemoryMetrics {
-    configured_capacity_bytes: u64,
-    admission_used_bytes: u64,
+    capacity_bytes: u64,
+    admitted_bytes: u64,
     active_planned_demand_bytes: u64,
-    charged_capacity_bytes: u64,
+    in_use_bytes: u64,
     admission_overage_bytes: u64,
     prepared_capacity_bytes: u64,
-    queued_reservations: usize,
-    reservation_enqueues_total: u64,
+    waiting_requests: usize,
+    waits_total: u64,
 }
 
 /// Carrier-count inputs captured under admission serialization.
@@ -143,45 +143,78 @@ impl MemoryDiagnostics {
 impl MemoryMetrics {
     /// Constructs one sample from validated carrier counts.
     pub(super) fn from_carriers(carrier_size: usize, state: MemoryMetricState) -> Self {
-        let configured_capacity_bytes = carriers_to_bytes(state.configured_capacity, carrier_size);
-        let admission_used_bytes = carriers_to_bytes(state.admission_used, carrier_size);
+        let capacity_bytes = carriers_to_bytes(state.configured_capacity, carrier_size);
+        let admitted_bytes = carriers_to_bytes(state.admission_used, carrier_size);
         Self {
-            configured_capacity_bytes,
-            admission_used_bytes,
+            capacity_bytes,
+            admitted_bytes,
             active_planned_demand_bytes: carriers_to_bytes(
                 state.active_planned_demand,
                 carrier_size,
             ),
-            charged_capacity_bytes: carriers_to_bytes(state.charged_capacity, carrier_size),
-            admission_overage_bytes: admission_used_bytes.saturating_sub(configured_capacity_bytes),
+            in_use_bytes: carriers_to_bytes(state.charged_capacity, carrier_size),
+            admission_overage_bytes: admitted_bytes.saturating_sub(capacity_bytes),
             prepared_capacity_bytes: carriers_to_bytes(state.prepared_capacity, carrier_size),
-            queued_reservations: state.queued_reservations,
-            reservation_enqueues_total: state.reservation_enqueues_total,
+            waiting_requests: state.queued_reservations,
+            waits_total: state.reservation_enqueues_total,
         }
     }
 
-    /// Returns the normal admission ceiling after carrier rounding.
-    pub fn configured_capacity_bytes(&self) -> u64 {
-        self.configured_capacity_bytes
+    /// Returns the pool's admission ceiling.
+    ///
+    /// This is the configured memory budget, rounded down to the pool's
+    /// allocation unit. Requests wait while admitting them would exceed it.
+    pub fn capacity_bytes(&self) -> u64 {
+        self.capacity_bytes
     }
 
-    /// Returns active planned demand plus ownership outside active demand.
-    pub fn admission_used_bytes(&self) -> u64 {
-        self.admission_used_bytes
+    /// Returns memory currently admitted against [`Self::capacity_bytes`].
+    ///
+    /// Admitted memory includes memory in use and memory admitted for requests
+    /// that have not yet filled it, so requests can wait at the ceiling while
+    /// [`Self::in_use_bytes`] is lower.
+    pub fn admitted_bytes(&self) -> u64 {
+        self.admitted_bytes
+    }
+
+    /// Returns memory held by live buffers and the immutable bytes built from
+    /// them.
+    ///
+    /// Memory remains in use until the last value referring to it is dropped.
+    pub fn in_use_bytes(&self) -> u64 {
+        self.in_use_bytes
+    }
+
+    /// Returns memory the pool holds ready for use, whether in use or kept for
+    /// reuse.
+    ///
+    /// The value may exceed [`Self::capacity_bytes`]. `None` means the pool
+    /// cannot tell; this pool always returns `Some`.
+    pub fn committed_bytes(&self) -> Option<u64> {
+        Some(self.prepared_capacity_bytes)
+    }
+
+    /// Returns requests currently waiting for admission.
+    pub fn waiting_requests(&self) -> usize {
+        self.waiting_requests
+    }
+
+    /// Returns how many requests have waited for admission.
+    ///
+    /// This pool-lifetime counter increments once per request that waits and
+    /// saturates at `u64::MAX`. Unlike [`Self::waiting_requests`], it does not
+    /// decrease when a request is admitted or cancelled.
+    pub fn waits_total(&self) -> u64 {
+        self.waits_total
     }
 
     /// Returns complete envelopes whose acquisition authority remains open.
-    pub fn active_planned_demand_bytes(&self) -> u64 {
+    pub(crate) fn active_planned_demand_bytes(&self) -> u64 {
         self.active_planned_demand_bytes
     }
 
-    /// Returns aggregate charges held by owners or in-flight acquisitions.
-    pub fn charged_capacity_bytes(&self) -> u64 {
-        self.charged_capacity_bytes
-    }
-
     /// Returns admission use above the normal configured ceiling.
-    pub fn admission_overage_bytes(&self) -> u64 {
+    pub(crate) fn admission_overage_bytes(&self) -> u64 {
         self.admission_overage_bytes
     }
 
@@ -190,22 +223,8 @@ impl MemoryMetrics {
     /// Preparation rounds its current floor up to whole blocks and may exceed
     /// that floor by less than one block. Idle-only admission overage may also
     /// place prepared capacity above the normal configured ceiling.
-    pub fn prepared_capacity_bytes(&self) -> u64 {
+    pub(crate) fn prepared_capacity_bytes(&self) -> u64 {
         self.prepared_capacity_bytes
-    }
-
-    /// Returns reservation requests currently retained in FIFO order.
-    pub fn queued_reservations(&self) -> usize {
-        self.queued_reservations
-    }
-
-    /// Returns how many reservation requests have entered the FIFO.
-    ///
-    /// This pool-lifetime counter increments once per queued request and
-    /// saturates at `u64::MAX`. Unlike [`Self::queued_reservations`], it does
-    /// not decrease when a request is granted or cancelled.
-    pub fn reservation_enqueues_total(&self) -> u64 {
-        self.reservation_enqueues_total
     }
 }
 
@@ -229,14 +248,14 @@ mod tests {
     fn test_metrics_report_admission_ownership_and_queue_state() {
         let (pool, carrier_size) = test_pool(1, 1);
         let initial = pool.metrics();
-        assert_eq!(initial.configured_capacity_bytes(), carrier_size as u64);
-        assert_eq!(initial.admission_used_bytes(), 0);
+        assert_eq!(initial.capacity_bytes(), carrier_size as u64);
+        assert_eq!(initial.admitted_bytes(), 0);
         assert_eq!(initial.active_planned_demand_bytes(), 0);
-        assert_eq!(initial.charged_capacity_bytes(), 0);
+        assert_eq!(initial.in_use_bytes(), 0);
         assert_eq!(initial.admission_overage_bytes(), 0);
         assert_eq!(initial.prepared_capacity_bytes(), 0);
-        assert_eq!(initial.queued_reservations(), 0);
-        assert_eq!(initial.reservation_enqueues_total(), 0);
+        assert_eq!(initial.waiting_requests(), 0);
+        assert_eq!(initial.waits_total(), 0);
 
         let reservation = pool
             .try_reserve(carrier_size)
@@ -247,31 +266,31 @@ mod tests {
         assert!(poll_reserve(&mut queued, &waker).is_pending());
 
         let queued_metrics = pool.metrics();
-        assert_eq!(queued_metrics.admission_used_bytes(), carrier_size as u64);
+        assert_eq!(queued_metrics.admitted_bytes(), carrier_size as u64);
         assert_eq!(
             queued_metrics.active_planned_demand_bytes(),
             carrier_size as u64
         );
-        assert_eq!(queued_metrics.charged_capacity_bytes(), 0);
+        assert_eq!(queued_metrics.in_use_bytes(), 0);
         assert_eq!(
             queued_metrics.prepared_capacity_bytes(),
             carrier_size as u64
         );
-        assert_eq!(queued_metrics.queued_reservations(), 1);
-        assert_eq!(queued_metrics.reservation_enqueues_total(), 1);
+        assert_eq!(queued_metrics.waiting_requests(), 1);
+        assert_eq!(queued_metrics.waits_total(), 1);
 
         drop(queued);
         let acquired = pool.acquire(&reservation, carrier_size).unwrap();
         let charged = pool.metrics();
-        assert_eq!(charged.charged_capacity_bytes(), carrier_size as u64);
-        assert_eq!(charged.queued_reservations(), 0);
-        assert_eq!(charged.reservation_enqueues_total(), 1);
+        assert_eq!(charged.in_use_bytes(), carrier_size as u64);
+        assert_eq!(charged.waiting_requests(), 0);
+        assert_eq!(charged.waits_total(), 1);
 
         reservation.close_acquisition();
         let closed = pool.metrics();
         assert_eq!(closed.active_planned_demand_bytes(), 0);
-        assert_eq!(closed.admission_used_bytes(), carrier_size as u64);
-        assert_eq!(closed.charged_capacity_bytes(), carrier_size as u64);
+        assert_eq!(closed.admitted_bytes(), carrier_size as u64);
+        assert_eq!(closed.in_use_bytes(), carrier_size as u64);
         drop(acquired);
     }
 
@@ -282,10 +301,10 @@ mod tests {
         let acquired = pool.acquire_unreserved(carrier_size * 2).unwrap();
         let metrics = pool.metrics();
 
-        assert_eq!(metrics.configured_capacity_bytes(), carrier_size as u64);
-        assert_eq!(metrics.admission_used_bytes(), (carrier_size * 2) as u64);
+        assert_eq!(metrics.capacity_bytes(), carrier_size as u64);
+        assert_eq!(metrics.admitted_bytes(), (carrier_size * 2) as u64);
         assert_eq!(metrics.active_planned_demand_bytes(), 0);
-        assert_eq!(metrics.charged_capacity_bytes(), (carrier_size * 2) as u64);
+        assert_eq!(metrics.in_use_bytes(), (carrier_size * 2) as u64);
         assert_eq!(metrics.admission_overage_bytes(), carrier_size as u64);
         assert_eq!(metrics.prepared_capacity_bytes(), (carrier_size * 2) as u64);
         drop(acquired);
@@ -314,18 +333,18 @@ mod loom_tests {
             returning.join().unwrap();
 
             let carrier_size = carrier_size as u64;
-            assert_eq!(sample.configured_capacity_bytes(), carrier_size);
-            assert!([0, carrier_size].contains(&sample.admission_used_bytes()));
+            assert_eq!(sample.capacity_bytes(), carrier_size);
+            assert!([0, carrier_size].contains(&sample.admitted_bytes()));
             assert!([0, carrier_size].contains(&sample.active_planned_demand_bytes()));
-            assert!([0, carrier_size].contains(&sample.charged_capacity_bytes()));
-            assert!(sample.charged_capacity_bytes() <= sample.admission_used_bytes());
+            assert!([0, carrier_size].contains(&sample.in_use_bytes()));
+            assert!(sample.in_use_bytes() <= sample.admitted_bytes());
             assert_eq!(sample.admission_overage_bytes(), 0);
             assert_eq!(sample.prepared_capacity_bytes(), carrier_size);
 
             let final_sample = pool.metrics();
-            assert_eq!(final_sample.admission_used_bytes(), 0);
+            assert_eq!(final_sample.admitted_bytes(), 0);
             assert_eq!(final_sample.active_planned_demand_bytes(), 0);
-            assert_eq!(final_sample.charged_capacity_bytes(), 0);
+            assert_eq!(final_sample.in_use_bytes(), 0);
         });
     }
 }

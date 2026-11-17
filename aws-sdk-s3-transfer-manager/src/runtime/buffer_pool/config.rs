@@ -46,7 +46,7 @@ const F64_EXPONENT_BIAS: u32 = 1023;
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BufferPoolBuildError {
-    /// Capacity is invalid or resolves below one carrier.
+    /// Capacity is invalid or resolves below one allocation unit.
     InvalidCapacity,
     /// The selected capacity policy requires unavailable memory detection.
     MemoryDetectionUnavailable,
@@ -508,7 +508,7 @@ mod tests {
         .unwrap();
         assert_eq!(pool.inner.geometry.carrier_size(), DEFAULT_CARRIER_BYTES);
         assert_eq!(pool.inner.geometry.block_size(), DEFAULT_BLOCK_BYTES);
-        assert_eq!(pool.metrics().configured_capacity_bytes(), GIB as u64);
+        assert_eq!(pool.metrics().capacity_bytes(), GIB as u64);
         assert_eq!(pool.metrics().prepared_capacity_bytes(), 0);
     }
 
@@ -520,7 +520,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(pool.carrier_size(), DEFAULT_CARRIER_BYTES);
-        assert_eq!(pool.metrics().configured_capacity_bytes(), GIB as u64);
+        assert_eq!(pool.metrics().capacity_bytes(), GIB as u64);
         assert_eq!(pool.metrics().prepared_capacity_bytes(), 0);
     }
 

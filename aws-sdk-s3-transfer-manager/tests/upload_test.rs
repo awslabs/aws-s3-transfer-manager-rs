@@ -33,7 +33,7 @@ use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
 use aws_smithy_runtime_api::client::result::SdkError;
 use aws_smithy_runtime_api::http::StatusCode;
 use aws_smithy_types::body::SdkBody;
-use bytes::{BufMut, Bytes};
+use bytes::Bytes;
 use pin_project_lite::pin_project;
 
 use tokio::sync::{mpsc, Semaphore};
@@ -334,8 +334,10 @@ impl PartStream for ScriptedPartStream {
     }
 }
 
+/// Copies `data` into one part built in `pool`, which the caller shares with the client.
 #[derive(Debug)]
 struct PooledPartStream {
+    pool: BufferPool,
     data: Option<Bytes>,
     buffer: Option<PartBuffer>,
 }
@@ -349,7 +351,10 @@ impl PartStream for PooledPartStream {
         let Some(data_len) = self.data.as_ref().map(Bytes::len) else {
             return Poll::Ready(None);
         };
-        let buffer = self.buffer.get_or_insert_with(|| stream_cx.part_buffer());
+        let this = &mut *self;
+        let buffer = this
+            .buffer
+            .get_or_insert_with(|| PartBuffer::new(&this.pool, stream_cx.part_size()));
         match buffer.poll_acquire(cx, data_len) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Err(error)) => return Poll::Ready(Some(Err(error))),
@@ -357,10 +362,16 @@ impl PartStream for PooledPartStream {
         }
 
         let data = self.data.take().expect("pooled stream data disappeared");
-        self.buffer
+        let copied = self
+            .buffer
             .as_mut()
             .expect("pooled stream buffer disappeared")
-            .put_slice(&data);
+            .fill_from_slice(&data);
+        assert_eq!(
+            copied,
+            data.len(),
+            "admitted envelope did not hold the part"
+        );
         let data = self
             .buffer
             .take()
@@ -655,8 +666,14 @@ async fn test_custom_stream_resumes_after_part_buffer_admission() {
         .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(CAPACITY as u64)))
         .build()
         .unwrap();
-    let holder = pool.try_reserve(CAPACITY).unwrap().unwrap();
-    let held = pool.acquire(&holder, CAPACITY).unwrap();
+    // A second buffer admitted for the whole budget makes the stream's admission wait.
+    let mut holder = PartBuffer::new(&pool, CAPACITY);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        holder.poll_acquire(&mut cx, CAPACITY),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(holder.writable(), CAPACITY);
 
     let config = aws_sdk_s3_transfer_manager::Config::builder()
         .s3_config(test_common::s3_config_with_test_http(
@@ -671,6 +688,7 @@ async fn test_custom_stream_resumes_after_part_buffer_admission() {
         .bucket("test-bucket")
         .key("pooled-part")
         .body(InputStream::from_part_stream(PooledPartStream {
+            pool: pool.clone(),
             data: Some(Bytes::from_static(b"pooled payload")),
             buffer: None,
         }))
@@ -679,22 +697,21 @@ async fn test_custom_stream_resumes_after_part_buffer_admission() {
     let join = tokio::spawn(async move { handle.join().await });
 
     tokio::time::timeout(Duration::from_secs(5), async {
-        while pool.metrics().queued_reservations() == 0 {
+        while pool.metrics().waiting_requests() == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("custom stream did not wait for pool admission");
 
-    drop(held);
-    holder.close_acquisition();
+    drop(holder);
 
     tokio::time::timeout(Duration::from_secs(5), join)
         .await
         .expect("custom stream did not resume after pool admission")
         .expect("upload task panicked")
         .unwrap();
-    assert_eq!(pool.metrics().charged_capacity_bytes(), 0);
+    assert_eq!(pool.metrics().in_use_bytes(), 0);
 }
 
 #[tokio::test]

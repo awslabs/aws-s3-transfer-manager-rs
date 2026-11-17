@@ -37,7 +37,7 @@ use coverage::CoverageSnapshot;
 pub(super) use coverage::{CoverageDebit, CoverageState, MAX_PACKED_CARRIERS};
 
 mod waiter;
-pub use waiter::ReserveFuture;
+pub(crate) use waiter::ReserveFuture;
 pub(super) use waiter::{ReservationPoll, WaitSlot, WaitState, Waiter};
 
 /// Orders uncovered repayment against reservation-queue publication.
@@ -541,7 +541,7 @@ impl AdmissionLedger {
 /// Failure to create a new reservation.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReserveError {
+pub(crate) enum ReserveError {
     /// The byte request was zero.
     InvalidSize,
     /// The requested envelope exceeds the pool's configured capacity.
@@ -579,7 +579,7 @@ impl std::error::Error for ReserveError {}
 /// Dropping the reservation closes it. Mutable buffers and immutable views
 /// already acquired through it remain valid and keep their memory charged
 /// until their final owners are dropped.
-pub struct Reservation {
+pub(crate) struct Reservation {
     state: Option<Arc<ReservationState>>,
 }
 
@@ -610,7 +610,7 @@ impl Reservation {
     /// Buffers acquired before this call keep their existing capacity, but
     /// attempts to grow them return
     /// [`AcquireError::ReservationClosed`](super::AcquireError::ReservationClosed).
-    pub fn close_acquisition(mut self) {
+    pub(crate) fn close_acquisition(mut self) {
         self.close();
     }
 
@@ -998,8 +998,8 @@ mod tests {
             assert!(pool.try_reserve(carrier_size).unwrap().is_none());
             let metrics = pool.metrics();
             assert_eq!(metrics.active_planned_demand_bytes(), 0);
-            assert_eq!(metrics.admission_used_bytes(), carrier_size as u64);
-            assert_eq!(metrics.charged_capacity_bytes(), carrier_size as u64);
+            assert_eq!(metrics.admitted_bytes(), carrier_size as u64);
+            assert_eq!(metrics.in_use_bytes(), carrier_size as u64);
             assert_eq!(metrics.admission_overage_bytes(), 0);
         }
 

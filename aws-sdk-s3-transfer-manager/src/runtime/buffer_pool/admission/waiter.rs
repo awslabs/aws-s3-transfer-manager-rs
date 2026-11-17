@@ -70,7 +70,7 @@ enum ReserveFutureState {
 /// preparation failures resolve to [`ReserveError`]. A request larger than the
 /// configured pool capacity fails without entering the FIFO.
 #[must_use = "a reservation request does nothing unless polled or awaited"]
-pub struct ReserveFuture {
+pub(crate) struct ReserveFuture {
     state: ReserveFutureState,
 }
 
@@ -477,8 +477,8 @@ mod tests {
             Poll::Ready(Err(ReserveError::MetadataAllocationFailed))
         ));
         assert_eq!(wake_count(&wake_state), 0);
-        assert_eq!(pool.metrics().queued_reservations(), 0);
-        assert_eq!(pool.metrics().reservation_enqueues_total(), 0);
+        assert_eq!(pool.metrics().waiting_requests(), 0);
+        assert_eq!(pool.metrics().waits_total(), 0);
         assert!(!pool.inner.reservation_drain.is_armed());
 
         drop(holder);

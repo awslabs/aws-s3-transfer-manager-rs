@@ -680,14 +680,16 @@ fn is_sdk_transient_transport<E, R>(e: &SdkError<E, R>) -> bool {
 }
 
 /// Associates an SDK service error type with its originating S3 operation.
-trait SdkOperationError: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static {
+pub(crate) trait SdkOperationError:
+    ProvideErrorMetadata + std::error::Error + Send + Sync + 'static
+{
     const OPERATION_NAME: &'static str;
 }
 
 /// Converts an `SdkError` into an [`ErrorKind::ServiceError`], capturing the
 /// operation name, service metadata, and whether it was a transient transport
 /// failure.
-fn service_error<E: SdkOperationError>(e: SdkError<E, HttpResponse>) -> Error {
+pub(crate) fn service_error<E: SdkOperationError>(e: SdkError<E, HttpResponse>) -> Error {
     let service = service_metadata(E::OPERATION_NAME, &e);
     let transient_transport = is_sdk_transient_transport(&e);
     Error {
@@ -698,12 +700,6 @@ fn service_error<E: SdkOperationError>(e: SdkError<E, HttpResponse>) -> Error {
             transient_transport,
             ..Default::default()
         })),
-    }
-}
-
-impl<E: SdkOperationError> From<SdkError<E, HttpResponse>> for Error {
-    fn from(e: SdkError<E, HttpResponse>) -> Self {
-        service_error(e)
     }
 }
 
@@ -779,7 +775,7 @@ impl From<crate::io::walk::WalkError> for Error {
                     .into_source()
                     .downcast::<SdkError<ListObjectsV2Error, HttpResponse>>()
                 {
-                    Ok(sdk) => Error::from(*sdk),
+                    Ok(sdk) => service_error(*sdk),
                     Err(src) => Error::new(ErrorKind::ObjectNotDiscoverable, src),
                 }
             }
@@ -1140,7 +1136,7 @@ mod tests {
             ),
             HttpResponse::new(StatusCode::try_from(412).unwrap(), SdkBody::empty()),
         );
-        let err = Error::from(sdk);
+        let err = service_error(sdk);
         assert!(matches!(err.kind(), ErrorKind::ServiceError));
         assert_eq!(err.code(), Some("PreconditionFailed"));
         assert_eq!(err.operation_name(), Some("PutObject"));

@@ -628,6 +628,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: "clippy --all"
         run: cargo clippy --locked --workspace --all-targets --all-features --no-deps
+      - name: "clippy buffer-pool bench (cfg s3_tm_bench)"
+        run: cargo clippy --locked -p benches --all-targets --no-deps
+        env:
+          RUSTFLAGS: -Dwarnings --cfg s3_tm_bench
 
   docs:
     name: docs
@@ -646,6 +650,16 @@ jobs:
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated
           RUSTDOCFLAGS: -Dwarnings --cfg docsrs
+      - name: Install cargo-docs-rs
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: cargo-docs-rs@1.0.4
+      - name: Install just
+        uses: extractions/setup-just@v3
+      - name: "just docs"
+        run: just docs
+        env:
+          RUSTFLAGS: -Dwarnings -Adeprecated
 
   minrust:
     name: minrust

@@ -208,7 +208,7 @@ async fn discover_obj_with_get_first_part(
             req.send()
                 .await
                 .map(|resp| (resp, checksum))
-                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
+                .map_err(|e| crate::retry::GuardError::Inner(error::service_error(e)))
         }
     })
     .instrument(tracing::trace_span!(
@@ -236,7 +236,7 @@ async fn discover_obj_with_head(
         async move {
             req.send()
                 .await
-                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
+                .map_err(|e| crate::retry::GuardError::Inner(error::service_error(e)))
         }
     })
     .instrument(tracing::trace_span!(
@@ -303,10 +303,7 @@ fn validate_response_content_range(
     let response = object_meta
         .range_from_content_range()
         .ok_or_else(|| error::discovery_failed("ranged response has invalid content-range"))?;
-    let total = content_range
-        .split_once('/')
-        .filter(|(_, total)| !total.contains('/'))
-        .and_then(|(_, total)| total.parse::<u64>().ok())
+    let total = crate::http::header::parse_content_range_total(content_range)
         .filter(|total| *total > 0)
         .ok_or_else(|| error::discovery_failed("ranged response has invalid object length"))?;
 
@@ -395,7 +392,7 @@ async fn discover_obj_with_get(
             req.send()
                 .await
                 .map(|resp| (resp, checksum))
-                .map_err(|e| crate::retry::GuardError::Inner(error::Error::from(e)))
+                .map_err(|e| crate::retry::GuardError::Inner(error::service_error(e)))
         }
     })
     .instrument(tracing::trace_span!(

@@ -24,6 +24,9 @@ aws-smithy-checksums = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-http-client = { workspace = true, features = ["rustls-aws-lc"] }
 bytes = "1"
+aws-smithy-execution = { workspace = true }
+aws-smithy-managed-http = { workspace = true, features = ["client"] }
+aws-sdk-s3-transfer-manager-ext = { path = "../crates/aws-sdk-s3-transfer-manager-ext" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(e2e_test)', 'cfg(s3_tm_tsan)'] }

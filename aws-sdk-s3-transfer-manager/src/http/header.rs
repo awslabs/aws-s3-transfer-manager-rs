@@ -21,6 +21,19 @@ pub(crate) fn parse_content_range(header: &str) -> Option<RangeInclusive<u64>> {
     Some(start..=end)
 }
 
+/// Parse the complete object length from a Content-Range response header.
+///
+/// Expects format `bytes START-END/TOTAL` or `bytes */TOTAL`. Returns `None` if
+/// the header is malformed or the length is unknown (`bytes 0-9/*`).
+pub(crate) fn parse_content_range_total(header: &str) -> Option<u64> {
+    header
+        .strip_prefix("bytes ")?
+        .split_once('/')?
+        .1
+        .parse()
+        .ok()
+}
+
 /// Representation of `Range` header.
 /// NOTE: S3 only supports a single bytes range this is a simplified representation
 #[derive(Debug, Clone, PartialEq)]
@@ -157,6 +170,17 @@ mod tests {
         assert_eq!(parse_content_range("invalid"), None);
         assert_eq!(parse_content_range("bytes abc-def/100"), None);
         assert_eq!(parse_content_range("bytes 0-499"), None);
+    }
+
+    #[test]
+    fn test_parse_content_range_total() {
+        use super::parse_content_range_total;
+        assert_eq!(parse_content_range_total("bytes 0-499/1000"), Some(1000));
+        assert_eq!(parse_content_range_total("bytes */0"), Some(0));
+        assert_eq!(parse_content_range_total("bytes 0-9/*"), None);
+        assert_eq!(parse_content_range_total("bytes 0-9/1/2"), None);
+        assert_eq!(parse_content_range_total("0-9/10"), None);
+        assert_eq!(parse_content_range_total("invalid"), None);
     }
 
     #[test]

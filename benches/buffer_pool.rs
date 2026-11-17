@@ -7,7 +7,7 @@
 //!
 //! The groups isolate acquisition, mutable collection, immutable ownership,
 //! final-owner accounting, fragmented-pool search, sustained whole-part
-//! placement, and contention through the public memory API. Pools are prepared
+//! placement, and contention through the allocation API. Pools are prepared
 //! before timed loops, so ordinary results exclude virtual range reservation
 //! and initial block preparation unless a scenario states otherwise.
 //!
@@ -28,12 +28,13 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use aws_sdk_s3_transfer_manager::config::MemoryBudgetConfig;
-use aws_sdk_s3_transfer_manager::memory::{
-    BufferPool, PooledBufMut, Reservation, ReserveFuture, SegmentedBytes,
+use aws_sdk_s3_transfer_manager::__bench::{
+    BufferPoolExt, PooledBufMut, Reservation, ReserveFuture,
 };
+use aws_sdk_s3_transfer_manager::config::MemoryBudgetConfig;
+use aws_sdk_s3_transfer_manager::memory::{BufferPool, SegmentedBytes};
 use bytes::{Buf, BufMut};
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
@@ -80,7 +81,7 @@ impl PreparedPool {
             FRAME_BYTES,
             "benchmark assumes the production 16 KiB carrier"
         );
-        let configured = usize::try_from(pool.metrics().configured_capacity_bytes())
+        let configured = usize::try_from(pool.metrics().capacity_bytes())
             .expect("configured capacity should fit usize");
         assert_eq!(configured, capacity);
         let reservation = pool
@@ -88,8 +89,8 @@ impl PreparedPool {
             .expect("benchmark reservation should not fail")
             .expect("empty benchmark pool should grant immediately");
         assert_eq!(
-            pool.metrics().prepared_capacity_bytes(),
-            configured as u64,
+            pool.metrics().committed_bytes(),
+            Some(configured as u64),
             "block-aligned capacity should prepare exactly"
         );
 
@@ -98,10 +99,7 @@ impl PreparedPool {
             pool.acquire(&reservation, occupied_bytes)
                 .expect("benchmark occupancy should fit its reservation")
         });
-        assert_eq!(
-            pool.metrics().charged_capacity_bytes(),
-            occupied_bytes as u64
-        );
+        assert_eq!(pool.metrics().in_use_bytes(), occupied_bytes as u64);
 
         Self {
             pool,
@@ -121,7 +119,7 @@ fn prepared_unreserved_pool(capacity: usize) -> BufferPool {
         .acquire_unreserved(capacity)
         .expect("benchmark preparation should succeed");
     drop(prepared);
-    assert_eq!(pool.metrics().prepared_capacity_bytes(), capacity as u64);
+    assert_eq!(pool.metrics().committed_bytes(), Some(capacity as u64));
     pool
 }
 
@@ -1103,8 +1101,13 @@ fn report_whole_part_preflight(
     assert!(total != 0, "whole-part preflight produced no acquisitions");
     let contiguous_percent = preflight.contiguous as f64 * 100.0 / total as f64;
     let acquisition_ns = preflight.acquisition_time.as_nanos() / u128::from(preflight.acquisitions);
-    let prepared_bytes = churn.state.pool.metrics().prepared_capacity_bytes();
-    let charged_bytes = churn.state.pool.metrics().charged_capacity_bytes();
+    let prepared_bytes = churn
+        .state
+        .pool
+        .metrics()
+        .committed_bytes()
+        .expect("buffer pool reports committed memory");
+    let charged_bytes = churn.state.pool.metrics().in_use_bytes();
     let occupancy_percent = charged_bytes as f64 * 100.0 / prepared_bytes as f64;
     let part_count = traffic.part_count(churn.part_bytes);
     let unallocated_tail_bytes = traffic.unallocated_tail_bytes(churn.part_bytes);
@@ -1272,4 +1275,3 @@ criterion_group!(
     benchmark_whole_part_churn,
     benchmark_reserved_contention
 );
-criterion_main!(benches);

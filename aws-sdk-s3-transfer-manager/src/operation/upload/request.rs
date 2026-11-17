@@ -66,7 +66,10 @@ pub(crate) fn copy_fields_to_mpu_request(
 
 // Copy fields from UploadInput to `UploadPartFluentBuilder`
 //
-// Takes an optional checksum value passed by user via `PartStream`.
+// Takes an optional checksum value passed by user via `PartStream`. A checksum value
+// requires a checksum strategy to name its algorithm, so `checksum_value` must be
+// `None` when `upload_input` has none. `validate_part_checksum_has_strategy` rejects
+// that combination before a part is sent.
 pub(crate) fn copy_fields_to_upload_part_request(
     upload_input: &UploadInput,
     upload_part_builder: UploadPartFluentBuilder,
@@ -95,14 +98,10 @@ pub(crate) fn copy_fields_to_upload_part_request(
             );
         }
     } else {
-        // Warn if user is passing a checksum value, but the upload isn't doing checksums.
-        // We can't just set a checksum header, because we don't know what algorithm to use.
-        if checksum_value.is_some() {
-            tracing::warn!(
-                target: crate::telemetry::TARGET_TRANSFER_UPLOAD,
-                "Ignoring part checksum provided during upload, because no ChecksumStrategy is specified",
-            );
-        }
+        debug_assert!(
+            checksum_value.is_none(),
+            "a part checksum without a ChecksumStrategy is rejected before the part is sent"
+        );
     }
 
     upload_part_builder

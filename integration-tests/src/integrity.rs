@@ -26,7 +26,11 @@
 //!   * the object's checksum value members and type, surfaced only when the whole
 //!     object is covered by a single returned checksum (single-part objects); for
 //!     a larger multipart object the discovery chunk carries only part 1's
-//!     checksum, which is not the object checksum and is not surfaced.
+//!     checksum, which is not the object checksum and is not surfaced. A
+//!     composite value is never surfaced, even when the object fits in one chunk.
+//!     `DownloadOutput::object_meta` copies the discovery response's checksum
+//!     values and type, except that it clears composite values and values from a
+//!     part GET of a multipart object.
 //!   * `ChecksumValidation`: `Validated{algorithm}` when the whole object was
 //!     validated, else `NotValidated{reason}`.
 //!
@@ -315,6 +319,10 @@ async fn multipart_full_object(target: Target) {
     assert!(
         output.integrity_checks().checksum_crc32().is_none(),
         "must not surface a part checksum as the object checksum"
+    );
+    assert!(
+        output.object_meta.checksum_crc32.is_none(),
+        "object metadata must not carry a part checksum as the object's"
     );
 
     // S3 returns the checksum of a part of a FULL_OBJECT multipart object only in directory
