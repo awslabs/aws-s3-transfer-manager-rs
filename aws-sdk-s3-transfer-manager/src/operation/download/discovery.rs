@@ -301,7 +301,7 @@ async fn discover_obj_with_head(
         async move {
             req.send()
                 .await
-                .map_err(|e| crate::retry::GuardError::Inner(error::service_error(e)))
+                .map_err(|e| crate::retry::GuardError::Inner(error::head_object_error(e)))
         }
     })
     .instrument(tracing::trace_span!(

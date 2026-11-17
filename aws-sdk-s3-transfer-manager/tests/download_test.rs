@@ -1568,6 +1568,56 @@ async fn test_range_response_without_content_range_fails_with_service_error() {
     assert_eq!(error.code(), None);
 }
 
+/// S3 answers a failed HEAD with its status and request ids only, with no body to
+/// carry the error code. A status that identifies a single S3 code reports that code;
+/// any other reports the code the SDK assigned, if any.
+#[tokio::test]
+async fn test_failed_head_reports_the_code_its_status_identifies() {
+    for (status, range, expected) in [
+        (412, None, Some("PreconditionFailed")),
+        (304, None, Some("NotModified")),
+        (416, Some("bytes=100-"), Some("InvalidRange")),
+        (404, None, Some("NotFound")),
+        (403, None, None),
+        (400, None, None),
+    ] {
+        let response = http::Response::builder()
+            .status(status)
+            .header("x-amz-request-id", "head-request")
+            .body(SdkBody::empty())
+            .unwrap();
+        let http_client =
+            StaticReplayClient::new(vec![ReplayEvent::new(dummy_expected_request(), response)]);
+        let tm = test_tm(http_client.clone(), ByteSize::mib(5).as_usize());
+
+        let mut request = tm
+            .download()
+            .bucket("test-bucket")
+            .key("test-object")
+            .if_match("\"stale-etag\"");
+        if let Some(range) = range {
+            request = request.range(range);
+        }
+        let mut handle = request.initiate().unwrap();
+        let _ = drain(&mut handle).await;
+        let error = handle.join().await.unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::ServiceError,
+            "{status}: {error:?}"
+        );
+        assert_eq!(error.operation_name(), Some("HeadObject"), "{status}");
+        assert_eq!(error.code(), expected, "{status}: {error:?}");
+        assert_eq!(error.request_id(), Some("head-request"), "{status}");
+        let methods: Vec<_> = http_client
+            .actual_requests()
+            .map(|request| request.method().to_owned())
+            .collect();
+        assert_eq!(methods, ["HEAD"], "{status}: no other request is sent");
+    }
+}
+
 /// A checksum-mode HEAD response for `len` bytes with `etag` and `headers`.
 fn head_with_headers(len: usize, etag: &str, headers: &[(&str, &str)]) -> ReplayEvent {
     let mut response = http::Response::builder()

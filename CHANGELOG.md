@@ -71,6 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ByteSize`'s `Display` replaces `ByteUnit::display`.
   `ByteCountDisplayContext` is renamed `ByteSizeDisplayContext`, and `ByteSize::display_as` is its
   only constructor: `ByteCountDisplayContext::new` is removed.
+- A download that discovers the object with HeadObject, which is every whole-object download with
+  checksum validation enabled, reports a failed discovery as S3 answers a failed HEAD: with the
+  status and request ids but no message, since a HEAD response has no body. The error code is
+  `PreconditionFailed` for 412, `NotModified` for 304, `InvalidRange` for 416, and `NotFound` for 404
+  (where GetObject reported `NoSuchKey`). Other statuses carry no code.
 - A download response whose `Content-Range` doesn't match the requested range fails with
   `ErrorKind::ServiceError`, carrying the operation and the response's request ids, whether discovery
   or a later range received it. It previously failed with `ErrorKind::ObjectNotDiscoverable` in

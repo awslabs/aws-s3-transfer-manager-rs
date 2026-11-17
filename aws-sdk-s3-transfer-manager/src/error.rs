@@ -123,6 +123,14 @@ pub enum ErrorKind {
     /// (`if_match` / `if_none_match` on an upload) arrives here with
     /// [`Error::code`] of `"PreconditionFailed"`; S3 reports that code in the
     /// response body, so it is available whatever HTTP status carries it.
+    ///
+    /// A whole-object download with checksum validation enabled, or a download of an
+    /// open-ended or suffix range, discovers the object with HeadObject. S3 answers a
+    /// failed HeadObject without a body, so the error carries the HTTP status and
+    /// request ids but no message, and a code only where the status identifies one:
+    /// `"PreconditionFailed"` for 412, `"NotModified"` for 304, `"InvalidRange"` for
+    /// 416, and the SDK's `"NotFound"` for 404. A missing key is `"NotFound"`, not
+    /// `"NoSuchKey"` as a failed GetObject reports.
     ServiceError,
 
     /// Object integrity validation failed: the received bytes did not match the
@@ -727,6 +735,42 @@ pub(crate) fn service_error<E: SdkOperationError>(e: SdkError<E, HttpResponse>) 
             transient_transport,
             ..Default::default()
         })),
+    }
+}
+
+/// Converts a failed HeadObject into an [`ErrorKind::ServiceError`].
+///
+/// S3 answers a failed HEAD with the status and request ids only. A HEAD response has
+/// no body, so it carries no error code or message. Where the status identifies a
+/// single S3 code, the code is filled in: 412 is `PreconditionFailed`, 304 is
+/// `NotModified`, and 416 is `InvalidRange`. Any other status keeps the code the SDK
+/// reported: `NotFound` for 404, and none otherwise.
+pub(crate) fn head_object_error(e: SdkError<HeadObjectError, HttpResponse>) -> Error {
+    let mut error = service_error(e);
+    let code = error
+        .extra
+        .as_ref()
+        .and_then(|extra| extra.http_status)
+        .and_then(head_status_code);
+    if let (Some(code), Some(service)) = (
+        code,
+        error
+            .extra
+            .as_mut()
+            .and_then(|extra| extra.service.as_mut()),
+    ) {
+        service.code.get_or_insert_with(|| code.to_owned());
+    }
+    error
+}
+
+/// The S3 error code a failed HEAD's `status` alone identifies, if there is exactly one.
+fn head_status_code(status: u16) -> Option<&'static str> {
+    match status {
+        304 => Some("NotModified"),
+        412 => Some("PreconditionFailed"),
+        416 => Some("InvalidRange"),
+        _ => None,
     }
 }
 
