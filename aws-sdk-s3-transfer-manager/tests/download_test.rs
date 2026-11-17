@@ -209,47 +209,54 @@ async fn test_object_meta_after_discovery_failure() {
 /// Connector modelling a ranged-GET object store for an object of `total`
 /// bytes.
 ///
-/// HEAD reports the object's metadata. The first GET is answered with the
-/// requested range. Every later GET stays
-/// in flight until its future is dropped; each one adds a permit to
+/// HEAD reports the object's metadata. The first GET, which must request a range
+/// starting at byte 0, is answered from `first_range`. Every later GET stays in
+/// flight until its future is dropped; each one adds a permit to
 /// `parked_started` when it begins.
+///
+/// The first GET is a range request that can run alongside a parked one, so its
+/// body is built before the download starts: generating it in `call()` would
+/// occupy a runtime worker that `abort()` waits for.
 #[derive(Debug)]
-struct ParkAfterDiscoveryConnector {
+struct ParkAfterFirstGetConnector {
     total: usize,
+    first_range: Bytes,
     requests: Arc<AtomicUsize>,
     parked_started: Arc<Semaphore>,
 }
 
-impl ParkAfterDiscoveryConnector {
-    fn discovery_response(&self, request: &HttpRequest) -> HttpResponse {
+impl ParkAfterFirstGetConnector {
+    fn first_range_response(&self, request: &HttpRequest) -> HttpResponse {
+        let total = self.total;
         let range = request
             .headers()
             .get("Range")
-            .expect("discovery GET must be ranged");
+            .expect("range GET must be ranged");
         let (start, end) = range
             .strip_prefix("bytes=")
             .and_then(|r| r.split_once('-'))
             .map(|(s, e)| (s.parse::<usize>().unwrap(), e.parse::<usize>().unwrap()))
             .unwrap_or_else(|| panic!("unexpected Range header: {range}"));
-        let end = cmp::min(end, self.total - 1);
+        let end = cmp::min(end, total - 1);
         let len = end - start + 1;
+        assert!(
+            start == 0 && len <= self.first_range.len(),
+            "unexpected first range: {range}"
+        );
 
         let mut response = HttpResponse::new(
             StatusCode::try_from(206).unwrap(),
-            SdkBody::from(rand_data(len)),
+            SdkBody::from(self.first_range.slice(..len)),
         );
         let headers = response.headers_mut();
         headers.insert("Content-Length", len.to_string());
-        headers.insert(
-            "Content-Range",
-            format!("bytes {start}-{end}/{}", self.total),
-        );
+        headers.insert("Content-Range", format!("bytes {start}-{end}/{total}"));
         headers.insert("ETag", "my-etag");
         response
     }
 }
 
-impl HttpConnector for ParkAfterDiscoveryConnector {
+impl HttpConnector for ParkAfterFirstGetConnector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
         if request.method() == "HEAD" {
             let mut response =
@@ -263,7 +270,7 @@ impl HttpConnector for ParkAfterDiscoveryConnector {
         assert_eq!("GET", request.method());
         let seq = self.requests.fetch_add(1, Ordering::SeqCst);
         if seq == 0 {
-            let response = self.discovery_response(&request);
+            let response = self.first_range_response(&request);
             return HttpConnectorFuture::ready(Ok(response));
         }
 
@@ -275,7 +282,7 @@ impl HttpConnector for ParkAfterDiscoveryConnector {
     }
 }
 
-/// `abort()` must return once ranged GETs following discovery are executing,
+/// `abort()` must return once ranged GETs following the first are executing,
 /// without waiting for those requests to complete on their own.
 ///
 /// The body is never consumed.
@@ -284,8 +291,10 @@ async fn abort_download_with_executing_gets(runtime_config: RuntimeConfig) {
     let part_size = ByteSize::mib(5).as_usize();
     let requests = Arc::new(AtomicUsize::new(0));
     let parked_started = Arc::new(Semaphore::new(0));
-    let connector = SharedHttpConnector::new(ParkAfterDiscoveryConnector {
+    let connector = SharedHttpConnector::new(ParkAfterFirstGetConnector {
         total,
+        // The body is never read, so its contents don't matter.
+        first_range: Bytes::from(vec![b'x'; part_size]),
         requests: requests.clone(),
         parked_started: parked_started.clone(),
     });
@@ -309,7 +318,7 @@ async fn abort_download_with_executing_gets(runtime_config: RuntimeConfig) {
 
     tokio::time::timeout(Duration::from_secs(5), parked_started.acquire())
         .await
-        .expect("no GET after discovery started")
+        .expect("no GET after the first started")
         .expect("start semaphore closed")
         .forget();
 
