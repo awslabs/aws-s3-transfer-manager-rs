@@ -209,14 +209,15 @@ async fn test_object_meta_after_discovery_failure() {
 /// Connector modelling a ranged-GET object store for an object of `total`
 /// bytes.
 ///
-/// HEAD reports the object's metadata. The first GET, which must request a range
-/// starting at byte 0, is answered with `first_range`. Every later GET stays in
-/// flight until its future is dropped; each one adds a permit to
-/// `parked_started` when it begins.
+/// HEAD reports the object's metadata. The first GET to arrive, whichever range
+/// it requests, is answered with that range, its body taken from `first_range`.
+/// Every later GET stays in flight until its future is dropped; each one adds a
+/// permit to `parked_started` when it begins.
 #[derive(Debug)]
 struct ParkAfterFirstGetConnector {
     total: usize,
-    /// The first GET's body, built before the download so `call()` does no work.
+    /// Bytes for the first GET's body, at least one part long, built before the
+    /// download so `call()` does no work.
     first_range: Bytes,
     requests: Arc<AtomicUsize>,
     parked_started: Arc<Semaphore>,
@@ -236,9 +237,10 @@ impl ParkAfterFirstGetConnector {
             .unwrap_or_else(|| panic!("unexpected Range header: {range}"));
         let end = cmp::min(end, total - 1);
         let len = end - start + 1;
+        // With two requests in flight, either of the first two ranges can arrive first.
         assert!(
-            start == 0 && len <= self.first_range.len(),
-            "unexpected first range: {range}"
+            len <= self.first_range.len(),
+            "range longer than a part: {range}"
         );
 
         let mut response = HttpResponse::new(
