@@ -102,8 +102,7 @@ pub enum ErrorKind {
     IOError,
 
     /// The transfer manager could not continue for an internal reason that is
-    /// neither an input, I/O, nor service failure: a worker panicked while
-    /// executing the transfer, or the memory budget could not admit a request.
+    /// not an input, I/O or service failure.
     RuntimeError,
 
     /// Object discovery failed for a reason that is not a service-call error, such

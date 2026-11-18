@@ -1685,11 +1685,12 @@ impl UploadTransfer {
     /// Handles a CompleteMultipartUpload error, or an error that stopped
     /// Complete from being sent.
     ///
-    /// During a caller's abort, `NoSuchUpload` means the abort won and no
-    /// object exists: S3 returns `NoSuchUpload` to a Complete sent after
-    /// AbortMultipartUpload, and 200 to a Complete retried after an earlier
-    /// one committed. Every other error, and any error outside an abort, fails
-    /// the transfer, which aborts the upload.
+    /// During a caller's abort, `NoSuchUpload` is taken to mean the abort won,
+    /// and the upload ends `Cancelled`: S3 returns `NoSuchUpload` to a Complete
+    /// sent after AbortMultipartUpload. It does not prove that no object
+    /// exists: a Complete retried after an earlier attempt committed can also
+    /// be answered with `NoSuchUpload`. Every other error, and any error
+    /// outside an abort, fails the transfer, which aborts the upload.
     fn complete_mpu_failed(&self, error: Error) -> WorkOutcome {
         let no_such_upload = error.code() == Some("NoSuchUpload");
         let mut state = self.inner.state.lock().expect("lock poisoned");

@@ -7,7 +7,7 @@ license = "Apache-2.0"
 rust-version = "1.96.0"
 repository = "https://github.com/awslabs/aws-s3-transfer-manager-rs"
 description = """
-A high performance Amazon S3 transfer manager for Rust.
+Transfer Manager for Amazon S3 - a high-performance data plane client for uploading and downloading objects and directories.
 """
 categories = ["asynchronous", "concurrency"]
 keywords = ["AWS", "Amazon", "S3", "high-performance", "transfer-manager"]

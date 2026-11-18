@@ -19,8 +19,13 @@ use crate::types::{AbortOutcome, AbortedUpload};
 /// **Handles should be kept until the transfer completes or is explicitly cancelled.**
 /// The recommended pattern is to call [`join`](Self::join) to wait for completion:
 ///
-/// ```ignore
-/// let handle = tm.upload()
+/// ```no_run
+/// use aws_sdk_s3_transfer_manager::io::InputStream;
+///
+/// # async fn example(client: &aws_sdk_s3_transfer_manager::Client) -> Result<(), aws_sdk_s3_transfer_manager::error::Error> {
+/// let stream = InputStream::from_path("/path/to/file")?;
+/// let handle = client
+///     .upload()
 ///     .bucket("my-bucket")
 ///     .key("my-key")
 ///     .body(stream)
@@ -28,6 +33,7 @@ use crate::types::{AbortOutcome, AbortedUpload};
 ///
 /// // Wait for upload to complete
 /// let output = handle.join().await?;
+/// # Ok(()) }
 /// ```
 ///
 /// # Custom stream bodies
@@ -140,15 +146,20 @@ impl UploadHandle {
     ///
     /// What happens depends on how far the upload got:
     ///
-    /// - Before CreateMultipartUpload is sent: returns
+    /// - Before CreateMultipartUpload or PutObject is sent: returns
     ///   [`AbortOutcome::Cancelled`] with no upload ID.
+    /// - While PutObject is in flight: the request is interrupted. Returns
+    ///   [`AbortOutcome::AlreadyCompleted`] if its response arrived first,
+    ///   otherwise [`AbortOutcome::Cancelled`] with no upload ID. S3 may have
+    ///   stored the object if it received the whole request.
     /// - After CreateMultipartUpload is sent: sends AbortMultipartUpload once
     ///   the upload ID is known. Returns [`AbortOutcome::Cancelled`] with the
     ///   upload ID.
     /// - While CompleteMultipartUpload is in flight: also sends
     ///   AbortMultipartUpload and waits for both. Returns
     ///   [`AbortOutcome::AlreadyCompleted`] if S3 created the object first,
-    ///   otherwise [`AbortOutcome::Cancelled`].
+    ///   otherwise [`AbortOutcome::Cancelled`]. `Cancelled` does not prove
+    ///   that no object exists: see [`AbortOutcome::Cancelled`].
     /// - After the object was created: returns
     ///   [`AbortOutcome::AlreadyCompleted`] with the upload output. The object
     ///   is not deleted.

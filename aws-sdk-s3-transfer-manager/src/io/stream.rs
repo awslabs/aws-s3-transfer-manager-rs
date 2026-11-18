@@ -75,10 +75,18 @@ impl InputStream {
     /// Create a new `InputStream` that reads data from a given `path`.
     ///
     /// ## Warning
-    /// The contents of the file MUST not change. The length & checksum of the file
-    /// will be cached. If the contents of the file change, the operation will almost certainly fail.
+    /// The file must not be modified until the upload completes. The stream records the file's
+    /// length when it is built and reads the contents as the upload proceeds. Each attempt of a
+    /// single-request upload reads the file again and calculates its checksum from the bytes read.
+    /// A multipart upload reads each part from the file once, and every attempt of that part sends
+    /// the same bytes.
     ///
-    /// Furthermore, a partial write MAY seek in the file and resume from the previous location.
+    /// A change during the upload is not detected: a file shortened below the recorded length
+    /// fails the upload, bytes past the recorded length are not uploaded, and bytes rewritten in
+    /// place are uploaded with checksums that match the rewritten data. To have S3 reject an object
+    /// that doesn't match the file as it was before the upload, calculate the file's full object
+    /// checksum first and supply it as the expected full object checksum in a
+    /// [`ChecksumStrategy`](crate::operation::upload::ChecksumStrategy).
     ///
     /// The path must name a regular file, directly or through symbolic links.
     /// Upload pipes and devices with [`InputStream::from_part_stream`] and
@@ -417,9 +425,13 @@ pub trait PartStream {
     /// Polls for the next complete upload part.
     ///
     /// Returns [`Poll::Ready(Some(Ok(part)))`](std::task::Poll::Ready) when one part is available.
-    /// Parts should contain [`StreamContext::part_size`] bytes except for the final part, which may
-    /// be shorter. Returns [`Poll::Ready(None)`](std::task::Poll::Ready) at end-of-stream. The
-    /// transfer manager does not poll the stream again after end-of-stream or an error.
+    /// Returns [`Poll::Ready(None)`](std::task::Poll::Ready) at end-of-stream. The transfer manager
+    /// does not poll the stream again after end-of-stream or an error.
+    ///
+    /// The transfer manager does not check part sizes. S3 requires every part except the
+    /// highest-numbered one to be at least 5 MiB; a smaller part is uploaded, and the upload fails
+    /// when S3 rejects `CompleteMultipartUpload`. [`StreamContext::part_size`] is the size the
+    /// transfer manager uses for its own parts.
     ///
     /// Each part's number is its position in the object, between 1 and 10,000, unique within the
     /// upload, and best numbered 1 to N without gaps. Parts may be returned in any order (see

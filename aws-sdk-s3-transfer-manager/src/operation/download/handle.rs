@@ -149,18 +149,19 @@ impl DownloadHandleInner {
 ///
 /// Adjusts how the transfer moves data, as opposed to how it is scheduled relative
 /// to other transfers (that is [`SchedulingCtl`](crate::transfer::SchedulingCtl)).
-/// Obtained via [`DownloadHandle::io_ctl()`].
+/// Obtained via [`DownloadHandle::io_ctl()`] or [`ManagedDownloadHandle::io_ctl()`].
 #[derive(Debug)]
 pub struct DownloadIoCtl<'a> {
     transfer: &'a DownloadTransfer,
 }
 
 impl<'a> DownloadIoCtl<'a> {
-    /// Set how far this download prefetches ahead of the consumer, overriding the
-    /// value resolved at initiation. Takes effect on the next issuance decision.
+    /// Sets how far this download fetches ahead of the data its consumer has
+    /// taken, replacing the value resolved at initiation; takes effect on the
+    /// next fetch decision.
     ///
-    /// Lowering the window caps resident memory for a consumer that has fallen
-    /// behind; raising it restores prefetch depth once the consumer catches up.
+    /// Lowering it limits what a slow consumer's download holds; raising it
+    /// restores prefetch once the consumer catches up.
     pub fn set_read_ahead(&self, mode: crate::config::ReadAhead) {
         self.transfer.set_read_ahead(&mode);
     }
@@ -295,10 +296,6 @@ impl DownloadHandle {
     ///
     /// If the body has not been fully consumed, this will cancel the transfer
     /// and wait for outstanding work to complete before returning.
-    ///
-    /// TODO: Currently, in-flight work is only cancelled when join() is called
-    /// after a failure. Consider proactively cancelling on failure so resources are
-    /// released without requiring user action.
     pub async fn join(mut self) -> Result<DownloadOutput, error::Error> {
         // Close body - we're done consuming (or never started)
         self.body.close();
@@ -357,16 +354,21 @@ impl Drop for DownloadHandle {
     }
 }
 
-/// Handle to an in-progress download-to-file operation.
+/// Handle to an in-progress download that writes to a file.
 ///
-/// Returned by `write_to_path` and similar methods. Unlike [`DownloadHandle`],
-/// this handle does not expose a body — the transfer manager writes data
-/// directly to disk.
+/// Returned by
+/// [`write_to_path`](crate::operation::download::builders::DownloadFluentBuilder::write_to_path)
+/// and
+/// [`write_to_file`](crate::operation::download::builders::DownloadFluentBuilder::write_to_file).
+/// Unlike [`DownloadHandle`], this handle does not expose a body; the transfer
+/// manager writes the data to the file.
 ///
-/// Data is written to a temporary file (`{dest}.s3tmp.{id}`) during the
-/// transfer. On successful completion via [`join`](Self::join), the temporary
-/// file is atomically renamed to the destination path. On failure,
-/// cancellation, or drop, the temporary file is deleted.
+/// For a path destination, data is written to a temporary file named
+/// `{file name}.s3tmp.{suffix}` in the destination's directory, where
+/// `{file name}` is the destination's file name and `{suffix}` is 8 random
+/// hexadecimal digits. A successful [`join`](Self::join) renames the temporary
+/// file to the destination path. On failure, cancellation, or drop, the
+/// temporary file is deleted.
 ///
 /// Success means the operating system accepted every byte and, for a managed
 /// path, completed the rename. The transfer manager does not call `sync_data`,

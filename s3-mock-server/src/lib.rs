@@ -5,9 +5,9 @@
 
 //! S3 Mock Server
 //!
-//! A mock S3 server for testing and benchmarking the AWS S3 Transfer Manager.
+//! A mock S3 server for testing and benchmarking Transfer Manager for Amazon S3.
 //! This crate provides a local HTTP server that implements the S3 API operations
-//! required by the Transfer Manager, allowing for comprehensive testing of
+//! required by the transfer manager, allowing for comprehensive testing of
 //! concurrent operations, error handling, and performance characteristics.
 
 mod bucket;
@@ -39,3 +39,8 @@ pub use server::{
 };
 pub use storage::models::RestoreStatus;
 pub use types::composite_checksum;
+
+/// Compiles the package README's examples as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

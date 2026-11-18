@@ -85,3 +85,8 @@ pub use shutdown::ShutdownCompletion;
 
 /// Hardware topology and placement primitives.
 pub use aws_smithy_topology as topology;
+
+/// Compiles the package README's examples as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

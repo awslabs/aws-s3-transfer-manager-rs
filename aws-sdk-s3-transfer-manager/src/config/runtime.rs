@@ -20,6 +20,29 @@ use aws_smithy_types::error::operation::BuildError;
 /// let managed = RuntimeConfig::managed(Managed::default());
 /// let caller_runtime = RuntimeConfig::multi_thread_tokio();
 /// ```
+///
+/// # HTTP transport
+///
+/// With managed execution and no HTTP client configured, the transfer manager
+/// builds its own transport:
+///
+/// - One connection pool, partitioned by managed thread, so each connection is
+///   driven by the thread that opened it.
+/// - Connections per host capped according to the process's file-descriptor
+///   limit. Requests beyond the cap wait for a connection.
+/// - Proxy settings from `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and
+///   `NO_PROXY`.
+///
+/// wasm targets have no such transport; see [`Managed`].
+///
+/// An HTTP client set on the [`SdkConfig`](aws_types::SdkConfig) or S3
+/// configuration replaces this transport: its pool, TLS, DNS and proxy settings
+/// apply, its connections are not partitioned by managed thread, and the
+/// transfer manager does not cap its connections per host. With
+/// [`multi_thread_tokio`](Self::multi_thread_tokio), the S3 client uses the
+/// configured HTTP client or, without one, the SDK default.
+///
+/// Configure an HTTP client to change TLS, DNS or connection settings.
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct RuntimeConfig {

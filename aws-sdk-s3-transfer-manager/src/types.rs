@@ -50,7 +50,13 @@ pub struct AbortedUpload {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AbortOutcome {
-    /// The upload was stopped before S3 completes the object.
+    /// The abort stopped the upload, and the transfer manager did not observe S3 store the
+    /// object.
+    ///
+    /// S3 may still have stored it: a PutObject interrupted by the abort may have completed in
+    /// S3, and a CompleteMultipartUpload retried after an earlier attempt committed can be
+    /// answered with `NoSuchUpload`. Check for the object, for example with HeadObject, when
+    /// this matters.
     #[default]
     Cancelled,
     /// S3 finished storing the object before the abort took effect. The object is not
@@ -100,8 +106,8 @@ pub enum FailedTransferPolicy {
     /// Abort the transfer on any individual failure to upload or download an object
     #[default]
     Abort,
-    /// Continue the transfer. Any failure will be logged and the details of all failed
-    /// objects will be available in the output after the transfer completes.
+    /// Continue the transfer. The details of each failed object are available in the output
+    /// after the transfer completes.
     Continue,
 }
 

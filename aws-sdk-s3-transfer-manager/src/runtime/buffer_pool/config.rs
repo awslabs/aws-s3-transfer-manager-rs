@@ -96,7 +96,9 @@ impl BufferPoolBuilder {
     /// capacity policy requires it.
     ///
     /// Construction fixes capacity and geometry but does not reserve virtual
-    /// ranges, prepare physical memory, or start the maintenance worker.
+    /// ranges or prepare physical memory. It reads `AWS_S3_TM_DIAGNOSTICS`, and
+    /// starts the pool's maintenance thread only when that setting enables
+    /// periodic memory snapshots (`memory.snapshot`).
     pub fn build(self) -> Result<super::BufferPool, BufferPoolBuildError> {
         let needs_memory_detection = match self.memory_budget {
             MemoryBudgetConfig::Auto => true,
