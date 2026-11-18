@@ -24,14 +24,14 @@ use crate::config::{ConcurrencyMode, MemoryConfig, PartSize, ReadAhead};
 ///
 /// ```no_run
 /// # async fn example() {
-/// use aws_sdk_s3_transfer_manager::config::PartSize;
-/// use aws_sdk_s3_transfer_manager::types::ByteSize;
+/// use aws_s3_transfer::config::PartSize;
+/// use aws_s3_transfer::types::ByteSize;
 ///
-/// let config = aws_sdk_s3_transfer_manager::from_env()
+/// let config = aws_s3_transfer::from_env()
 ///     .part_size(PartSize::Target(ByteSize::mib(16)))
 ///     .load()
 ///     .await;
-/// let client = aws_sdk_s3_transfer_manager::Client::new(config);
+/// let client = aws_s3_transfer::Client::new(config);
 /// # }
 /// ```
 #[derive(Default, Debug)]
@@ -114,7 +114,7 @@ impl ConfigLoader {
     ///
     /// ```no_run
     /// # async fn example(sdk_config: aws_config::SdkConfig) {
-    /// let config = aws_sdk_s3_transfer_manager::from_env()
+    /// let config = aws_s3_transfer::from_env()
     ///     .s3_config(&sdk_config)
     ///     .load()
     ///     .await;

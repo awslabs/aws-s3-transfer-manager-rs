@@ -6,7 +6,7 @@
 //! Buffer-pool benchmark entry point.
 //!
 //! The benchmarks reach the crate-private allocation API through
-//! `aws_sdk_s3_transfer_manager::__bench`, which exists only when both crates
+//! `aws_s3_transfer::__bench`, which exists only when both crates
 //! are built with `RUSTFLAGS='--cfg s3_tm_bench'`. Without the cfg this target
 //! builds a `main` that reports how to enable the benchmarks.
 

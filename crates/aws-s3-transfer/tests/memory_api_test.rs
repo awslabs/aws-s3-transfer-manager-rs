@@ -3,14 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_sdk_s3_transfer_manager::types::ByteSize;
+use aws_s3_transfer::types::ByteSize;
 use std::error::Error;
 use std::io;
 use std::task::{Context, Poll, Waker};
 
-use aws_sdk_s3_transfer_manager::config::{MemoryBudgetConfig, MemoryConfig};
-use aws_sdk_s3_transfer_manager::io::PartBuffer;
-use aws_sdk_s3_transfer_manager::memory::{
+use aws_s3_transfer::config::{MemoryBudgetConfig, MemoryConfig};
+use aws_s3_transfer::io::PartBuffer;
+use aws_s3_transfer::memory::{
     BufferPool, BufferPoolBuildError, BufferPoolBuilder, SegmentedBytes,
 };
 use bytes::Buf;

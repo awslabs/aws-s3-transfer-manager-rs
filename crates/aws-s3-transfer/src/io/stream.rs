@@ -55,7 +55,7 @@ impl InputStream {
     ///
     /// ```no_run
     /// # {
-    /// use aws_sdk_s3_transfer_manager::io::InputStream;
+    /// use aws_s3_transfer::io::InputStream;
     ///
     /// async fn input_stream_from_file() -> InputStream {
     ///     let stream = InputStream::read_from()
@@ -102,7 +102,7 @@ impl InputStream {
     ///
     /// # Examples
     /// ```no_run
-    /// use aws_sdk_s3_transfer_manager::io::InputStream;
+    /// use aws_s3_transfer::io::InputStream;
     /// use std::path::Path;
     ///  async fn make_stream() -> InputStream {
     ///     InputStream::from_path("docs/rows.csv").expect("file should be readable")

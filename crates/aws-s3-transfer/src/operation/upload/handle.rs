@@ -20,9 +20,9 @@ use crate::types::{AbortOutcome, AbortedUpload};
 /// The recommended pattern is to call [`join`](Self::join) to wait for completion:
 ///
 /// ```no_run
-/// use aws_sdk_s3_transfer_manager::io::InputStream;
+/// use aws_s3_transfer::io::InputStream;
 ///
-/// # async fn example(client: &aws_sdk_s3_transfer_manager::Client) -> Result<(), aws_sdk_s3_transfer_manager::error::Error> {
+/// # async fn example(client: &aws_s3_transfer::Client) -> Result<(), aws_s3_transfer::error::Error> {
 /// let stream = InputStream::from_path("/path/to/file")?;
 /// let handle = client
 ///     .upload()

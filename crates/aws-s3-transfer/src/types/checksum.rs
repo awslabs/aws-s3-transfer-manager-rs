@@ -26,8 +26,8 @@ pub trait Algorithm: sealed::Sealed + Copy {
 /// stores a full object checksum.
 ///
 /// ```no_run
-/// use aws_sdk_s3_transfer_manager::types::checksum::Crc64Nvme;
-/// use aws_sdk_s3_transfer_manager::types::ChecksumStrategy;
+/// use aws_s3_transfer::types::checksum::Crc64Nvme;
+/// use aws_s3_transfer::types::ChecksumStrategy;
 ///
 /// let strategy = ChecksumStrategy::full_object(Crc64Nvme);
 /// ```
@@ -35,8 +35,8 @@ pub trait Algorithm: sealed::Sealed + Copy {
 /// A SHA algorithm is not a full object algorithm:
 ///
 /// ```compile_fail
-/// use aws_sdk_s3_transfer_manager::types::checksum::Sha256;
-/// use aws_sdk_s3_transfer_manager::types::ChecksumStrategy;
+/// use aws_s3_transfer::types::checksum::Sha256;
+/// use aws_s3_transfer::types::ChecksumStrategy;
 ///
 /// let strategy = ChecksumStrategy::full_object(Sha256);
 /// ```
@@ -50,8 +50,8 @@ pub trait FullObjectAlgorithm: Algorithm {}
 /// An algorithm S3 supports as a composite checksum for multipart uploads.
 ///
 /// ```no_run
-/// use aws_sdk_s3_transfer_manager::types::checksum::Crc32;
-/// use aws_sdk_s3_transfer_manager::types::ChecksumStrategy;
+/// use aws_s3_transfer::types::checksum::Crc32;
+/// use aws_s3_transfer::types::ChecksumStrategy;
 ///
 /// let strategy = ChecksumStrategy::composite(Crc32);
 /// ```
@@ -59,8 +59,8 @@ pub trait FullObjectAlgorithm: Algorithm {}
 /// CRC64NVME is not a composite algorithm:
 ///
 /// ```compile_fail
-/// use aws_sdk_s3_transfer_manager::types::checksum::Crc64Nvme;
-/// use aws_sdk_s3_transfer_manager::types::ChecksumStrategy;
+/// use aws_s3_transfer::types::checksum::Crc64Nvme;
+/// use aws_s3_transfer::types::ChecksumStrategy;
 ///
 /// let strategy = ChecksumStrategy::composite(Crc64Nvme);
 /// ```

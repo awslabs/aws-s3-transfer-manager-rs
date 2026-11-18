@@ -15,10 +15,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
-use aws_sdk_s3_transfer_manager::io::walk::S3Walker;
-use aws_sdk_s3_transfer_manager::types::ByteSize;
-use aws_sdk_s3_transfer_manager::types::FailedTransferPolicy;
+use aws_s3_transfer::config::RuntimeConfig;
+use aws_s3_transfer::io::walk::S3Walker;
+use aws_s3_transfer::types::ByteSize;
+use aws_s3_transfer::types::FailedTransferPolicy;
 use s3_mock_server::{FaultType, Occurrence, S3MockServer};
 
 use crate::assertions::wait_for_finished_elapsed;
@@ -895,10 +895,7 @@ async fn test_download_objects_destination_file_is_input_invalid() {
             .join()
             .await
             .expect_err("a file destination must fail");
-        assert_eq!(
-            &aws_sdk_s3_transfer_manager::error::ErrorKind::InputInvalid,
-            err.kind()
-        );
+        assert_eq!(&aws_s3_transfer::error::ErrorKind::InputInvalid, err.kind());
         assert_eq!(b"not a directory".as_slice(), std::fs::read(&dest).unwrap());
 
         m.handle.shutdown().await.expect("shutdown");
@@ -1046,7 +1043,7 @@ async fn test_download_objects_key_path_safety() {
         );
         for failed in output.failed_transfers() {
             assert_eq!(
-                &aws_sdk_s3_transfer_manager::error::ErrorKind::InputInvalid,
+                &aws_s3_transfer::error::ErrorKind::InputInvalid,
                 failed.error().kind()
             );
         }
@@ -1115,9 +1112,9 @@ fn file_sizes(dir: &Path) -> std::collections::BTreeMap<PathBuf, u64> {
 /// local path, the only failure the ported cases expect.
 async fn run_corpus_case(case: CorpusCase) {
     let m = crate::harness::mock_tm_with(RuntimeConfig::default(), |b| {
-        b.part_size(aws_sdk_s3_transfer_manager::config::PartSize::Target(
-            ByteSize::new(CORPUS_PART_SIZE),
-        ))
+        b.part_size(aws_s3_transfer::config::PartSize::Target(ByteSize::new(
+            CORPUS_PART_SIZE,
+        )))
     })
     .await;
     let bucket = "test-bucket";
@@ -1160,7 +1157,7 @@ async fn run_corpus_case(case: CorpusCase) {
     );
     for failed in output.failed_transfers() {
         assert_eq!(
-            &aws_sdk_s3_transfer_manager::error::ErrorKind::InputInvalid,
+            &aws_s3_transfer::error::ErrorKind::InputInvalid,
             failed.error().kind(),
             "key {:?}",
             failed.input().key()
@@ -1446,7 +1443,7 @@ async fn test_upload_then_download_objects_roundtrip(rt: RuntimeConfig) {
         }
 
         // Upload the directory tree.
-        use aws_sdk_s3_transfer_manager::io::walk::FsWalker;
+        use aws_s3_transfer::io::walk::FsWalker;
         let upload_handle = m
             .client
             .upload_objects()

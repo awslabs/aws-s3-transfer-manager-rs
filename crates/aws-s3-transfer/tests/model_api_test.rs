@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_sdk_s3_transfer_manager::config::ReadAhead;
-use aws_sdk_s3_transfer_manager::{
+use aws_s3_transfer::config::ReadAhead;
+use aws_s3_transfer::{
     io::InputStream,
     types::{
         builders::{DownloadInputBuilder, UploadInputBuilder},
@@ -148,14 +148,14 @@ fn sensitive_input_and_builder_debug_redacts_real_modeled_members() {
 
 #[test]
 fn existing_operation_input_paths_remain_available() {
-    let _: aws_sdk_s3_transfer_manager::operation::download::DownloadInput =
-        aws_sdk_s3_transfer_manager::operation::download::DownloadInput::builder()
+    let _: aws_s3_transfer::operation::download::DownloadInput =
+        aws_s3_transfer::operation::download::DownloadInput::builder()
             .bucket("bucket")
             .key("key")
             .build()
             .unwrap();
-    let _: aws_sdk_s3_transfer_manager::operation::upload::UploadInput =
-        aws_sdk_s3_transfer_manager::operation::upload::UploadInput::builder()
+    let _: aws_s3_transfer::operation::upload::UploadInput =
+        aws_s3_transfer::operation::upload::UploadInput::builder()
             .bucket("bucket")
             .key("key")
             .body(InputStream::from_static(b""))

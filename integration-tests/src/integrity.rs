@@ -112,12 +112,12 @@ use crate::assertions::{
     assert_integrity_error, assert_not_validated, assert_same_content, assert_validated,
 };
 use crate::harness::{BucketKind, Target};
-use aws_sdk_s3_transfer_manager::config::PartSize;
-use aws_sdk_s3_transfer_manager::types::checksum::{Crc32, Sha256};
-use aws_sdk_s3_transfer_manager::types::ByteSize;
-use aws_sdk_s3_transfer_manager::types::ChecksumMode;
-use aws_sdk_s3_transfer_manager::types::ChecksumStrategy;
-use aws_sdk_s3_transfer_manager::types::{ChecksumAlgorithm, NotValidatedReason};
+use aws_s3_transfer::config::PartSize;
+use aws_s3_transfer::types::checksum::{Crc32, Sha256};
+use aws_s3_transfer::types::ByteSize;
+use aws_s3_transfer::types::ChecksumMode;
+use aws_s3_transfer::types::ChecksumStrategy;
+use aws_s3_transfer::types::{ChecksumAlgorithm, NotValidatedReason};
 use s3_mock_server::{FaultType, Occurrence};
 
 /// A part size pinned equally for upload and download. Multipart downloads align
@@ -396,12 +396,12 @@ async fn multipart_composite(target: Target) {
     assert_eq!(output.integrity_checks().checksum_sha256(), None);
     assert_eq!(
         output.integrity_checks().checksum_type(),
-        Some(&aws_sdk_s3_transfer_manager::types::ChecksumType::Composite)
+        Some(&aws_s3_transfer::types::ChecksumType::Composite)
     );
     assert_eq!(output.object_meta.checksum_sha256, None);
     assert_eq!(
         output.object_meta.checksum_type,
-        Some(aws_sdk_s3_transfer_manager::types::ChecksumType::Composite)
+        Some(aws_s3_transfer::types::ChecksumType::Composite)
     );
     assert_validated(&output, ChecksumAlgorithm::Sha256);
 
@@ -585,7 +585,7 @@ async fn integrity_error_carries_extracted_fields_mock_gp() {
 
     assert_eq!(
         ie.algorithm(),
-        Some(&aws_sdk_s3_transfer_manager::types::ChecksumAlgorithm::Crc32),
+        Some(&aws_s3_transfer::types::ChecksumAlgorithm::Crc32),
         "the algorithm should come from the SDK's checksum outcome"
     );
     assert!(
@@ -835,8 +835,8 @@ static SERIAL_TEST_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(
 
 #[cfg(e2e_test)]
 async fn large_object_file_download_validates(target: Target) {
-    use aws_sdk_s3_transfer_manager::config::PartSize;
-    use aws_sdk_s3_transfer_manager::types::checksum::Crc64Nvme;
+    use aws_s3_transfer::config::PartSize;
+    use aws_s3_transfer::types::checksum::Crc64Nvme;
 
     // Hold the gate for the whole test so peak temp-disk usage stays within one
     // test's footprint (see SERIAL_TEST_GATE).

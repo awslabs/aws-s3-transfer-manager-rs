@@ -32,10 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signal it came from, memory ceiling, part size, connection cap), a `WARN` when the part size
   exceeds the memory ceiling, and a `WARN` when the soft file-descriptor limit holds connections
   per host below the concurrency target.
-- `aws-sdk-s3-transfer-manager`: downloads report `ChecksumValidation::Validated` when a response
+- `aws-s3-transfer`: downloads report `ChecksumValidation::Validated` when a response
   checksum covered every delivered byte and every one of those checksums matched.
   `IntegrityChecks::checksum_validation` previously never reported `Validated`.
-- `aws-sdk-s3-transfer-manager`: `NotValidatedReason::UnsupportedAlgorithm`, reported when a
+- `aws-s3-transfer`: `NotValidatedReason::UnsupportedAlgorithm`, reported when a
   download's responses carried checksums only in algorithms the SDK does not compute, such as MD5.
 - `io::PartBuffer::new` creates a buffer for one upload part charged to a caller's
   `memory::BufferPool`. `PartBuffer::writable` returns the bytes writable without another
@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upload with one fails `initiate` with `ErrorKind::InputInvalid` before any request is sent.
 
 ### Changed
+- `aws-sdk-s3-transfer-manager` is renamed `aws-s3-transfer`, imported as `aws_s3_transfer`, and
+  `aws-sdk-s3-transfer-manager-ext` is renamed `aws-s3-transfer-ext`, imported as
+  `aws_s3_transfer_ext`. Tracing targets start with `aws_s3_transfer::` instead of
+  `aws_sdk_s3_transfer_manager::`.
 - `TransferMetrics::started_at` and `TransferMetrics::finished_at` are replaced by
   `TransferMetrics::elapsed`: the time from when the transfer was initiated until it recorded its
   finish, or until the snapshot if it has not. The metrics in an operation's output hold the final
@@ -95,7 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single-part object no larger than the part size is downloaded with one checksum-mode GET pinned to
   its listed ETag, falling back to HEAD if the object changed since the listing. Caller-range and
   validation-off downloads retain their existing discovery paths.
-- `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
+- `aws-s3-transfer`, `aws-s3-transfer-ext`, `aws-smithy-topology`,
   `aws-smithy-execution` and `aws-smithy-managed-http`: the minimum supported Rust version is
   1.96.0.
 - `error::Error` no longer implements `From<tokio::task::JoinError>` or
@@ -108,7 +112,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connections to network interfaces, build a `ManagedRuntime`, set the S3 configuration's HTTP
   client to an `aws_smithy_managed_http::client::ManagedHttpPool` over a connection pool whose
   partitions, one per runtime thread, bind to the interfaces, and adopt the runtime with
-  `aws_sdk_s3_transfer_manager_ext::managed`. `examples/cp.rs` builds this for
+  `aws_s3_transfer_ext::managed`. `examples/cp.rs` builds this for
   `--network-interfaces`.
 - `io::error` is no longer public. `InputStream::from_path` and `PathBodyBuilder::build` return
   `error::Error`: a missing path or an offset past the end of the file is
@@ -145,7 +149,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `dial9` feature, `config::Builder::dial9_handle`, and `ConfigLoader::dial9_handle` are
   removed. To trace managed execution, pass the recorder's handle to
   `ManagedRuntime::builder().dial9_handle`, then adopt the runtime with
-  `aws_sdk_s3_transfer_manager_ext::managed`. The `aws-sdk-s3-transfer-manager-ext` `dial9` feature
+  `aws_s3_transfer_ext::managed`. The `aws-s3-transfer-ext` `dial9` feature
   enables `aws-smithy-execution/dial9` only.
 - The hidden `config::Builder::framework_metadata`, `ConfigLoader::framework_metadata`, and
   `Config::framework_metadata` are removed. Set framework metadata on the `SdkConfig` or S3
@@ -181,7 +185,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of 128.
 - The automatic memory ceiling for a client is at least 256 MiB, limited to half of detected
   memory. `BufferPool` built with `MemoryBudgetConfig::Auto` directly is unchanged.
-- `aws-sdk-s3-transfer-manager`: the minimum `aws-sdk-s3` is now 1.158.0, the first release that
+- `aws-s3-transfer`: the minimum `aws-sdk-s3` is now 1.158.0, the first release that
   reports the response checksum outcome the verdict is built from.
 - The bandwidth table adds m5n, m5dn, r5n, r5dn, m5zn, x2iezn, d3, d3en, is4gen, c8ine, g4dn
   and g6e, and uses one network card's bandwidth for p5, p5e, p5en, p6-b200, p6-b300, trn1 and
@@ -234,13 +238,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.`, `./`, or `a/..`, with `ErrorKind::InputInvalid` before creating any file or requesting the
   object. Such an object was previously downloaded to a temporary file beside the destination
   and then failed to be renamed onto it.
-- `aws-sdk-s3-transfer-manager`: `IntegrityError::algorithm()` now names the algorithm on a
+- `aws-s3-transfer`: `IntegrityError::algorithm()` now names the algorithm on a
   checksum mismatch. It was always `None`.
-- `aws-sdk-s3-transfer-manager`: an upload now fails with `ErrorKind::InputInvalid` when a checksum the
+- `aws-s3-transfer`: an upload now fails with `ErrorKind::InputInvalid` when a checksum the
   caller supplied cannot be sent. A `PartStream` part that carries
   a checksum on an upload with no `ChecksumStrategy`, and a `content_md5` on a multipart upload, are
   both rejected before any request is sent.
-- `aws-sdk-s3-transfer-manager`: a download no longer reports a checksum value that does not cover
+- `aws-s3-transfer`: a download no longer reports a checksum value that does not cover
   the whole object.
 
 ## [release-2026-11-05]

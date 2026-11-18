@@ -7,9 +7,9 @@
 
 use super::{head_event, object_connector};
 use crate::{common, dummy_expected_request, rand_data};
-use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
-use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize};
-use aws_sdk_s3_transfer_manager::types::ByteSize;
+use aws_s3_transfer::config::RuntimeConfig;
+use aws_s3_transfer::config::{ConcurrencyMode, PartSize};
+use aws_s3_transfer::types::ByteSize;
 use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
 use aws_smithy_types::body::SdkBody;
 use std::time::Duration;
@@ -120,16 +120,14 @@ impl OpenFileProbe {
 }
 
 /// Drops the client and waits for its managed threads to join.
-pub(crate) async fn drop_and_await_shutdown(tm: aws_sdk_s3_transfer_manager::Client) {
+pub(crate) async fn drop_and_await_shutdown(tm: aws_s3_transfer::Client) {
     let completion = tm.shutdown_completion();
     drop(tm);
     await_shutdown(completion).await;
 }
 
 /// Waits for managed-runtime teardown, if the client owns a managed runtime.
-pub(crate) async fn await_shutdown(
-    completion: Option<aws_sdk_s3_transfer_manager::ShutdownCompletion>,
-) {
+pub(crate) async fn await_shutdown(completion: Option<aws_s3_transfer::ShutdownCompletion>) {
     if let Some(completion) = completion {
         tokio::time::timeout(Duration::from_secs(5), completion.wait())
             .await
@@ -202,14 +200,14 @@ pub(crate) async fn assert_download_releases_destination(
         ]),
         _ => object_connector(&data, part_size),
     };
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
+    let config = aws_s3_transfer::Config::builder()
         .s3_config(common::s3_config(http_client))
         .part_size(PartSize::Target(ByteSize::new(part_size as u64)))
         .concurrency(ConcurrencyMode::Explicit(1))
         .runtime_config(runtime_config)
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = aws_s3_transfer::Client::new(config);
 
     let dir = tempfile::tempdir().unwrap();
     let dest_path = dir.path().join("output.dat");

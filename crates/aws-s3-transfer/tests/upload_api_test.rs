@@ -12,18 +12,18 @@ use std::{
 };
 
 #[cfg(feature = "sdk-v1")]
-use aws_sdk_s3::operation::{
-    complete_multipart_upload::CompleteMultipartUploadOutput,
-    create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput,
-    upload_part::UploadPartOutput,
-};
-#[cfg(feature = "sdk-v1")]
-use aws_sdk_s3_transfer_manager::io::{PartData, PartStream, SizeHint, StreamContext};
-use aws_sdk_s3_transfer_manager::{
+use aws_s3_transfer::io::{PartData, PartStream, SizeHint, StreamContext};
+use aws_s3_transfer::{
     io::InputStream,
     operation::upload,
     types::{self, ChecksumStrategy},
     Client, Config,
+};
+#[cfg(feature = "sdk-v1")]
+use aws_sdk_s3::operation::{
+    complete_multipart_upload::CompleteMultipartUploadOutput,
+    create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput,
+    upload_part::UploadPartOutput,
 };
 #[cfg(feature = "sdk-v1")]
 use aws_smithy_mocks::{mock, mock_client, RuleMode};

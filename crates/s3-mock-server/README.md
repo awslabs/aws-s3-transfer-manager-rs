@@ -85,8 +85,8 @@ async fn test_with_mock_server() -> Result<(), Box<dyn std::error::Error>> {
 ### With the Transfer Manager
 
 ```rust,ignore
-use aws_sdk_s3_transfer_manager::io::InputStream;
-use aws_sdk_s3_transfer_manager::{Client, Config};
+use aws_s3_transfer::io::InputStream;
+use aws_s3_transfer::{Client, Config};
 use s3_mock_server::S3MockServer;
 
 #[tokio::test]

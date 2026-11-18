@@ -9,12 +9,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use aws_sdk_s3_transfer_manager::config::PartSize;
-use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
-use aws_sdk_s3_transfer_manager::config::S3ClientConfig;
-use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
-use aws_sdk_s3_transfer_manager::types::ByteSize;
-use aws_sdk_s3_transfer_manager::types::{checksum::Crc32, ChecksumStrategy};
+use aws_s3_transfer::config::PartSize;
+use aws_s3_transfer::config::RuntimeConfig;
+use aws_s3_transfer::config::S3ClientConfig;
+use aws_s3_transfer::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
+use aws_s3_transfer::types::ByteSize;
+use aws_s3_transfer::types::{checksum::Crc32, ChecksumStrategy};
 use s3_mock_server::S3MockServer;
 use tokio::sync::mpsc;
 
@@ -329,8 +329,8 @@ async fn test_part_checksum_over_different_bytes_fails_before_complete() {
             .build();
         aws_sdk_s3::Client::from_conf(conf)
     };
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
+    let tm = aws_s3_transfer::Client::new(
+        aws_s3_transfer::Config::builder()
             .s3_config(S3ClientConfig::new(s3.config().to_builder()))
             .build()
             .expect("valid config"),

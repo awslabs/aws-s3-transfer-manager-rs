@@ -14,9 +14,9 @@
 //! The checksums are supplied by the client, so every test runs the same assertions on the mock
 //! and on real S3, in a general purpose and a directory bucket.
 
+use aws_s3_transfer::io::{InputStream, PartData};
+use aws_s3_transfer::types::{checksum::Crc32, ChecksumStrategy};
 use aws_sdk_s3::types::ChecksumType;
-use aws_sdk_s3_transfer_manager::io::{InputStream, PartData};
-use aws_sdk_s3_transfer_manager::types::{checksum::Crc32, ChecksumStrategy};
 
 use crate::assertions::describe_error;
 use crate::harness::{target_tests, ClientOptions, Target, TmTestClient};
@@ -35,7 +35,7 @@ const KEY: &str = "obj";
 
 /// A transfer manager client on `t`'s backend that uploads in [`PART_SIZE`] parts above
 /// [`PART_SIZE`], and the recorder of every request attempt its S3 client sends.
-fn recorded_client(t: &TmTestClient) -> (aws_sdk_s3_transfer_manager::Client, OperationRecorder) {
+fn recorded_client(t: &TmTestClient) -> (aws_s3_transfer::Client, OperationRecorder) {
     let recorder = OperationRecorder::default();
     let client = t.client_with(ClientOptions {
         part_size: Some(PART_SIZE),
@@ -59,7 +59,7 @@ fn parts_of(seed: u32, part_size: u64, count: u64) -> Vec<PartData> {
 
 /// Panics unless `result` is S3's `BadDigest` error for `operation`.
 fn assert_bad_digest<T: std::fmt::Debug>(
-    result: Result<T, aws_sdk_s3_transfer_manager::error::Error>,
+    result: Result<T, aws_s3_transfer::error::Error>,
     operation: &str,
 ) {
     let err = result.expect_err("an upload with a mismatched checksum must fail");

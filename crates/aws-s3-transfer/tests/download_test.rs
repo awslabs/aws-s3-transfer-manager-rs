@@ -20,9 +20,9 @@ use test_util::{
     object_connector_with_object_and_range_checksum_headers,
 };
 
-use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
-use aws_sdk_s3_transfer_manager::types::ByteSize;
-use aws_sdk_s3_transfer_manager::{
+use aws_s3_transfer::config::RuntimeConfig;
+use aws_s3_transfer::types::ByteSize;
+use aws_s3_transfer::{
     error::{BoxError, ErrorKind},
     types::{
         ChecksumAlgorithm, ChecksumMode, ChecksumValidation, IntegrityChecks, NotValidatedReason,
@@ -48,7 +48,7 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
-use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize};
+use aws_s3_transfer::config::{ConcurrencyMode, PartSize};
 use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
 use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
 use aws_smithy_types::body::SdkBody;
@@ -76,27 +76,21 @@ fn dummy_expected_request() -> http::Request<SdkBody> {
         .unwrap()
 }
 
-fn simple_test_tm(
-    data: &Bytes,
-    part_size: usize,
-) -> (aws_sdk_s3_transfer_manager::Client, StaticReplayClient) {
+fn simple_test_tm(data: &Bytes, part_size: usize) -> (aws_s3_transfer::Client, StaticReplayClient) {
     let http_client = object_connector(data, part_size);
     let tm = test_tm(http_client.clone(), part_size);
     (tm, http_client)
 }
 
-fn test_tm(
-    http_client: StaticReplayClient,
-    part_size: usize,
-) -> aws_sdk_s3_transfer_manager::Client {
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
+fn test_tm(http_client: StaticReplayClient, part_size: usize) -> aws_s3_transfer::Client {
+    let config = aws_s3_transfer::Config::builder()
         .s3_config(common::s3_config(http_client))
         .part_size(PartSize::Target(ByteSize::new(part_size as u64)))
         .concurrency(ConcurrencyMode::Explicit(1))
         .build()
         .expect("valid config");
 
-    aws_sdk_s3_transfer_manager::Client::new(config)
+    aws_s3_transfer::Client::new(config)
 }
 
 /// Test the object ranges are expected and we get all the data
@@ -297,7 +291,7 @@ async fn abort_download_with_executing_gets(runtime_config: RuntimeConfig) {
         requests: requests.clone(),
         parked_started: parked_started.clone(),
     });
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
+    let config = aws_s3_transfer::Config::builder()
         .s3_config(common::s3_config(http_client_fn(move |_, _| {
             connector.clone()
         })))
@@ -306,7 +300,7 @@ async fn abort_download_with_executing_gets(runtime_config: RuntimeConfig) {
         .runtime_config(runtime_config)
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = aws_s3_transfer::Client::new(config);
 
     let handle = tm
         .download()
@@ -821,7 +815,7 @@ async fn download_objects_releases_destination_files() {
             .body(SdkBody::from(data.clone()))
             .unwrap(),
     );
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
+    let config = aws_s3_transfer::Config::builder()
         .s3_config(common::s3_config(StaticReplayClient::new(vec![
             list,
             head_event(data.len(), None),
@@ -830,7 +824,7 @@ async fn download_objects_releases_destination_files() {
         .concurrency(ConcurrencyMode::Explicit(1))
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = aws_s3_transfer::Client::new(config);
 
     let dir = tempfile::tempdir().unwrap();
     let output = tm
@@ -875,8 +869,8 @@ async fn write_to_path_drop_clients_then_unlink_releases_destination() {
     ]));
     // Reproduce the reported drop sequence with both clients sharing SDK configuration.
     let s3 = aws_sdk_s3::Client::new(&shared);
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
+    let tm = aws_s3_transfer::Client::new(
+        aws_s3_transfer::Config::builder()
             .s3_config(&shared)
             .build()
             .expect("valid config"),
@@ -1167,31 +1161,26 @@ fn checksum_cases() -> [ChecksumCase; 5] {
 
 /// A transfer manager whose S3 client sets `ResponseChecksumValidation` to
 /// `WhenRequired`, so a download validates only when its request enables it.
-fn when_required_tm(
-    http_client: StaticReplayClient,
-    part_size: usize,
-) -> aws_sdk_s3_transfer_manager::Client {
+fn when_required_tm(http_client: StaticReplayClient, part_size: usize) -> aws_s3_transfer::Client {
     let shared = common::shared_config(http_client)
         .into_builder()
         .response_checksum_validation(
             aws_smithy_types::checksum_config::ResponseChecksumValidation::WhenRequired,
         )
         .build();
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
-            &shared,
-        ))
+    let config = aws_s3_transfer::Config::builder()
+        .s3_config(aws_s3_transfer::config::S3ClientConfig::new(&shared))
         .part_size(PartSize::Target(ByteSize::new(part_size as u64)))
         .concurrency(ConcurrencyMode::Explicit(1))
         .build()
         .expect("valid config");
-    aws_sdk_s3_transfer_manager::Client::new(config)
+    aws_s3_transfer::Client::new(config)
 }
 
 /// Downloads `test-object` through `tm`, with `checksum_mode` if set, and returns
 /// the download's checksum verdict.
 async fn download_checksum_validation(
-    tm: &aws_sdk_s3_transfer_manager::Client,
+    tm: &aws_s3_transfer::Client,
     checksum_mode: Option<ChecksumMode>,
 ) -> ChecksumValidation {
     let mut handle = tm
@@ -1650,7 +1639,7 @@ fn head_with_headers(len: usize, etag: &str, headers: &[(&str, &str)]) -> Replay
 /// `object_meta` reports the value; both keep the checksum type.
 #[tokio::test]
 async fn test_integrity_checks_one_part_composite_has_no_object_value() {
-    use aws_sdk_s3_transfer_manager::types::ChecksumType;
+    use aws_s3_transfer::types::ChecksumType;
 
     let data = Bytes::from_static(HELLO);
     let part_size = ByteSize::mib(5).as_usize();
@@ -1706,7 +1695,7 @@ async fn test_integrity_checks_one_part_composite_has_no_object_value() {
 /// both report HEAD's COMPOSITE type and no value.
 #[tokio::test]
 async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
-    use aws_sdk_s3_transfer_manager::types::ChecksumType;
+    use aws_s3_transfer::types::ChecksumType;
 
     // Two stored parts, "hello" and "world"; CRC32("hello") is `NhCmhg==`.
     const PART1_CRC32: &str = "NhCmhg==";
@@ -1746,12 +1735,12 @@ async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
         ),
     ]);
     // No part size, so discovery aligns ranges to the stored part size.
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
+    let config = aws_s3_transfer::Config::builder()
         .s3_config(common::s3_config(http_client.clone()))
         .concurrency(ConcurrencyMode::Explicit(1))
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = aws_s3_transfer::Client::new(config);
 
     let mut handle = tm
         .download()
@@ -1795,7 +1784,7 @@ async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
 /// the part's.
 #[tokio::test]
 async fn test_integrity_checks_part_aligned_range_checksum_is_not_an_object_value() {
-    use aws_sdk_s3_transfer_manager::types::ChecksumType;
+    use aws_s3_transfer::types::ChecksumType;
 
     let part_size = ByteSize::mib(5).as_usize();
     let data = Bytes::from(vec![b'a'; 2 * part_size]);

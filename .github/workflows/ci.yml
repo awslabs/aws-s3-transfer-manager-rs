@@ -177,9 +177,9 @@ jobs:
         run: just install-model --check --pinned-only
       - name: Test installed values with Transfer Manager runtime types
         run: |
-          cargo test --locked -p aws-sdk-s3-transfer-manager \
+          cargo test --locked -p aws-s3-transfer \
             --lib --test model_api_test
-          cargo test --locked -p aws-sdk-s3-transfer-manager \
+          cargo test --locked -p aws-s3-transfer \
             --lib --test model_api_test --test sdk_v1_compat_test --features sdk-v1
 
  # Basic actions that must pass before we kick off more expensive tests.
@@ -307,11 +307,11 @@ jobs:
           key: i686-unknown-linux-gnu
       - name: Clippy (library and tests)
         run: |
-          cargo clippy --locked -p aws-sdk-s3-transfer-manager --all-targets --no-deps
+          cargo clippy --locked -p aws-s3-transfer --all-targets --no-deps
       - name: Transfer-manager unit and integration tests
         run: |
-          cargo test --locked -p aws-sdk-s3-transfer-manager --lib
-          cargo test --locked -p aws-sdk-s3-transfer-manager --tests
+          cargo test --locked -p aws-s3-transfer --lib
+          cargo test --locked -p aws-s3-transfer --tests
       - name: Mock-server integration tests
         run: |
           cargo test --locked -p integration-tests
@@ -519,13 +519,13 @@ jobs:
           key: ${{ matrix.target }}
       - name: Clippy
         run: |
-          cargo clippy --locked -p aws-sdk-s3-transfer-manager -p wasm32-wasi-tests \
+          cargo clippy --locked -p aws-s3-transfer -p wasm32-wasi-tests \
             --target ${{ matrix.target }} --no-deps
-          cargo clippy --locked -p aws-sdk-s3-transfer-manager --features sdk-v1 \
+          cargo clippy --locked -p aws-s3-transfer --features sdk-v1 \
             --target ${{ matrix.target }} --no-deps
       - name: Docs
         run: |
-          cargo doc --locked -p aws-sdk-s3-transfer-manager --target ${{ matrix.target }} \
+          cargo doc --locked -p aws-s3-transfer --target ${{ matrix.target }} \
             --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: -Dwarnings
@@ -598,9 +598,9 @@ jobs:
           key: wasm32-unknown-unknown
       - name: Clippy
         run: |
-          cargo clippy --locked -p aws-sdk-s3-transfer-manager \
+          cargo clippy --locked -p aws-s3-transfer \
             --target wasm32-unknown-unknown --no-deps -- -D warnings
-          cargo clippy --locked -p aws-sdk-s3-transfer-manager --features sdk-v1 \
+          cargo clippy --locked -p aws-s3-transfer --features sdk-v1 \
             --target wasm32-unknown-unknown --no-deps -- -D warnings
 
   fmt:
@@ -708,7 +708,7 @@ jobs:
       - name: Resolve aws-sdk-s3 to the declared minimum
         run: |
           floor=$(cargo metadata --format-version 1 --no-deps | jq -er '
-            [.packages[] | select(.name == "aws-sdk-s3-transfer-manager")
+            [.packages[] | select(.name == "aws-s3-transfer")
               | .dependencies[] | select(.name == "aws-sdk-s3" and .kind == null) | .req]
             | unique
             | if length == 1 then .[0] | ltrimstr("^")
@@ -720,7 +720,7 @@ jobs:
       # tests read. A filter that matches no test exits 0, so require a pass.
       - name: checksum verdict tests
         run: |
-          out=$(cargo test -p aws-sdk-s3-transfer-manager --all-features --test download_test \
+          out=$(cargo test -p aws-s3-transfer --all-features --test download_test \
             -- test_integrity_checks 2>&1) || { echo "$out"; exit 1; }
           echo "$out"
           if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
@@ -750,7 +750,7 @@ jobs:
             set -eux
             . "$HOME/.cargo/env"
             export CMAKE_GENERATOR=Ninja
-            cargo test --locked -p aws-sdk-s3-transfer-manager --lib
+            cargo test --locked -p aws-s3-transfer --lib
 
   check-external-types:
     name: check-external-types (${{ matrix.os }})
@@ -902,7 +902,7 @@ jobs:
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated --cfg s3_tm_fuzz
       - name: Run optimized model and corpus replay
-        run: cargo nextest run --release -p aws-sdk-s3-transfer-manager --lib
+        run: cargo nextest run --release -p aws-s3-transfer --lib
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated
       - name: Build native fuzz targets
@@ -941,7 +941,7 @@ jobs:
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
           manifest-path: crates/aws-s3-transfer/Cargo.toml
-          package: aws-sdk-s3-transfer-manager
+          package: aws-s3-transfer
           feature-group: all-features
           rust-toolchain: ${{ env.rust_min }}
           baseline-version: '0.3.0'
@@ -968,11 +968,11 @@ jobs:
         run: python3 tools/check-tm-consumers.py
       - name: Test ordinary and unstable managed configuration
         run: |
-          cargo test --locked -p aws-sdk-s3-transfer-manager --no-default-features \
+          cargo test --locked -p aws-s3-transfer --no-default-features \
             --lib client::tests -- --test-threads 1
-          cargo test --locked -p aws-sdk-s3-transfer-manager --no-default-features \
+          cargo test --locked -p aws-s3-transfer --no-default-features \
             --features __unstable_ext --lib client::tests -- --test-threads 1
-          cargo test --locked -p aws-sdk-s3-transfer-manager --no-default-features \
+          cargo test --locked -p aws-s3-transfer --no-default-features \
             --features __unstable_ext --lib config::runtime -- --test-threads 1
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated
@@ -998,7 +998,7 @@ jobs:
           toolchain: ${{ env.rust_stable }}
       - uses: Swatinem/rust-cache@v2
       - name: build cp example with dial9
-        run: cargo build -p aws-sdk-s3-transfer-manager --example cp --all-features
+        run: cargo build -p aws-s3-transfer --example cp --all-features
         env:
           RUSTFLAGS: "-Dwarnings --cfg tokio_unstable --cfg s3_tm_dial9"
 
@@ -1024,7 +1024,7 @@ jobs:
       # integer-to-pointer casts incompatible with strict provenance).
       - name: miri
         run: |
-          cargo miri test -p aws-sdk-s3-transfer-manager --lib
+          cargo miri test -p aws-s3-transfer --lib
         env:
           MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-recursive-validation
           RUSTFLAGS: -Dwarnings -Adeprecated
@@ -1044,12 +1044,12 @@ jobs:
       - name: loom
         run: |
           test_list=$(RUSTFLAGS='-Dwarnings --cfg s3_tm_loom' \
-            cargo test -p aws-sdk-s3-transfer-manager --lib --release -- --list)
+            cargo test -p aws-s3-transfer --lib --release -- --list)
           if ! grep -q 'loom_tests::.*: test' <<<"$test_list"; then
             echo "no Loom tests were registered" >&2
             exit 1
           fi
-          RUSTFLAGS='-Dwarnings --cfg s3_tm_loom' cargo test -p aws-sdk-s3-transfer-manager \
+          RUSTFLAGS='-Dwarnings --cfg s3_tm_loom' cargo test -p aws-s3-transfer \
             --lib --release -- loom_tests --nocapture
         env:
           # Three preemption points catches three-way interleaving bugs that

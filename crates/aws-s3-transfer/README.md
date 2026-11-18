@@ -1,11 +1,11 @@
 # Transfer Manager for Amazon S3 [![Crates.io][crates-badge]][crates-url] [![API docs][docs-badge]][docs-url] [![Apache 2.0 licensed][apache-badge]][apache-url]
 
-[crates-badge]: https://img.shields.io/crates/v/aws-sdk-s3-transfer-manager.svg
-[crates-url]: https://crates.io/crates/aws-sdk-s3-transfer-manager
+[crates-badge]: https://img.shields.io/crates/v/aws-s3-transfer.svg
+[crates-url]: https://crates.io/crates/aws-s3-transfer
 [apache-badge]: https://img.shields.io/badge/License-Apache_2.0-blue.svg
 [apache-url]:https://opensource.org/licenses/Apache-2.0
-[docs-badge]: https://img.shields.io/docsrs/aws-sdk-s3-transfer-manager
-[docs-url]: https://docs.rs/crate/aws-sdk-s3-transfer-manager/latest
+[docs-badge]: https://img.shields.io/docsrs/aws-s3-transfer
+[docs-url]: https://docs.rs/crate/aws-s3-transfer/latest
 
 Transfer Manager for Amazon S3 - a high-performance data plane client for uploading and downloading objects and directories.
 
@@ -22,17 +22,17 @@ Transfer Manager for Amazon S3 - a high-performance data plane client for upload
 Add the crate to your project:
 
 ```sh
-cargo add aws-sdk-s3-transfer-manager
+cargo add aws-s3-transfer
 ```
 
 **Create a client:**
 `from_env` loads the S3 client configuration from the shared AWS configuration sources and sizes the automatic defaults to the host.
 
 ```rust,no_run
-use aws_sdk_s3_transfer_manager::Client;
+use aws_s3_transfer::Client;
 
 async fn create_client() -> Client {
-    let config = aws_sdk_s3_transfer_manager::from_env().load().await;
+    let config = aws_s3_transfer::from_env().load().await;
     Client::new(config)
 }
 ```
@@ -41,10 +41,10 @@ async fn create_client() -> Client {
 A large file is split into part-sized chunks that are uploaded in parallel.
 
 ```rust,no_run
-use aws_sdk_s3_transfer_manager::io::InputStream;
-use aws_sdk_s3_transfer_manager::Client;
+use aws_s3_transfer::io::InputStream;
+use aws_s3_transfer::Client;
 
-async fn upload_file(client: &Client) -> Result<(), aws_sdk_s3_transfer_manager::error::Error> {
+async fn upload_file(client: &Client) -> Result<(), aws_s3_transfer::error::Error> {
     let stream = InputStream::from_path("/path/to/file")?;
     let output = client
         .upload()
@@ -63,9 +63,9 @@ async fn upload_file(client: &Client) -> Result<(), aws_sdk_s3_transfer_manager:
 A large object is downloaded in parallel part-sized ranges. The data is written to a temporary file in the destination's directory, which is renamed to the destination when the download succeeds.
 
 ```rust,no_run
-use aws_sdk_s3_transfer_manager::Client;
+use aws_s3_transfer::Client;
 
-async fn download_file(client: &Client) -> Result<(), aws_sdk_s3_transfer_manager::error::Error> {
+async fn download_file(client: &Client) -> Result<(), aws_s3_transfer::error::Error> {
     let handle = client
         .download()
         .bucket("amzn-s3-demo-bucket")
@@ -81,9 +81,9 @@ async fn download_file(client: &Client) -> Result<(), aws_sdk_s3_transfer_manage
 The body delivers the object's data in order as its parts arrive. `join` returns the result of the transfer, including any checksum mismatch; accept the data only after it succeeds.
 
 ```rust,no_run
-use aws_sdk_s3_transfer_manager::Client;
+use aws_s3_transfer::Client;
 
-async fn download_stream(client: &Client) -> Result<(), aws_sdk_s3_transfer_manager::error::Error> {
+async fn download_stream(client: &Client) -> Result<(), aws_s3_transfer::error::Error> {
     let mut handle = client
         .download()
         .bucket("amzn-s3-demo-bucket")
@@ -105,10 +105,10 @@ By default only the files directly inside the source directory are uploaded. Thi
 For example, if your prefix is `"prefix"` and the file path is `"test/docs/key.json"`, it will be uploaded with the key `"prefix/test/docs/key.json"`.
 
 ```rust,no_run
-use aws_sdk_s3_transfer_manager::io::walk::FsWalker;
-use aws_sdk_s3_transfer_manager::Client;
+use aws_s3_transfer::io::walk::FsWalker;
+use aws_s3_transfer::Client;
 
-async fn upload_directory(client: &Client) -> Result<(), aws_sdk_s3_transfer_manager::error::Error> {
+async fn upload_directory(client: &Client) -> Result<(), aws_s3_transfer::error::Error> {
     let output = client
         .upload_objects()
         .bucket("amzn-s3-demo-bucket")
@@ -131,10 +131,10 @@ async fn upload_directory(client: &Client) -> Result<(), aws_sdk_s3_transfer_man
 This will download every object under the prefix, writing each one at its full key under the destination directory. With the prefix `"photos/"`, the object `"photos/2023/a.jpg"` is written to `"/path/to/directory/photos/2023/a.jpg"`.
 
 ```rust,no_run
-use aws_sdk_s3_transfer_manager::io::walk::S3Walker;
-use aws_sdk_s3_transfer_manager::Client;
+use aws_s3_transfer::io::walk::S3Walker;
+use aws_s3_transfer::Client;
 
-async fn download_prefix(client: &Client) -> Result<(), aws_sdk_s3_transfer_manager::error::Error> {
+async fn download_prefix(client: &Client) -> Result<(), aws_s3_transfer::error::Error> {
     let output = client
         .download_objects()
         .bucket("amzn-s3-demo-bucket")
@@ -154,7 +154,7 @@ async fn download_prefix(client: &Client) -> Result<(), aws_sdk_s3_transfer_mana
 
 ## Learn more
 
-The [API documentation](https://docs.rs/aws-sdk-s3-transfer-manager) on docs.rs describes the client configuration, each transfer operation and its output, integrity checks, runtime and HTTP options, and runtime diagnostics.
+The [API documentation](https://docs.rs/aws-s3-transfer) on docs.rs describes the client configuration, each transfer operation and its output, integrity checks, runtime and HTTP options, and runtime diagnostics.
 
 ## Getting help
 

@@ -434,10 +434,10 @@ impl Client {
     /// ```no_run
     /// use std::error::Error;
     /// use std::path::Path;
-    /// use aws_sdk_s3_transfer_manager::io::InputStream;
+    /// use aws_s3_transfer::io::InputStream;
     ///
     /// async fn upload_file(
-    ///     client: &aws_sdk_s3_transfer_manager::Client,
+    ///     client: &aws_s3_transfer::Client,
     ///     path: impl AsRef<Path>
     /// ) -> Result<(), Box<dyn Error>> {
     ///     let stream = InputStream::from_path(path)?;
@@ -474,7 +474,7 @@ impl Client {
     /// ```no_run
     /// use std::error::Error;
     ///
-    /// async fn get_object(client: &aws_sdk_s3_transfer_manager::Client) -> Result<(), Box<dyn Error>> {
+    /// async fn get_object(client: &aws_s3_transfer::Client) -> Result<(), Box<dyn Error>> {
     ///
     ///     let handle = client
     ///         .download()
@@ -517,11 +517,11 @@ impl Client {
     /// # Examples
     /// ```no_run
     /// use std::path::PathBuf;
-    /// use aws_sdk_s3_transfer_manager::error::Error;
-    /// use aws_sdk_s3_transfer_manager::io::walk::S3Walker;
+    /// use aws_s3_transfer::error::Error;
+    /// use aws_s3_transfer::io::walk::S3Walker;
     ///
     /// async fn download_photos(
-    ///     client: &aws_sdk_s3_transfer_manager::Client,
+    ///     client: &aws_s3_transfer::Client,
     ///     dest: PathBuf
     /// ) -> Result<(), Error> {
     ///
@@ -561,11 +561,11 @@ impl Client {
     /// Examples
     /// ```no_run
     /// use std::path::Path;
-    /// use aws_sdk_s3_transfer_manager::error::Error;
-    /// use aws_sdk_s3_transfer_manager::io::walk::FsWalker;
+    /// use aws_s3_transfer::error::Error;
+    /// use aws_s3_transfer::io::walk::FsWalker;
     ///
     /// async fn upload_directory(
-    ///     client: &aws_sdk_s3_transfer_manager::Client,
+    ///     client: &aws_s3_transfer::Client,
     ///     source: &Path,
     /// ) -> Result<(), Error> {
     ///

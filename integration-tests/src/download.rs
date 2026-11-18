@@ -5,10 +5,10 @@
 
 //! Download integration tests.
 
-use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
-use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize};
-use aws_sdk_s3_transfer_manager::types::ByteSize;
-use aws_sdk_s3_transfer_manager::types::ChecksumAlgorithm;
+use aws_s3_transfer::config::RuntimeConfig;
+use aws_s3_transfer::config::{ConcurrencyMode, PartSize};
+use aws_s3_transfer::types::ByteSize;
+use aws_s3_transfer::types::ChecksumAlgorithm;
 
 use crate::assertions::assert_validated;
 use crate::harness::{mock_tm, mock_tm_with, MockTm};
@@ -32,8 +32,8 @@ async fn setup_with_part_size(part_size: usize) -> MockTm {
 
 /// Helper to drain download body
 async fn drain_body(
-    handle: &mut aws_sdk_s3_transfer_manager::operation::download::DownloadHandle,
-) -> Result<Vec<u8>, aws_sdk_s3_transfer_manager::error::Error> {
+    handle: &mut aws_s3_transfer::operation::download::DownloadHandle,
+) -> Result<Vec<u8>, aws_s3_transfer::error::Error> {
     let mut result = Vec::new();
     while let Some(chunk) = handle.body_mut().next().await {
         let chunk = chunk?;
@@ -348,10 +348,7 @@ async fn test_download_write_to_read_only_file_fails() {
         .await
         .expect("destination write failure should wake the download joiner")
         .expect_err("download to a read-only file should fail");
-    assert_eq!(
-        error.kind(),
-        &aws_sdk_s3_transfer_manager::error::ErrorKind::IOError
-    );
+    assert_eq!(error.kind(), &aws_s3_transfer::error::ErrorKind::IOError);
     assert_eq!(std::fs::read(&file_path).unwrap(), b"existing");
 
     m.handle.shutdown().await.expect("shutdown");
@@ -627,7 +624,7 @@ async fn test_download_empty_object() {
 // concurrent in-flight GETs) with a deliberately slow consumer.
 //
 // Each test is wrapped in a `timeout` so a stalled gate surfaces as a failure with
-// output (run with `RUST_LOG=aws_sdk_s3_transfer_manager::transfer=trace` to see the
+// output (run with `RUST_LOG=aws_s3_transfer::transfer=trace` to see the
 // gate-closed line and whether `consumed` is advancing), not as a hung test.
 
 /// A many-part download whose consumer drains slower than the issuer fetches, so the
@@ -689,7 +686,7 @@ async fn test_download_slow_consumer_does_not_wedge() {
 #[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_download_to_disk_exceeding_read_ahead_window_does_not_wedge() {
-    use aws_sdk_s3_transfer_manager::config::ReadAhead;
+    use aws_s3_transfer::config::ReadAhead;
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -742,7 +739,7 @@ async fn test_download_to_disk_exceeding_read_ahead_window_does_not_wedge() {
 #[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_download_to_disk_below_segment_window_drains_in_runs() {
-    use aws_sdk_s3_transfer_manager::config::ReadAhead;
+    use aws_s3_transfer::config::ReadAhead;
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -801,8 +798,8 @@ async fn test_download_to_disk_below_segment_window_drains_in_runs() {
 /// re-wedges and the timeout fires.
 #[cfg(any(unix, windows))]
 async fn test_concurrent_disk_downloads_under_tight_memory_budget_do_not_wedge(rt: RuntimeConfig) {
-    use aws_sdk_s3_transfer_manager::config::{MemoryBudgetConfig, MemoryConfig};
-    use aws_sdk_s3_transfer_manager::memory::BufferPool;
+    use aws_s3_transfer::config::{MemoryBudgetConfig, MemoryConfig};
+    use aws_s3_transfer::memory::BufferPool;
     use std::time::Duration;
     use tokio::time::timeout;
 

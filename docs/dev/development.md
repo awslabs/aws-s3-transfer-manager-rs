@@ -20,7 +20,7 @@ cargo test --all-features
 Run an individual test:
 
 ```sh
-cargo test -p aws-sdk-s3-transfer-manager --lib operation::download::body::tests::disk_eof_partial_tail
+cargo test -p aws-s3-transfer --lib operation::download::body::tests::disk_eof_partial_tail
 ```
 
 ## The `cp` example
@@ -45,21 +45,21 @@ AWS_PROFILE=<profile-name> RUST_LOG=trace cargo run --example cp -- /local/path/
 
 Add `--release` (`-r`) to build in release mode; see `cargo run -h`. The `profiling` profile in
 `.cargo/config.toml` builds a release binary with debug info for any example: pass `--profile profiling`.
-`RUST_LOG=trace` includes every dependency's logs; `RUST_LOG=aws_sdk_s3_transfer_manager=trace` limits
+`RUST_LOG=trace` includes every dependency's logs; `RUST_LOG=aws_s3_transfer=trace` limits
 them to the transfer manager's.
 
 ### Runtime diagnostics
 
 `AWS_S3_TM_DIAGNOSTICS` enables optional diagnostic collection, and `RUST_LOG` selects which collected
 records are emitted. The crate documentation's
-[Runtime diagnostics](https://docs.rs/aws-sdk-s3-transfer-manager/latest/aws_sdk_s3_transfer_manager/#runtime-diagnostics)
+[Runtime diagnostics](https://docs.rs/aws-s3-transfer/latest/aws_s3_transfer/#runtime-diagnostics)
 section defines the accepted settings and the tracing targets.
 
 Report memory-pool snapshots every second with detailed allocator counters:
 
 ```sh
 AWS_S3_TM_DIAGNOSTICS=memory.snapshot=1000ms,memory.detail=1 \
-RUST_LOG=aws_sdk_s3_transfer_manager::memory=debug \
+RUST_LOG=aws_s3_transfer::memory=debug \
 cargo run --release --example cp -- ...
 ```
 
@@ -67,18 +67,18 @@ Collect per-transfer summaries:
 
 ```sh
 AWS_S3_TM_DIAGNOSTICS=transfer.detail=1 \
-RUST_LOG=aws_sdk_s3_transfer_manager::transfer=debug \
+RUST_LOG=aws_s3_transfer::transfer=debug \
 cargo run --release --example cp -- ...
 ```
 
-Each operation logs under its own target below `aws_sdk_s3_transfer_manager::transfer`
+Each operation logs under its own target below `aws_s3_transfer::transfer`
 (`transfer::upload`, `transfer::download`, `transfer::upload_objects`, `transfer::download_objects`), so
 the `transfer` target enables all of them. A directive also matches longer targets that start with it, so
 `transfer::upload` includes `transfer::upload_objects`. Add a directive for the longer target to set it to
 a different level:
 
 ```sh
-RUST_LOG=aws_sdk_s3_transfer_manager::transfer::upload=debug,aws_sdk_s3_transfer_manager::transfer::upload_objects=warn
+RUST_LOG=aws_s3_transfer::transfer::upload=debug,aws_s3_transfer::transfer::upload_objects=warn
 ```
 
 ### Flamegraphs
@@ -88,7 +88,7 @@ See [cargo-flamegraph](https://github.com/flamegraph-rs/flamegraph) for prerequi
 Generate a flamegraph (written to `flamegraph.svg` by default):
 
 ```sh
-sudo AWS_PROFILE=<profile-name> RUST_LOG=aws_sdk_s3_transfer_manager=info cargo flamegraph --profile profiling --example cp -- s3://amzn-s3-demo-bucket/<key> /tmp/<filename>
+sudo AWS_PROFILE=<profile-name> RUST_LOG=aws_s3_transfer=info cargo flamegraph --profile profiling --example cp -- s3://amzn-s3-demo-bucket/<key> /tmp/<filename>
 ```
 
 ### tokio-console

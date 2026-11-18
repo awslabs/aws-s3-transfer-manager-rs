@@ -191,8 +191,8 @@ impl<'a> DownloadIoCtl<'a> {
 /// require it must inspect the outcome before accepting the downloaded content:
 ///
 /// ```no_run
-/// # async fn example(tm: &aws_sdk_s3_transfer_manager::Client) -> Result<(), Box<dyn std::error::Error>> {
-/// use aws_sdk_s3_transfer_manager::types::ChecksumValidation;
+/// # async fn example(tm: &aws_s3_transfer::Client) -> Result<(), Box<dyn std::error::Error>> {
+/// use aws_s3_transfer::types::ChecksumValidation;
 ///
 /// let mut handle = tm.download()
 ///     .bucket("my-bucket")

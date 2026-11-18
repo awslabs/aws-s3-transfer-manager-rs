@@ -5,8 +5,8 @@ API transfers a caller-built managed runtime into transfer manager ownership.
 HTTP composition is provided independently by `aws-smithy-managed-http`.
 
 ```rust,no_run
-use aws_sdk_s3_transfer_manager as tm;
-use aws_sdk_s3_transfer_manager_ext as tm_ext;
+use aws_s3_transfer as tm;
+use aws_s3_transfer_ext as tm_ext;
 use aws_smithy_execution::ManagedRuntime;
 use aws_smithy_managed_http::client::{ManagedHttpPool, pool};
 

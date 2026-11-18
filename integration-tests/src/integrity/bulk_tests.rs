@@ -13,8 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
-use aws_sdk_s3_transfer_manager::io::walk::S3Walker;
-use aws_sdk_s3_transfer_manager::types::FailedTransferPolicy;
+use aws_s3_transfer::io::walk::S3Walker;
+use aws_s3_transfer::types::FailedTransferPolicy;
 use s3_mock_server::{FaultTarget, FaultType, Occurrence, Operation};
 
 use super::test_util::vocab::CaseTarget;
@@ -73,7 +73,7 @@ fn download_prefix(
     prefix: &str,
     dest: &Path,
     policy: FailedTransferPolicy,
-) -> aws_sdk_s3_transfer_manager::operation::download_objects::DownloadObjectsHandle {
+) -> aws_s3_transfer::operation::download_objects::DownloadObjectsHandle {
     t.client_with(ClientOptions::default())
         .download_objects()
         .bucket(t.bucket())

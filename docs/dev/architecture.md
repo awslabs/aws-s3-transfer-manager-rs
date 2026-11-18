@@ -1,6 +1,6 @@
 # Architecture
 
-This document maps the `aws-sdk-s3-transfer-manager` crate and states the boundaries and conventions that hold across its modules. Each module's documentation covers that module's internals. The [design documents](../design/README.md) cover each subsystem's requirements and invariants. Paths are relative to `crates/aws-s3-transfer/src/`.
+This document maps the `aws-s3-transfer` crate and states the boundaries and conventions that hold across its modules. Each module's documentation covers that module's internals. The [design documents](../design/README.md) cover each subsystem's requirements and invariants. Paths are relative to `crates/aws-s3-transfer/src/`.
 
 ## Codemap
 

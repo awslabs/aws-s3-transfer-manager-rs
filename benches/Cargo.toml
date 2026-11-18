@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>"]
 license = "Apache-2.0"
 publish = false
-description = "Internal benchmarks for aws-sdk-s3-transfer-manager"
+description = "Internal benchmarks for aws-s3-transfer"
 
 [[bench]]
 name = "throughput"
@@ -26,7 +26,7 @@ harness = false
 criterion = { version = "0.7", features = ["html_reports"] }
 tokio = { version = "1", features = ["full"] }
 s3-mock-server = { path = "../crates/s3-mock-server" }
-aws-sdk-s3-transfer-manager = { path = "../crates/aws-s3-transfer" }
+aws-s3-transfer = { path = "../crates/aws-s3-transfer" }
 bytes = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

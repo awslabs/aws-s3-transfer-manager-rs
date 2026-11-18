@@ -81,7 +81,7 @@ pub enum ReadAhead {
 /// use aws_config::BehaviorVersion;
 ///
 /// let sdk_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-/// let config = aws_sdk_s3_transfer_manager::Config::builder()
+/// let config = aws_s3_transfer::Config::builder()
 ///     .s3_config(&sdk_config)
 ///     .build()?;
 /// # Ok(())

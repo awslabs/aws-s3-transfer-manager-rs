@@ -6,8 +6,8 @@
 //! The checks a case's outcome makes: on every target, the delivered bytes, the verdict or error,
 //! the destination and the reported object checksum; on mock targets, what the server observed.
 
-use aws_sdk_s3_transfer_manager::operation::download::DownloadOutput;
-use aws_sdk_s3_transfer_manager::types::ChecksumValidation;
+use aws_s3_transfer::operation::download::DownloadOutput;
+use aws_s3_transfer::types::ChecksumValidation;
 use s3_mock_server::{BodyEnding, ChecksumScope, FaultType, HoldEnd, Operation, RequestRecord};
 
 use super::runner::{Check, Delivered, SENTINEL};
@@ -15,7 +15,7 @@ use super::vocab::{Action, Alg, At, Case, Expect, Mechanism, NotValidatedReason,
 use crate::assertions::check_integrity_error;
 use crate::test_util::data::fill_object_bytes;
 use crate::test_util::object::ChecksumValues;
-use aws_sdk_s3_transfer_manager::error::ErrorKind;
+use aws_s3_transfer::error::ErrorKind;
 
 /// Returns `Err(message)` from the enclosing check when `condition` is false.
 macro_rules! ensure {
