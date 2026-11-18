@@ -7,10 +7,10 @@
 
 use std::time::Duration;
 
-use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
-use aws_sdk_s3_transfer_manager::io::InputStream;
-use aws_sdk_s3_transfer_manager::types::ByteSize;
-use aws_sdk_s3_transfer_manager::types::TransferStatus;
+use aws_s3_transfer::config::RuntimeConfig;
+use aws_s3_transfer::io::InputStream;
+use aws_s3_transfer::types::ByteSize;
+use aws_s3_transfer::types::TransferStatus;
 use s3_mock_server::{FaultType, Occurrence, Operation};
 use tokio::time::timeout;
 

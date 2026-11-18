@@ -3,14 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 use aws_config::BehaviorVersion;
-use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize, TargetThroughput};
-use aws_sdk_s3_transfer_manager::config::{MemoryBudgetConfig, MemoryConfig};
-use aws_sdk_s3_transfer_manager::config::{RuntimeConfig, S3ClientConfig};
-use aws_sdk_s3_transfer_manager::io::InputStream;
-use aws_sdk_s3_transfer_manager::memory::BufferPool;
-use aws_sdk_s3_transfer_manager::operation::download::Body;
-use aws_sdk_s3_transfer_manager::types::{ByteSize, Throughput};
-use aws_sdk_s3_transfer_manager::Config;
+use aws_s3_transfer::config::{ConcurrencyMode, PartSize, TargetThroughput};
+use aws_s3_transfer::config::{MemoryBudgetConfig, MemoryConfig};
+use aws_s3_transfer::config::{RuntimeConfig, S3ClientConfig};
+use aws_s3_transfer::io::InputStream;
+use aws_s3_transfer::memory::BufferPool;
+use aws_s3_transfer::operation::download::Body;
+use aws_s3_transfer::types::{ByteSize, Throughput};
+use aws_s3_transfer::Config;
 use aws_smithy_execution::{ManagedRuntime, ManagedRuntimeBuilder, ManagedRuntimeHandle};
 use aws_smithy_http_client::pool::{ConnectionPool, DriverSpawner, Partition, PartitionId};
 use aws_smithy_http_client::proxy::ProxyConfig;
@@ -311,7 +311,7 @@ impl Direction {
 }
 
 async fn do_single_download(
-    tm: &aws_sdk_s3_transfer_manager::Client,
+    tm: &aws_s3_transfer::Client,
     bucket: &str,
     key: &str,
     dest: &Path,
@@ -338,7 +338,7 @@ async fn do_single_download(
 }
 
 async fn do_recursive_download(
-    tm: &aws_sdk_s3_transfer_manager::Client,
+    tm: &aws_s3_transfer::Client,
     bucket: &str,
     key_prefix: &str,
     dest: &Path,
@@ -349,7 +349,7 @@ async fn do_recursive_download(
         .download_objects()
         .bucket(bucket)
         .walker(
-            aws_sdk_s3_transfer_manager::io::walk::S3Walker::builder()
+            aws_s3_transfer::io::walk::S3Walker::builder()
                 .prefix(key_prefix)
                 .build(),
         )
@@ -369,7 +369,7 @@ async fn do_recursive_download(
 }
 
 async fn do_single_upload(
-    tm: &aws_sdk_s3_transfer_manager::Client,
+    tm: &aws_s3_transfer::Client,
     bucket: &str,
     key: &str,
     source: &Path,
@@ -389,7 +389,7 @@ async fn do_single_upload(
 }
 
 async fn do_recursive_upload(
-    tm: &aws_sdk_s3_transfer_manager::Client,
+    tm: &aws_s3_transfer::Client,
     bucket: &str,
     key_prefix: &str,
     source: &Path,
@@ -400,7 +400,7 @@ async fn do_recursive_upload(
         .bucket(bucket)
         .key_prefix(key_prefix)
         .walker(
-            aws_sdk_s3_transfer_manager::io::walk::FsWalker::builder()
+            aws_s3_transfer::io::walk::FsWalker::builder()
                 .recursive(true)
                 .build(),
         )
@@ -419,7 +419,7 @@ async fn do_recursive_upload(
 }
 
 async fn do_manifest_download(
-    tm: &aws_sdk_s3_transfer_manager::Client,
+    tm: &aws_s3_transfer::Client,
     bucket: &str,
     entries: &[ManifestEntry],
     dest_dir: &Path,
@@ -449,7 +449,7 @@ async fn do_manifest_download(
 }
 
 async fn do_manifest_upload(
-    tm: &aws_sdk_s3_transfer_manager::Client,
+    tm: &aws_s3_transfer::Client,
     bucket: &str,
     key_prefix: &str,
     entries: &[ManifestEntry],
@@ -530,12 +530,7 @@ async fn run(args: Args) -> Result<(), BoxError> {
     // fallible step runs inside `result`, ahead of the graceful shutdown.
     let result = async {
         let config = client_config(&args, &runtime_tracing).await?;
-        transfer(
-            aws_sdk_s3_transfer_manager::Client::new(config),
-            &args,
-            direction,
-        )
-        .await
+        transfer(aws_s3_transfer::Client::new(config), &args, direction).await
     }
     .await;
     runtime_tracing.shutdown();
@@ -558,7 +553,7 @@ fn init_tracing(tokio_console: bool) {
 /// Each component is built from `args` when an option needs it; otherwise the transfer
 /// manager's default for that component applies.
 async fn client_config(args: &Args, runtime_tracing: &RuntimeTracing) -> Result<Config, BoxError> {
-    let mut loader = aws_sdk_s3_transfer_manager::from_env()
+    let mut loader = aws_s3_transfer::from_env()
         .concurrency(args.concurrency.mode())
         .part_size(PartSize::Target(ByteSize::new(args.part_size)))
         .runtime_config(args.runtime.mode());
@@ -578,9 +573,9 @@ async fn client_config(args: &Args, runtime_tracing: &RuntimeTracing) -> Result<
                 .build();
             loader = loader.s3_config(S3ClientConfig::new(&sdk_config));
         }
-        loader = loader.runtime_config(RuntimeConfig::managed(
-            aws_sdk_s3_transfer_manager_ext::managed(runtime),
-        ));
+        loader = loader.runtime_config(RuntimeConfig::managed(aws_s3_transfer_ext::managed(
+            runtime,
+        )));
     }
     Ok(loader.load().await)
 }
@@ -884,7 +879,7 @@ impl<R: ResolveDns + 'static> ResolveDns for ShufflingDnsResolver<R> {
 /// Takes the client by value so it is dropped, and its worker runtimes flush their trace
 /// events, before the caller shuts runtime tracing down.
 async fn transfer(
-    tm: aws_sdk_s3_transfer_manager::Client,
+    tm: aws_s3_transfer::Client,
     args: &Args,
     direction: Direction,
 ) -> Result<(), BoxError> {

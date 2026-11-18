@@ -8,11 +8,11 @@
 // Refer to https://github.com/awslabs/aws-c-s3/tree/main/tests/test_helper to help set up the S3 in the account
 // Set S3_TEST_BUCKET_NAME_RS environment variables to the bucket created.
 // By default, it uses aws-s3-transfer-manager-rs-test-bucket
+use aws_s3_transfer::config::PartSize;
+use aws_s3_transfer::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
+use aws_s3_transfer::types::ByteSize;
+use aws_s3_transfer::types::{checksum::Crc32, ChecksumStrategy};
 use aws_sdk_s3::types::ChecksumMode;
-use aws_sdk_s3_transfer_manager::config::PartSize;
-use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
-use aws_sdk_s3_transfer_manager::types::ByteSize;
-use aws_sdk_s3_transfer_manager::types::{checksum::Crc32, ChecksumStrategy};
 use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
 use std::pin::Pin;
 use std::task::Poll;
@@ -37,12 +37,12 @@ fn generate_key(readable_key: &str) -> String {
     )
 }
 
-async fn test_tm() -> (aws_sdk_s3_transfer_manager::Client, aws_sdk_s3::Client) {
-    let tm_config = aws_sdk_s3_transfer_manager::from_env()
+async fn test_tm() -> (aws_s3_transfer::Client, aws_sdk_s3::Client) {
+    let tm_config = aws_s3_transfer::from_env()
         .part_size(PartSize::Target(ByteSize::mib(8)))
         .load()
         .await;
-    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
+    let tm = aws_s3_transfer::Client::new(tm_config);
     let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let s3_client = aws_sdk_s3::Client::new(&sdk_config);
     (tm, s3_client)
@@ -58,7 +58,7 @@ fn create_input_stream(size: usize) -> InputStream {
 }
 
 async fn perform_upload(
-    tm: &aws_sdk_s3_transfer_manager::Client,
+    tm: &aws_s3_transfer::Client,
     bucket_name: &str,
     key: &str,
     strategy: Option<ChecksumStrategy>,
@@ -134,7 +134,7 @@ async fn get_object_checksum(
 }
 
 async fn upload_and_get_object_checksum(
-    tm: &aws_sdk_s3_transfer_manager::Client,
+    tm: &aws_s3_transfer::Client,
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
@@ -234,13 +234,13 @@ async fn test_empty_object_download() {
 }
 
 async fn range_download_helper(
-    tm: &aws_sdk_s3_transfer_manager::Client,
+    tm: &aws_s3_transfer::Client,
     bucket: &str,
     key: &str,
     range: &str,
     expected_length: usize,
     description: &str,
-) -> Result<(), aws_sdk_s3_transfer_manager::error::Error> {
+) -> Result<(), aws_s3_transfer::error::Error> {
     let mut download_handle = tm
         .download()
         .bucket(bucket)
@@ -416,7 +416,7 @@ async fn test_objects_transfer() {
     let (bucket_name, _) = get_bucket_names();
 
     // SSE-C objects require the key to download, skipping it.
-    fn sse_c_filter(obj: &aws_sdk_s3_transfer_manager::types::Object) -> bool {
+    fn sse_c_filter(obj: &aws_s3_transfer::types::Object) -> bool {
         let key = obj.key().unwrap_or("");
         let is_sse_c = key.ends_with("aes256-c");
         !is_sse_c
@@ -430,7 +430,7 @@ async fn test_objects_transfer() {
         .download_objects()
         .bucket(bucket_name.as_str())
         .walker(
-            aws_sdk_s3_transfer_manager::io::walk::S3Walker::builder()
+            aws_s3_transfer::io::walk::S3Walker::builder()
                 .filter(sse_c_filter)
                 .prefix("pre-existing")
                 .build(),
@@ -571,7 +571,7 @@ impl PartStream for UnknownLengthStream {
 /// dropped, duplicated, or reordered part — the failure modes an unknown-length upload is
 /// most exposed to, since it has no declared size for S3 to cross-check against.
 async fn unknown_length_round_trip(
-    tm: &aws_sdk_s3_transfer_manager::Client,
+    tm: &aws_s3_transfer::Client,
     bucket: &str,
     key: &str,
     parts: Vec<bytes::Bytes>,
@@ -795,7 +795,7 @@ async fn test_upload_unknown_content_length_with_checksum() {
 // directory buckets is confirmed on a real run.
 #[tokio::test]
 async fn test_upload_if_none_match_star() {
-    use aws_sdk_s3_transfer_manager::error::ErrorKind;
+    use aws_s3_transfer::error::ErrorKind;
 
     let _logs = show_test_logs();
     let (bucket_name, _express_bucket_name) = get_bucket_names();
@@ -853,7 +853,7 @@ async fn test_upload_if_none_match_star() {
 /// [`test_upload_if_none_match_star`].
 #[tokio::test]
 async fn test_upload_if_match_etag() {
-    use aws_sdk_s3_transfer_manager::error::ErrorKind;
+    use aws_s3_transfer::error::ErrorKind;
 
     let _logs = show_test_logs();
     let (bucket_name, _express_bucket_name) = get_bucket_names();

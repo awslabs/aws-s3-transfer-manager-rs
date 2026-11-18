@@ -414,7 +414,7 @@ impl IntegrityChecks {
 /// integers.
 ///
 /// ```
-/// use aws_sdk_s3_transfer_manager::types::ByteSize;
+/// use aws_s3_transfer::types::ByteSize;
 ///
 /// const PART: ByteSize = ByteSize::mib(8);
 /// assert_eq!(PART.as_u64(), 8 * 1024 * 1024);
@@ -647,7 +647,7 @@ impl Throughput {
     ///
     /// ```
     /// use std::time::Duration;
-    /// use aws_sdk_s3_transfer_manager::types::{ByteSize, Throughput};
+    /// use aws_s3_transfer::types::{ByteSize, Throughput};
     /// let bytes_transferred = ByteSize::mib(5).as_u64();
     /// assert_eq!(
     ///     Throughput::new(bytes_transferred, Duration::from_secs(1)),

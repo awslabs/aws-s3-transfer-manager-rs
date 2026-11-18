@@ -4,6 +4,7 @@
  */
 #![cfg(target_family = "unix")]
 
+use aws_s3_transfer::{error::ErrorKind, io::walk::S3Walker, types::FailedTransferPolicy};
 use aws_sdk_s3::{
     error::DisplayErrorContext,
     operation::{
@@ -12,9 +13,6 @@ use aws_sdk_s3::{
         list_objects_v2::{ListObjectsV2Error, ListObjectsV2Output},
     },
     primitives::ByteStream,
-};
-use aws_sdk_s3_transfer_manager::{
-    error::ErrorKind, io::walk::S3Walker, types::FailedTransferPolicy,
 };
 use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
 use aws_smithy_runtime_api::{client::orchestrator::HttpResponse, http::StatusCode};
@@ -224,13 +222,13 @@ async fn test_prefix_kept_in_destination_path() {
 
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
 
-        let config = aws_sdk_s3_transfer_manager::Config::builder()
+        let config = aws_s3_transfer::Config::builder()
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
             .build()
             .expect("valid config");
-        let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+        let tm = aws_s3_transfer::Client::new(config);
 
         let dest = tempfile::tempdir().unwrap();
 
@@ -274,13 +272,13 @@ async fn test_object_with_prefix_included() {
 
     let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
 
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
+    let config = aws_s3_transfer::Config::builder()
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = aws_s3_transfer::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
 
@@ -315,13 +313,13 @@ async fn test_failed_download_policy_continue() {
 
     let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
 
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
+    let config = aws_s3_transfer::Config::builder()
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = aws_s3_transfer::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
 
@@ -375,13 +373,13 @@ async fn test_recursively_downloads() {
 
     let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
 
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
+    let config = aws_s3_transfer::Config::builder()
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = aws_s3_transfer::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
 
@@ -413,13 +411,13 @@ async fn test_delimiter() {
 
     let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
 
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
+    let config = aws_s3_transfer::Config::builder()
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = aws_s3_transfer::Client::new(config);
 
     let dest = tempfile::tempdir().unwrap();
 
@@ -453,13 +451,13 @@ async fn test_destination_dir_not_valid() {
 
     let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
 
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
+    let config = aws_s3_transfer::Config::builder()
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = aws_s3_transfer::Client::new(config);
 
     let dest = tempfile::NamedTempFile::new().unwrap();
 
@@ -488,13 +486,13 @@ async fn test_empty_destination_rejected() {
 
     let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
 
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
+    let config = aws_s3_transfer::Config::builder()
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = aws_s3_transfer::Client::new(config);
 
     let err = tm
         .download_objects()
@@ -541,13 +539,13 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
         rules.extend([list, get]);
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
 
-        let config = aws_sdk_s3_transfer_manager::Config::builder()
+        let config = aws_s3_transfer::Config::builder()
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
             .build()
             .expect("valid config");
-        let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+        let tm = aws_s3_transfer::Client::new(config);
 
         let dest = tempfile::tempdir().unwrap();
 
@@ -590,13 +588,13 @@ async fn test_failed_list_objects_should_cancel_the_operation() {
         });
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list]);
 
-        let config = aws_sdk_s3_transfer_manager::Config::builder()
+        let config = aws_s3_transfer::Config::builder()
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
             .build()
             .expect("valid config");
-        let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+        let tm = aws_s3_transfer::Client::new(config);
 
         let dest = tempfile::tempdir().unwrap();
 
@@ -633,13 +631,13 @@ async fn test_failed_get_object_should_cancel_the_operation() {
 
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, bucket.rules().as_slice());
 
-        let config = aws_sdk_s3_transfer_manager::Config::builder()
+        let config = aws_s3_transfer::Config::builder()
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
             .build()
             .expect("valid config");
-        let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+        let tm = aws_s3_transfer::Client::new(config);
 
         let dest = tempfile::tempdir().unwrap();
 
@@ -672,7 +670,7 @@ async fn test_failed_get_object_should_cancel_the_operation() {
 /// failed S3 operation and its error code.
 #[tokio::test]
 async fn test_aborted_download_objects_error_source_is_failed_child_error() {
-    use aws_sdk_s3_transfer_manager::error::Error;
+    use aws_s3_transfer::error::Error;
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -712,13 +710,13 @@ async fn test_aborted_download_objects_error_source_is_failed_child_error() {
         ]);
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
 
-        let config = aws_sdk_s3_transfer_manager::Config::builder()
+        let config = aws_s3_transfer::Config::builder()
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
             .build()
             .expect("valid config");
-        let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+        let tm = aws_s3_transfer::Client::new(config);
         let dest = tempfile::tempdir().unwrap();
 
         let err = tm
@@ -788,13 +786,13 @@ async fn test_drop_download_objects_handle() {
         rules.extend([list, get]);
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
 
-        let config = aws_sdk_s3_transfer_manager::Config::builder()
+        let config = aws_s3_transfer::Config::builder()
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
             .build()
             .expect("valid config");
-        let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+        let tm = aws_s3_transfer::Client::new(config);
 
         let dest = tempfile::tempdir().unwrap();
 
@@ -928,13 +926,13 @@ async fn test_abort_stops_child_get_before_temp_file_cleanup() {
             .with_test_defaults()
             .build(),
     );
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
+    let config = aws_s3_transfer::Config::builder()
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = aws_s3_transfer::Client::new(config);
 
     let handle = tm
         .download_objects()
@@ -1051,13 +1049,13 @@ async fn test_listed_object_that_fits_one_range_skips_head() {
             &multipart_get,
         ]
     );
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
+    let config = aws_s3_transfer::Config::builder()
         .s3_config(test_common::s3_config_with_test_http(
             client.config().to_builder(),
         ))
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = aws_s3_transfer::Client::new(config);
     let dest = tempfile::tempdir().unwrap();
 
     let output = tm

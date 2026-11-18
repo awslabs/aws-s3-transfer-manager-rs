@@ -4,7 +4,7 @@
  */
 #![cfg(feature = "sdk-v1")]
 
-use aws_sdk_s3_transfer_manager::types;
+use aws_s3_transfer::types;
 use aws_smithy_types::DateTime;
 
 macro_rules! enum_roundtrip {

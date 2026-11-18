@@ -8,8 +8,8 @@
 
 use std::time::Duration;
 
-use aws_sdk_s3_transfer_manager::error::Error;
-use aws_sdk_s3_transfer_manager::operation::download::DownloadOutput;
+use aws_s3_transfer::error::Error;
+use aws_s3_transfer::operation::download::DownloadOutput;
 use s3_mock_server::{FaultTarget, FaultType, Occurrence};
 
 use super::vocab::{Action, Case, CaseTarget, Hold, Sink};
@@ -176,7 +176,7 @@ impl Case {
 
     async fn download(
         &self,
-        client: &aws_sdk_s3_transfer_manager::Client,
+        client: &aws_s3_transfer::Client,
         t: &TmTestClient,
         key: &str,
     ) -> Delivered {

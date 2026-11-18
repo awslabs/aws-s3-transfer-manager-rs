@@ -15,7 +15,7 @@ use aws_smithy_types::error::operation::BuildError;
 /// configuration does not change this selection.
 ///
 /// ```
-/// use aws_sdk_s3_transfer_manager::{config::Managed, config::RuntimeConfig};
+/// use aws_s3_transfer::{config::Managed, config::RuntimeConfig};
 ///
 /// let managed = RuntimeConfig::managed(Managed::default());
 /// let caller_runtime = RuntimeConfig::multi_thread_tokio();

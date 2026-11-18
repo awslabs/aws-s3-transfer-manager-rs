@@ -27,8 +27,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use aws_sdk_s3_transfer_manager::config::ConcurrencyMode;
-use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
+use aws_s3_transfer::config::ConcurrencyMode;
+use aws_s3_transfer::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use s3_mock_server::{S3MockServer, ServerHandle};
@@ -132,36 +132,24 @@ impl PartStream for BenchmarkPartStream {
 }
 
 /// Starts one mock endpoint and one transfer-manager client for a concurrency case.
-async fn setup(
-    concurrency: usize,
-) -> (
-    S3MockServer,
-    ServerHandle,
-    aws_sdk_s3_transfer_manager::Client,
-) {
+async fn setup(concurrency: usize) -> (S3MockServer, ServerHandle, aws_s3_transfer::Client) {
     let server = S3MockServer::builder()
         .with_in_memory_store()
         .build()
         .expect("mock server should build");
     let handle = server.start().await.expect("mock server should start");
     let shared_config = handle.shared_config().await;
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
-            &shared_config,
-        ))
+    let config = aws_s3_transfer::Config::builder()
+        .s3_config(aws_s3_transfer::config::S3ClientConfig::new(&shared_config))
         .concurrency(ConcurrencyMode::Explicit(concurrency))
         .build()
         .expect("valid config");
-    let client = aws_sdk_s3_transfer_manager::Client::new(config);
+    let client = aws_s3_transfer::Client::new(config);
     (server, handle, client)
 }
 
 /// Runs one cohort of uploads through the complete public custom-stream path.
-async fn run_cohort(
-    client: &aws_sdk_s3_transfer_manager::Client,
-    readiness: Readiness,
-    payload: &Bytes,
-) {
+async fn run_cohort(client: &aws_s3_transfer::Client, readiness: Readiness, payload: &Bytes) {
     let mut handles = Vec::with_capacity(UPLOADS);
     for upload in 0..UPLOADS {
         let stream = BenchmarkPartStream::new(readiness, payload.clone());

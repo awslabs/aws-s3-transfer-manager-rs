@@ -8,6 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::task::ready;
 use std::{task::Poll, time::Duration};
 
+use aws_s3_transfer::config::{MemoryBudgetConfig, MemoryConfig};
+use aws_s3_transfer::error::{Error, ErrorKind};
+use aws_s3_transfer::io::{InputStream, PartBuffer, PartData, PartStream, SizeHint, StreamContext};
+use aws_s3_transfer::memory::{BufferPool, SegmentedBytes};
+use aws_s3_transfer::types::ByteSize;
+use aws_s3_transfer::types::FailedMultipartUploadPolicy;
+use aws_s3_transfer::types::{checksum::Crc32, ChecksumStrategy};
 use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
 use aws_sdk_s3::operation::complete_multipart_upload::{
     CompleteMultipartUploadError, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
@@ -15,15 +22,6 @@ use aws_sdk_s3::operation::complete_multipart_upload::{
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::put_object::{PutObjectError, PutObjectOutput};
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
-use aws_sdk_s3_transfer_manager::config::{MemoryBudgetConfig, MemoryConfig};
-use aws_sdk_s3_transfer_manager::error::{Error, ErrorKind};
-use aws_sdk_s3_transfer_manager::io::{
-    InputStream, PartBuffer, PartData, PartStream, SizeHint, StreamContext,
-};
-use aws_sdk_s3_transfer_manager::memory::{BufferPool, SegmentedBytes};
-use aws_sdk_s3_transfer_manager::types::ByteSize;
-use aws_sdk_s3_transfer_manager::types::FailedMultipartUploadPolicy;
-use aws_sdk_s3_transfer_manager::types::{checksum::Crc32, ChecksumStrategy};
 use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use aws_smithy_runtime_api::client::http::{
@@ -386,9 +384,9 @@ impl PartStream for PooledPartStream {
 }
 
 /// Builds a transfer manager with default config that sends its S3 requests to `client`.
-fn tm_with(client: aws_sdk_s3::Client) -> aws_sdk_s3_transfer_manager::Client {
-    aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
+fn tm_with(client: aws_sdk_s3::Client) -> aws_s3_transfer::Client {
+    aws_s3_transfer::Client::new(
+        aws_s3_transfer::Config::builder()
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
@@ -559,7 +557,7 @@ impl MultipartMock {
     }
 
     /// Builds a transfer manager with default config over [`Self::client`].
-    fn tm(&self) -> aws_sdk_s3_transfer_manager::Client {
+    fn tm(&self) -> aws_s3_transfer::Client {
         tm_with(self.client())
     }
 
@@ -675,14 +673,14 @@ async fn test_custom_stream_resumes_after_part_buffer_admission() {
     ));
     assert_eq!(holder.writable(), CAPACITY);
 
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
+    let config = aws_s3_transfer::Config::builder()
         .s3_config(test_common::s3_config_with_test_http(
             MultipartMock::new().client().config().to_builder(),
         ))
         .memory(MemoryConfig::Explicit(pool.clone()))
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = aws_s3_transfer::Client::new(config);
     let handle = tm
         .upload()
         .bucket("test-bucket")
@@ -2158,10 +2156,10 @@ fn precondition_failed() -> HttpResponse {
 /// part is a producer applying backpressure: a second `send` waits until the upload takes the
 /// first part.
 fn upload_from_channel(
-    tm: &aws_sdk_s3_transfer_manager::Client,
+    tm: &aws_s3_transfer::Client,
 ) -> (
     mpsc::Sender<Bytes>,
-    aws_sdk_s3_transfer_manager::operation::upload::UploadHandle,
+    aws_s3_transfer::operation::upload::UploadHandle,
 ) {
     let (tx, rx) = mpsc::channel(1);
     let handle = tm
@@ -2180,10 +2178,10 @@ fn upload_from_channel(
 /// still held. A `send` blocked on the channel returns its error at the same moment.
 async fn assert_failure_releases_stream(
     tx: &mpsc::Sender<Bytes>,
-    handle: &aws_sdk_s3_transfer_manager::operation::upload::UploadHandle,
+    handle: &aws_s3_transfer::operation::upload::UploadHandle,
 ) {
     tokio::time::timeout(SOURCE_RELEASE_TIMEOUT, async {
-        while handle.status() != aws_sdk_s3_transfer_manager::types::TransferStatus::Failed {
+        while handle.status() != aws_s3_transfer::types::TransferStatus::Failed {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -2303,12 +2301,12 @@ async fn test_worker_panic_releases_stream_held_by_a_hung_part() {
             .with_test_defaults()
             .build(),
     );
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
+    let tm = aws_s3_transfer::Client::new(
+        aws_s3_transfer::Config::builder()
             .s3_config(test_common::s3_config_with_test_http(
                 client.config().to_builder(),
             ))
-            .concurrency(aws_sdk_s3_transfer_manager::config::ConcurrencyMode::Explicit(4))
+            .concurrency(aws_s3_transfer::config::ConcurrencyMode::Explicit(4))
             .build()
             .expect("valid config"),
     );

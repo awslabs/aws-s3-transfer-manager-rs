@@ -121,12 +121,12 @@ run_android_tests() {
     )
     profile_directory="$build_directory/$rust_target/debug"
 
-    cargo clean --locked -p aws-sdk-s3-transfer-manager --target "$rust_target"
+    cargo clean --locked -p aws-s3-transfer --target "$rust_target"
     cargo ndk --target "$abi" --platform "$android_api_level" \
-        test --locked -p aws-sdk-s3-transfer-manager --lib --no-run
+        test --locked -p aws-s3-transfer --lib --no-run
 
     search_directories=()
-    for directory in "$profile_directory/deps" "$profile_directory/build/aws-sdk-s3-transfer-manager"; do
+    for directory in "$profile_directory/deps" "$profile_directory/build/aws-s3-transfer"; do
         [[ -d "$directory" ]] && search_directories+=("$directory")
     done
     if (( ${#search_directories[@]} == 0 )); then
@@ -137,7 +137,7 @@ run_android_tests() {
         find "${search_directories[@]}" \
             -maxdepth 3 \
             -type f \
-            -name 'aws_sdk_s3_transfer_manager-*' \
+            -name 'aws_s3_transfer-*' \
             -perm -111 \
             -print
     )
@@ -163,7 +163,7 @@ case "$mode" in
             exit 2
         fi
         cargo ndk --target "$abi" --platform "$android_api_level" \
-            test --locked -p aws-sdk-s3-transfer-manager --lib --no-run
+            test --locked -p aws-s3-transfer --lib --no-run
         ;;
     emulator)
         if (( $# != 4 )); then

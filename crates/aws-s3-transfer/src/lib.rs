@@ -29,17 +29,17 @@
 //!
 //! ```no_run
 //! # async fn example() {
-//! let config = aws_sdk_s3_transfer_manager::from_env().load().await;
-//! let client = aws_sdk_s3_transfer_manager::Client::new(config);
+//! let config = aws_s3_transfer::from_env().load().await;
+//! let client = aws_s3_transfer::Client::new(config);
 //! # }
 //! ```
 //!
 //! Download a bucket to a local directory:
 //!
 //! ```no_run
-//! # async fn example() -> Result<(), aws_sdk_s3_transfer_manager::error::Error> {
-//! let config = aws_sdk_s3_transfer_manager::from_env().load().await;
-//! let client = aws_sdk_s3_transfer_manager::Client::new(config);
+//! # async fn example() -> Result<(), aws_s3_transfer::error::Error> {
+//! let config = aws_s3_transfer::from_env().load().await;
+//! let client = aws_s3_transfer::Client::new(config);
 //!
 //! let handle = client
 //!     .download_objects()
@@ -130,7 +130,7 @@
 //! HTTP client. [`RuntimeConfig`](config::RuntimeConfig#http-transport)
 //! describes what each transport provides.
 //!
-//! `aws-sdk-s3-transfer-manager-ext` is an experimental crate that adopts a
+//! `aws-s3-transfer-ext` is an experimental crate that adopts a
 //! managed runtime built by the caller; its API may change in any release.
 //!
 //! # Modeled types
@@ -175,15 +175,15 @@
 //! environment variable accepts may change in minor releases. Events are
 //! grouped under these subsystem targets:
 //!
-//! - `aws_sdk_s3_transfer_manager::concurrency`: concurrency resolution and
+//! - `aws_s3_transfer::concurrency`: concurrency resolution and
 //!   control.
-//! - `aws_sdk_s3_transfer_manager::scheduling`: scheduler capacity decisions,
+//! - `aws_s3_transfer::scheduling`: scheduler capacity decisions,
 //!   worker pool growth, and memory-budget admission.
-//! - `aws_sdk_s3_transfer_manager::memory`: buffer-pool admission, physical
+//! - `aws_s3_transfer::memory`: buffer-pool admission, physical
 //!   storage, and reclamation.
-//! - `aws_sdk_s3_transfer_manager::execution`: per-work-item dispatch and
+//! - `aws_s3_transfer::execution`: per-work-item dispatch and
 //!   completion.
-//! - `aws_sdk_s3_transfer_manager::transfer`: transfer lifecycle and state
+//! - `aws_s3_transfer::transfer`: transfer lifecycle and state
 //!   transitions.
 //!
 //! Other events use the target of the module that emits them.
@@ -221,12 +221,12 @@
 //!   bitmap word inspected, adding relaxed atomic updates to the acquisition
 //!   path.
 //!
-//! Memory snapshots use the `aws_sdk_s3_transfer_manager::memory` tracing target
+//! Memory snapshots use the `aws_s3_transfer::memory` tracing target
 //! at `DEBUG`:
 //!
 //! ```text
 //! AWS_S3_TM_DIAGNOSTICS=memory.snapshot=1000ms
-//! RUST_LOG=aws_sdk_s3_transfer_manager::memory=debug
+//! RUST_LOG=aws_s3_transfer::memory=debug
 //! ```
 //!
 //! Snapshot reporting reuses the memory pool's maintenance thread. It does not
@@ -245,12 +245,12 @@
 //!
 //! Transfer summaries use the operation's tracing target at `DEBUG`;
 //! level-2 transitions use the same target at `TRACE`. Each operation logs
-//! under its own target below `aws_sdk_s3_transfer_manager::transfer`, so the
+//! under its own target below `aws_s3_transfer::transfer`, so the
 //! `transfer` target enables all of them:
 //!
 //! ```text
 //! AWS_S3_TM_DIAGNOSTICS=transfer.detail=1
-//! RUST_LOG=aws_sdk_s3_transfer_manager::transfer=debug
+//! RUST_LOG=aws_s3_transfer::transfer=debug
 //! ```
 
 /// Errors returned by transfers, and how to classify them.
@@ -294,7 +294,7 @@ compile_error!("`__unstable_ext` adopts a managed runtime, which wasm targets ca
 ///
 /// [`BufferPool::metrics`](crate::memory::BufferPool::metrics) returns current
 /// accounting gauges without enabling diagnostic sampling. Buffer-pool events
-/// use the `aws_sdk_s3_transfer_manager::memory` tracing target.
+/// use the `aws_s3_transfer::memory` tracing target.
 pub mod memory {
     pub use crate::runtime::buffer_pool::{
         BufferPool, BufferPoolBuildError, BufferPoolBuilder, SegmentedBytes,

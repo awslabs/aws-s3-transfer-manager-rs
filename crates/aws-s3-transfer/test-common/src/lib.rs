@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_sdk_s3_transfer_manager::{error::Error, operation::download::DownloadHandle};
+use aws_s3_transfer::{error::Error, operation::download::DownloadHandle};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::sync::OnceLock;
 use uuid::Uuid;
@@ -13,8 +13,8 @@ use uuid::Uuid;
 /// SDK-backed fixtures pass their client's `config().to_builder()` with
 /// `sdk-v1` enabled; shared-configuration fixtures can pass `&SdkConfig`.
 pub fn s3_config_with_test_http(
-    config: impl Into<aws_sdk_s3_transfer_manager::config::S3ClientConfig>,
-) -> aws_sdk_s3_transfer_manager::config::S3ClientConfig {
+    config: impl Into<aws_s3_transfer::config::S3ClientConfig>,
+) -> aws_s3_transfer::config::S3ClientConfig {
     config.into()
 }
 

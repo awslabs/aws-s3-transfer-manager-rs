@@ -82,7 +82,7 @@ fn not_regular_file(path: &Path) -> Error {
 ///
 /// ```no_run
 /// # {
-/// use aws_sdk_s3_transfer_manager::io::InputStream;
+/// use aws_s3_transfer::io::InputStream;
 /// use std::path::Path;
 ///
 /// async fn input_stream_from_file() -> InputStream {

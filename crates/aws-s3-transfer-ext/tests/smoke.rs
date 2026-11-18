@@ -7,8 +7,8 @@
 
 #![cfg(not(miri))]
 
-use aws_sdk_s3_transfer_manager as tm;
-use aws_sdk_s3_transfer_manager_ext as tm_ext;
+use aws_s3_transfer as tm;
+use aws_s3_transfer_ext as tm_ext;
 use aws_smithy_execution::{ManagedRuntime, ManagedRuntimeHandle, topology::Topology};
 use aws_smithy_http_client::test_util::wire::connection::{ConnectionTestHarness, EndpointPlan};
 use aws_smithy_managed_http::client::{ManagedHttpPool, pool};

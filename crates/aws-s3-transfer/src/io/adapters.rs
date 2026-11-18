@@ -30,8 +30,8 @@ pin_project! {
     /// # Examples
     ///
     /// ```
-    /// use aws_sdk_s3_transfer_manager::io::adapters::TokioIo;
-    /// use aws_sdk_s3_transfer_manager::io::{InputStream, SizeHint};
+    /// use aws_s3_transfer::io::adapters::TokioIo;
+    /// use aws_s3_transfer::io::{InputStream, SizeHint};
     /// use tokio::io::AsyncRead;
     ///
     /// fn into_input_stream<T: AsyncRead + Send + Sync + 'static>(inner: T, content_length: u64) -> InputStream {

@@ -78,7 +78,7 @@ def check_ordinary():
         if removed != 1:
             raise RuntimeError("expected one s3_tm_dial9 dev-dependency table")
         text, removed = re.subn(
-            r"^aws-sdk-s3-transfer-manager-ext = .*\n", "", text, flags=re.M
+            r"^aws-s3-transfer-ext = .*\n", "", text, flags=re.M
         )
         if removed != 1:
             raise RuntimeError("expected one extension-crate dev-dependency")

@@ -8,10 +8,10 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use aws_s3_transfer::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
+use aws_s3_transfer::types::checksum::{Crc32, Crc32C, Crc64Nvme, Sha1, Sha256};
+use aws_s3_transfer::types::ChecksumStrategy;
 use aws_sdk_s3::types::{ChecksumMode, ChecksumType};
-use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
-use aws_sdk_s3_transfer_manager::types::checksum::{Crc32, Crc32C, Crc64Nvme, Sha1, Sha256};
-use aws_sdk_s3_transfer_manager::types::ChecksumStrategy;
 
 use crate::assertions::{describe_error, describe_sdk_error};
 use crate::harness::{ClientOptions, TmTestClient};
@@ -59,8 +59,8 @@ impl Alg {
     }
 
     /// The algorithm as the transfer manager names it. `None` for [`Alg::NoChecksum`].
-    pub(crate) fn tm(self) -> Option<aws_sdk_s3_transfer_manager::types::ChecksumAlgorithm> {
-        use aws_sdk_s3_transfer_manager::types::ChecksumAlgorithm as A;
+    pub(crate) fn tm(self) -> Option<aws_s3_transfer::types::ChecksumAlgorithm> {
+        use aws_s3_transfer::types::ChecksumAlgorithm as A;
         Some(match self {
             Alg::Crc32 => A::Crc32,
             Alg::Crc32c => A::Crc32C,
@@ -651,7 +651,7 @@ checksum_values!(
     checksum_sha256
 );
 checksum_values!(
-    aws_sdk_s3_transfer_manager::types::IntegrityChecks,
+    aws_s3_transfer::types::IntegrityChecks,
     checksum_crc32,
     checksum_crc32c,
     checksum_crc64_nvme,

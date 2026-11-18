@@ -23,6 +23,6 @@ use aws_smithy_execution::ManagedRuntime;
 /// Dropping an unused managed value or configuration requests shutdown.
 ///
 /// Configure Dial9 on the execution builder.
-pub fn managed(runtime: ManagedRuntime) -> aws_sdk_s3_transfer_manager::config::Managed {
-    aws_sdk_s3_transfer_manager::unstable::managed(runtime)
+pub fn managed(runtime: ManagedRuntime) -> aws_s3_transfer::config::Managed {
+    aws_s3_transfer::unstable::managed(runtime)
 }

@@ -214,50 +214,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-sdk-s3"
-version = "1.158.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "453a8913ce5559e09b00138105107a8ac1ae26ffa1e9ac84c9202bd3ede62724"
-dependencies = [
- "arc-swap",
- "aws-credential-types",
- "aws-runtime",
- "aws-sigv4",
- "aws-smithy-async",
- "aws-smithy-checksums",
- "aws-smithy-eventstream",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-observability",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-schema",
- "aws-smithy-types",
- "aws-smithy-xml",
- "aws-types",
- "bytes",
- "fastrand",
- "hex",
- "hmac",
- "http 1.5.0",
- "http-body",
- "lru",
- "percent-encoding",
- "regex-lite",
- "sha2 0.11.0",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "aws-sdk-s3-transfer-manager"
+name = "aws-s3-transfer"
 version = "0.4.0"
 dependencies = [
  "arc-swap",
  "aws-config",
  "aws-runtime",
+ "aws-s3-transfer-ext",
  "aws-sdk-s3",
- "aws-sdk-s3-transfer-manager-ext",
  "aws-smithy-checksums",
  "aws-smithy-dns",
  "aws-smithy-execution",
@@ -309,11 +273,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-sdk-s3-transfer-manager-ext"
+name = "aws-s3-transfer-ext"
 version = "0.1.0"
 dependencies = [
  "aws-credential-types",
- "aws-sdk-s3-transfer-manager",
+ "aws-s3-transfer",
  "aws-smithy-checksums",
  "aws-smithy-execution",
  "aws-smithy-http-client",
@@ -323,6 +287,42 @@ dependencies = [
  "crossbeam-skiplist",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "aws-sdk-s3"
+version = "1.158.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "453a8913ce5559e09b00138105107a8ac1ae26ffa1e9ac84c9202bd3ede62724"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-sigv4",
+ "aws-smithy-async",
+ "aws-smithy-checksums",
+ "aws-smithy-eventstream",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "hex",
+ "hmac",
+ "http 1.5.0",
+ "http-body",
+ "lru",
+ "percent-encoding",
+ "regex-lite",
+ "sha2 0.11.0",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -821,7 +821,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 name = "benches"
 version = "0.0.0"
 dependencies = [
- "aws-sdk-s3-transfer-manager",
+ "aws-s3-transfer",
  "bytes",
  "criterion",
  "s3-mock-server",
@@ -2462,9 +2462,9 @@ name = "integration-tests"
 version = "0.0.0"
 dependencies = [
  "aws-config",
+ "aws-s3-transfer",
+ "aws-s3-transfer-ext",
  "aws-sdk-s3",
- "aws-sdk-s3-transfer-manager",
- "aws-sdk-s3-transfer-manager-ext",
  "aws-smithy-checksums",
  "aws-smithy-execution",
  "aws-smithy-http-client",
@@ -4340,7 +4340,7 @@ dependencies = [
 name = "test-common"
 version = "0.1.0"
 dependencies = [
- "aws-sdk-s3-transfer-manager",
+ "aws-s3-transfer",
  "bytes",
  "tempfile",
  "uuid",
@@ -4893,8 +4893,8 @@ dependencies = [
 name = "wasm32-wasi-tests"
 version = "0.1.0"
 dependencies = [
+ "aws-s3-transfer",
  "aws-sdk-s3",
- "aws-sdk-s3-transfer-manager",
  "aws-smithy-async",
  "aws-smithy-runtime-api",
  "aws-smithy-types",

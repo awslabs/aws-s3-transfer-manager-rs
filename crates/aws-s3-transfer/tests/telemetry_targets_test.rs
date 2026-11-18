@@ -6,8 +6,8 @@
 //! Tracing records from transfers use the documented targets.
 //!
 //! A record with no explicit target takes its module path, such as
-//! `aws_sdk_s3_transfer_manager::operation::upload::transfer`, which no
-//! `aws_sdk_s3_transfer_manager::transfer` directive matches. This binary
+//! `aws_s3_transfer::operation::upload::transfer`, which no
+//! `aws_s3_transfer::transfer` directive matches. This binary
 //! installs a process-wide subscriber that keeps every record at every level,
 //! runs one transfer of each operation with state-machine events enabled, and
 //! checks the target of every record the crate wrote.
@@ -15,13 +15,13 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
+use aws_s3_transfer::io::walk::{FsWalker, S3Walker};
+use aws_s3_transfer::io::InputStream;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
 use aws_sdk_s3::operation::put_object::PutObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::Object;
-use aws_sdk_s3_transfer_manager::io::walk::{FsWalker, S3Walker};
-use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_smithy_mocks::{mock, mock_client, RuleMode};
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, SubscriberExt};
@@ -29,15 +29,15 @@ use tracing_subscriber::Layer;
 
 /// Every target the crate documents in its `telemetry` module.
 const DOCUMENTED_TARGETS: &[&str] = &[
-    "aws_sdk_s3_transfer_manager::concurrency",
-    "aws_sdk_s3_transfer_manager::scheduling",
-    "aws_sdk_s3_transfer_manager::execution",
-    "aws_sdk_s3_transfer_manager::memory",
-    "aws_sdk_s3_transfer_manager::transfer",
-    "aws_sdk_s3_transfer_manager::transfer::upload",
-    "aws_sdk_s3_transfer_manager::transfer::download",
-    "aws_sdk_s3_transfer_manager::transfer::upload_objects",
-    "aws_sdk_s3_transfer_manager::transfer::download_objects",
+    "aws_s3_transfer::concurrency",
+    "aws_s3_transfer::scheduling",
+    "aws_s3_transfer::execution",
+    "aws_s3_transfer::memory",
+    "aws_s3_transfer::transfer",
+    "aws_s3_transfer::transfer::upload",
+    "aws_s3_transfer::transfer::download",
+    "aws_s3_transfer::transfer::upload_objects",
+    "aws_s3_transfer::transfer::download_objects",
 ];
 
 const OBJECTS: usize = 3;
@@ -137,13 +137,13 @@ async fn transfer_records_use_documented_targets() {
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Capture))
         .expect("the only subscriber in this binary");
 
-    let config = aws_sdk_s3_transfer_manager::Config::builder()
+    let config = aws_s3_transfer::Config::builder()
         .s3_config(test_common::s3_config_with_test_http(
             s3_client().config().to_builder(),
         ))
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let tm = aws_s3_transfer::Client::new(config);
 
     tokio::time::timeout(Duration::from_secs(30), async {
         tm.upload()
@@ -202,13 +202,13 @@ async fn transfer_records_use_documented_targets() {
     assert!(
         count(
             &records,
-            "aws_sdk_s3_transfer_manager::transfer::upload_objects",
+            "aws_s3_transfer::transfer::upload_objects",
             "upload_objects state-machine event"
         ) > 0
     );
     let undocumented: Vec<&Record> = records
         .iter()
-        .filter(|r| r.module_path.starts_with("aws_sdk_s3_transfer_manager"))
+        .filter(|r| r.module_path.starts_with("aws_s3_transfer"))
         .filter(|r| !DOCUMENTED_TARGETS.contains(&r.target.as_str()))
         .collect();
     assert!(
@@ -218,7 +218,7 @@ async fn transfer_records_use_documented_targets() {
 
     // Each composite reports once under its own target, and each of its
     // children is an ordinary transfer reporting under the child operation.
-    let target = |op: &str| format!("aws_sdk_s3_transfer_manager::transfer::{op}");
+    let target = |op: &str| format!("aws_s3_transfer::transfer::{op}");
     let summaries = [
         ("upload_objects", "upload_objects transfer terminal", 1),
         ("download_objects", "download_objects transfer terminal", 1),

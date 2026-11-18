@@ -24,11 +24,11 @@
 //! HTTP transport the runtime installs (the managed runtime's connection pool)
 //! rather than a client supplied by the test.
 //!
-//! [`S3ClientConfig`]: aws_sdk_s3_transfer_manager::config::S3ClientConfig
+//! [`S3ClientConfig`]: aws_s3_transfer::config::S3ClientConfig
 
-use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
-use aws_sdk_s3_transfer_manager::config::S3ClientConfig;
-use aws_sdk_s3_transfer_manager::Client as TmClient;
+use aws_s3_transfer::config::RuntimeConfig;
+use aws_s3_transfer::config::S3ClientConfig;
+use aws_s3_transfer::Client as TmClient;
 use s3_mock_server::S3MockServer;
 
 /// Installs a process-global tracing subscriber for test diagnosis, once.
@@ -45,9 +45,9 @@ pub(crate) fn init_test_logs() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         const DEFAULT_FILTER: &str = "info,\
-            aws_sdk_s3_transfer_manager::concurrency=debug,\
-            aws_sdk_s3_transfer_manager::scheduling=debug,\
-            aws_sdk_s3_transfer_manager::transfer=debug";
+            aws_s3_transfer::concurrency=debug,\
+            aws_s3_transfer::scheduling=debug,\
+            aws_s3_transfer::transfer=debug";
 
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_FILTER));
@@ -102,9 +102,7 @@ pub(crate) async fn mock_tm(runtime: RuntimeConfig) -> MockTm {
 /// concurrency, ...). The runtime mode is set by the harness after `configure`.
 pub(crate) async fn mock_tm_with(
     runtime: RuntimeConfig,
-    configure: impl FnOnce(
-        aws_sdk_s3_transfer_manager::config::Builder,
-    ) -> aws_sdk_s3_transfer_manager::config::Builder,
+    configure: impl FnOnce(aws_s3_transfer::config::Builder) -> aws_s3_transfer::config::Builder,
 ) -> MockTm {
     mock_tm_with_s3_config(runtime, |shared| shared, configure).await
 }
@@ -115,9 +113,7 @@ pub(crate) async fn mock_tm_with(
 pub(crate) async fn mock_tm_with_s3_config(
     runtime: RuntimeConfig,
     configure_shared: impl FnOnce(aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder,
-    configure: impl FnOnce(
-        aws_sdk_s3_transfer_manager::config::Builder,
-    ) -> aws_sdk_s3_transfer_manager::config::Builder,
+    configure: impl FnOnce(aws_s3_transfer::config::Builder) -> aws_s3_transfer::config::Builder,
 ) -> MockTm {
     init_test_logs();
     let server = S3MockServer::builder()
@@ -130,7 +126,7 @@ pub(crate) async fn mock_tm_with_s3_config(
         .await
         .expect("create bucket");
     let s3_config = mock_s3_config(&handle, configure_shared).await;
-    let cfg = configure(aws_sdk_s3_transfer_manager::Config::builder().s3_config(s3_config))
+    let cfg = configure(aws_s3_transfer::Config::builder().s3_config(s3_config))
         .runtime_config(runtime)
         .build()
         .expect("valid config");
@@ -238,7 +234,7 @@ impl Target {
     /// builds its S3 client from.
     pub(crate) async fn connect_mock_configured(
         self,
-        part_size: Option<aws_sdk_s3_transfer_manager::config::PartSize>,
+        part_size: Option<aws_s3_transfer::config::PartSize>,
         configure: impl FnOnce(aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder,
     ) -> TmTestClient {
         assert_eq!(self.backend, Backend::Mock, "mock-only helper");
@@ -250,7 +246,7 @@ impl Target {
     /// uploaded part boundaries (the precondition for per-part validation).
     pub(crate) async fn connect_with(
         self,
-        part_size: Option<aws_sdk_s3_transfer_manager::config::PartSize>,
+        part_size: Option<aws_s3_transfer::config::PartSize>,
     ) -> TmTestClient {
         match self.backend {
             Backend::Mock => TmTestClient::connect_mock(self.bucket_kind, part_size).await,
@@ -322,7 +318,7 @@ struct MockBackend {
 impl TmTestClient {
     async fn connect_mock(
         kind: BucketKind,
-        part_size: Option<aws_sdk_s3_transfer_manager::config::PartSize>,
+        part_size: Option<aws_s3_transfer::config::PartSize>,
     ) -> Self {
         Self::connect_mock_with(
             kind,
@@ -338,7 +334,7 @@ impl TmTestClient {
     /// stalled-stream protection enabled).
     async fn connect_mock_with(
         kind: BucketKind,
-        part_size: Option<aws_sdk_s3_transfer_manager::config::PartSize>,
+        part_size: Option<aws_s3_transfer::config::PartSize>,
         configure: Option<
             impl FnOnce(aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder,
         >,
@@ -360,13 +356,12 @@ impl TmTestClient {
             BucketKind::Express => "test-bucket--usw2-az1--x-s3",
         };
         server.create_bucket(bucket).await.expect("create bucket");
-        let mut builder = aws_sdk_s3_transfer_manager::Config::builder().s3_config(&shared_config);
+        let mut builder = aws_s3_transfer::Config::builder().s3_config(&shared_config);
         if let Some(ps) = part_size {
             builder = builder.part_size(ps);
         }
         if let Some(n) = default_concurrency() {
-            builder = builder
-                .concurrency(aws_sdk_s3_transfer_manager::config::ConcurrencyMode::Explicit(n));
+            builder = builder.concurrency(aws_s3_transfer::config::ConcurrencyMode::Explicit(n));
         }
         Self {
             tm: TmClient::new(builder.build().expect("valid config")),
@@ -383,7 +378,7 @@ impl TmTestClient {
     #[cfg(e2e_test)]
     async fn connect_real(
         kind: BucketKind,
-        part_size: Option<aws_sdk_s3_transfer_manager::config::PartSize>,
+        part_size: Option<aws_s3_transfer::config::PartSize>,
     ) -> Self {
         init_test_logs();
         let bucket_name = option_env!("S3_TEST_BUCKET_NAME_RS")
@@ -397,7 +392,7 @@ impl TmTestClient {
             .load()
             .await;
         let s3_client = aws_sdk_s3::Client::new(&shared_config);
-        let mut loader = aws_sdk_s3_transfer_manager::from_env();
+        let mut loader = aws_s3_transfer::from_env();
         if let Some(ps) = part_size {
             loader = loader.part_size(ps);
         }
@@ -428,8 +423,8 @@ impl TmTestClient {
     /// [`Target::connect_mock_configured`] or [`Target::connect_with`] don't apply to it. Without
     /// `options.concurrency`, it uses [`default_concurrency`].
     pub(crate) fn client_with(&self, options: ClientOptions) -> TmClient {
-        use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize};
-        use aws_sdk_s3_transfer_manager::types::ByteSize;
+        use aws_s3_transfer::config::{ConcurrencyMode, PartSize};
+        use aws_s3_transfer::types::ByteSize;
         let mut shared_config = self.shared_config.clone().into_builder();
         if options.response_checksums_when_required {
             shared_config.set_response_checksum_validation(Some(
@@ -445,9 +440,8 @@ impl TmTestClient {
         if let Some(recorder) = options.recorder {
             s3_config = s3_config.interceptor(recorder);
         }
-        let mut builder = aws_sdk_s3_transfer_manager::Config::builder().s3_config(
-            aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(s3_config),
-        );
+        let mut builder = aws_s3_transfer::Config::builder()
+            .s3_config(aws_s3_transfer::config::S3ClientConfig::new(s3_config));
         if let Some(part_size) = options.part_size {
             builder = builder.part_size(PartSize::Target(ByteSize::new(part_size)));
         }
@@ -523,14 +517,14 @@ impl TmTestClient {
         &self,
         key: &str,
         data: Vec<u8>,
-        strategy: aws_sdk_s3_transfer_manager::types::ChecksumStrategy,
+        strategy: aws_s3_transfer::types::ChecksumStrategy,
     ) {
         self.tm
             .upload()
             .bucket(&self.bucket)
             .key(self.key(key))
             .checksum_strategy(strategy)
-            .body(aws_sdk_s3_transfer_manager::io::InputStream::from(data))
+            .body(aws_s3_transfer::io::InputStream::from(data))
             .initiate()
             .expect("initiate upload")
             .join()
@@ -545,10 +539,10 @@ impl TmTestClient {
         &self,
         key: &str,
         path: &std::path::Path,
-        strategy: aws_sdk_s3_transfer_manager::types::ChecksumStrategy,
+        strategy: aws_s3_transfer::types::ChecksumStrategy,
     ) {
-        let body = aws_sdk_s3_transfer_manager::io::InputStream::from_path(path)
-            .expect("open upload source file");
+        let body =
+            aws_s3_transfer::io::InputStream::from_path(path).expect("open upload source file");
         self.tm
             .upload()
             .bucket(&self.bucket)
@@ -568,13 +562,13 @@ impl TmTestClient {
     pub(crate) async fn download(
         &self,
         key: &str,
-        checksum_mode: Option<aws_sdk_s3_transfer_manager::types::ChecksumMode>,
+        checksum_mode: Option<aws_s3_transfer::types::ChecksumMode>,
     ) -> Result<
         (
             Vec<u8>,
-            aws_sdk_s3_transfer_manager::operation::download::DownloadOutput,
+            aws_s3_transfer::operation::download::DownloadOutput,
         ),
-        aws_sdk_s3_transfer_manager::error::Error,
+        aws_s3_transfer::error::Error,
     > {
         let mut builder = self.tm.download().bucket(&self.bucket).key(self.key(key));
         if let Some(mode) = checksum_mode {
@@ -605,11 +599,9 @@ impl TmTestClient {
         &self,
         key: &str,
         dest: &std::path::Path,
-        checksum_mode: Option<aws_sdk_s3_transfer_manager::types::ChecksumMode>,
-    ) -> Result<
-        aws_sdk_s3_transfer_manager::operation::download::DownloadOutput,
-        aws_sdk_s3_transfer_manager::error::Error,
-    > {
+        checksum_mode: Option<aws_s3_transfer::types::ChecksumMode>,
+    ) -> Result<aws_s3_transfer::operation::download::DownloadOutput, aws_s3_transfer::error::Error>
+    {
         let mut builder = self.tm.download().bucket(&self.bucket).key(self.key(key));
         if let Some(mode) = checksum_mode {
             builder = builder.checksum_mode(mode);

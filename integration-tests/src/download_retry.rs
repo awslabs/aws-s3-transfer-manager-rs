@@ -41,12 +41,12 @@ use crate::assertions::{
     assert_integrity_error, assert_io_error, assert_same_content, assert_validated,
 };
 use crate::harness::Target;
-use aws_sdk_s3_transfer_manager::config::PartSize;
-use aws_sdk_s3_transfer_manager::types::checksum::Crc32;
-use aws_sdk_s3_transfer_manager::types::ByteSize;
-use aws_sdk_s3_transfer_manager::types::ChecksumStrategy;
-use aws_sdk_s3_transfer_manager::types::{ChecksumAlgorithm, ChecksumMode};
-use aws_sdk_s3_transfer_manager::Client as TmClient;
+use aws_s3_transfer::config::PartSize;
+use aws_s3_transfer::types::checksum::Crc32;
+use aws_s3_transfer::types::ByteSize;
+use aws_s3_transfer::types::ChecksumStrategy;
+use aws_s3_transfer::types::{ChecksumAlgorithm, ChecksumMode};
+use aws_s3_transfer::Client as TmClient;
 use s3_mock_server::S3MockServer;
 use s3_mock_server::{BodyCadence, FaultType, Occurrence, Operation};
 
@@ -867,8 +867,8 @@ async fn requests_carry_per_bucket_retry_partition() {
         aws_sdk_s3::Client::from_conf(conf)
     };
     let tm = TmClient::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
-            .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+        aws_s3_transfer::Config::builder()
+            .s3_config(aws_s3_transfer::config::S3ClientConfig::new(
                 s3.config().to_builder(),
             ))
             .part_size(PART_SIZE)
@@ -966,7 +966,7 @@ async fn discovery_service_error_surfaces_underlying_cause() {
 
     assert_eq!(
         *err.kind(),
-        aws_sdk_s3_transfer_manager::error::ErrorKind::ServiceError,
+        aws_s3_transfer::error::ErrorKind::ServiceError,
         "discovery failure must surface the underlying service error (SlowDown), \
          got {err:?}",
     );

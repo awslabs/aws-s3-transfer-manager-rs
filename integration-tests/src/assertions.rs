@@ -9,12 +9,10 @@
 //! are written and maintained once. Module-specific assertions (e.g. ones tied
 //! to a particular output type) stay with their module.
 
-use aws_sdk_s3_transfer_manager::error::{Error, ErrorKind};
-use aws_sdk_s3_transfer_manager::metrics::TransferMetrics;
-use aws_sdk_s3_transfer_manager::operation::download::DownloadOutput;
-use aws_sdk_s3_transfer_manager::types::{
-    ChecksumAlgorithm, ChecksumValidation, NotValidatedReason,
-};
+use aws_s3_transfer::error::{Error, ErrorKind};
+use aws_s3_transfer::metrics::TransferMetrics;
+use aws_s3_transfer::operation::download::DownloadOutput;
+use aws_s3_transfer::types::{ChecksumAlgorithm, ChecksumValidation, NotValidatedReason};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -69,7 +67,7 @@ pub(crate) fn assert_integrity_error<T>(result: Result<T, Error>) {
 /// checksum-mismatch error shape (algorithm/expected/computed extraction).
 pub(crate) fn expect_integrity_error<T: std::fmt::Debug>(
     result: Result<T, Error>,
-) -> aws_sdk_s3_transfer_manager::error::IntegrityError {
+) -> aws_s3_transfer::error::IntegrityError {
     match result {
         Err(e) => match e.kind() {
             ErrorKind::IntegrityError(ie) => ie.clone(),

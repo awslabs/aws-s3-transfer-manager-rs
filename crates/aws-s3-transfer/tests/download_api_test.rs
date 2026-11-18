@@ -5,16 +5,16 @@
 
 mod common;
 
+use aws_s3_transfer::config::ReadAhead;
 #[cfg(feature = "sdk-v1")]
-use aws_sdk_s3::operation::{get_object::GetObjectOutput, head_object::HeadObjectOutput};
-use aws_sdk_s3_transfer_manager::config::ReadAhead;
-#[cfg(feature = "sdk-v1")]
-use aws_sdk_s3_transfer_manager::types::{ChecksumValidation, NotValidatedReason};
-use aws_sdk_s3_transfer_manager::{
+use aws_s3_transfer::types::{ChecksumValidation, NotValidatedReason};
+use aws_s3_transfer::{
     operation::download,
     types::{self},
     Client, Config,
 };
+#[cfg(feature = "sdk-v1")]
+use aws_sdk_s3::operation::{get_object::GetObjectOutput, head_object::HeadObjectOutput};
 #[cfg(feature = "sdk-v1")]
 use aws_smithy_mocks::{mock, mock_client, RuleMode};
 #[cfg(feature = "sdk-v1")]

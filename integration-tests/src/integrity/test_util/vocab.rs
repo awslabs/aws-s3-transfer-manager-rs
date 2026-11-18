@@ -21,7 +21,7 @@
 pub(crate) use crate::test_util::object::{Alg, Layout, Object, MIB};
 /// Reason words, for `not_validated(<reason>)` and `undetected(<reason>)`: the transfer manager's
 /// own `NotValidatedReason` variants.
-pub(crate) use aws_sdk_s3_transfer_manager::types::NotValidatedReason;
+pub(crate) use aws_s3_transfer::types::NotValidatedReason;
 pub(crate) use Alg::*;
 pub(crate) use Layout::Composite;
 pub(crate) use NotValidatedReason::{CompositeChecksum, Disabled, PartialCoverage, Unavailable};

@@ -19,7 +19,7 @@ use crate::transfer::StateMachineTerminalReceiver;
 /// The recommended pattern is to call [`join`](Self::join) to wait for completion:
 ///
 /// ```no_run
-/// # async fn example(client: &aws_sdk_s3_transfer_manager::Client) -> Result<(), aws_sdk_s3_transfer_manager::error::Error> {
+/// # async fn example(client: &aws_s3_transfer::Client) -> Result<(), aws_s3_transfer::error::Error> {
 /// let handle = client
 ///     .upload_objects()
 ///     .bucket("my-bucket")

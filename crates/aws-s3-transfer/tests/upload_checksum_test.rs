@@ -3,20 +3,20 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use aws_sdk_s3_transfer_manager::types::ByteSize;
+use aws_s3_transfer::types::ByteSize;
 use std::{str::FromStr, task::Poll};
 
-use aws_sdk_s3::operation::{
-    complete_multipart_upload::CompleteMultipartUploadOutput,
-    create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput,
-    upload_part::UploadPartOutput,
-};
-use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize};
-use aws_sdk_s3_transfer_manager::{
+use aws_s3_transfer::config::{ConcurrencyMode, PartSize};
+use aws_s3_transfer::{
     io::{InputStream, PartData, PartStream, SizeHint},
     operation::upload::UploadOutput,
     types::checksum::{CompositeAlgorithm, Crc32, Crc32C, Crc64Nvme, Sha1, Sha256},
     types::{ChecksumAlgorithm, ChecksumStrategy, ChecksumType},
+};
+use aws_sdk_s3::operation::{
+    complete_multipart_upload::CompleteMultipartUploadOutput,
+    create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput,
+    upload_part::UploadPartOutput,
 };
 use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
 use bytes::Bytes;
@@ -183,7 +183,7 @@ impl PartStream for TestStream {
     fn poll_part(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
-        _stream_cx: &aws_sdk_s3_transfer_manager::io::StreamContext,
+        _stream_cx: &aws_s3_transfer::io::StreamContext,
     ) -> Poll<Option<std::io::Result<PartData>>> {
         let this = self.project();
         let part_index = *this.next_part_num as usize - 1;
@@ -627,7 +627,7 @@ async fn run_test(config: TestConfig) -> UploadOutput {
         config.parts[0].clone().into()
     };
 
-    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
+    let tm_config = aws_s3_transfer::Config::builder()
         .s3_config(test_common::s3_config_with_test_http(
             s3_client.config().to_builder(),
         ))
@@ -636,7 +636,7 @@ async fn run_test(config: TestConfig) -> UploadOutput {
         .concurrency(ConcurrencyMode::Explicit(1)) // guarantee parts sent in order
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
+    let tm = aws_s3_transfer::Client::new(tm_config);
 
     // Do upload
     let upload_handle = tm
@@ -1006,28 +1006,28 @@ async fn test_mpu_checksums_from_part_stream() {
 fn helper_create_transfer_manager(
     s3_client: aws_sdk_s3::Client,
     sdk_checksum_calculation: aws_sdk_s3::config::RequestChecksumCalculation,
-) -> aws_sdk_s3_transfer_manager::Client {
+) -> aws_s3_transfer::Client {
     let s3_config = s3_client
         .config()
         .to_builder()
         .request_checksum_calculation(sdk_checksum_calculation);
-    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
+    let tm_config = aws_s3_transfer::Config::builder()
         .s3_config(test_common::s3_config_with_test_http(s3_config))
         .part_size(PartSize::Target(ByteSize::new(PART_SIZE as u64)))
         .multipart_threshold(PartSize::Target(ByteSize::new(PART_SIZE as u64)))
         .concurrency(ConcurrencyMode::Explicit(1))
         .build()
         .expect("valid config");
-    aws_sdk_s3_transfer_manager::Client::new(tm_config)
+    aws_s3_transfer::Client::new(tm_config)
 }
 
 /// Asserts that `error` is an input error whose cause names `expected_cause`.
 ///
 /// The cause is reached through `source()`: the error's own `Display` carries only its kind.
-fn assert_input_invalid(error: &aws_sdk_s3_transfer_manager::error::Error, expected_cause: &str) {
+fn assert_input_invalid(error: &aws_s3_transfer::error::Error, expected_cause: &str) {
     assert_eq!(
         *error.kind(),
-        aws_sdk_s3_transfer_manager::error::ErrorKind::InputInvalid,
+        aws_s3_transfer::error::ErrorKind::InputInvalid,
         "{error}"
     );
     let cause = std::error::Error::source(error)
@@ -1249,7 +1249,7 @@ impl PartStream for UnboundedEmptyStream {
     fn poll_part(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
-        _stream_cx: &aws_sdk_s3_transfer_manager::io::StreamContext,
+        _stream_cx: &aws_s3_transfer::io::StreamContext,
     ) -> Poll<Option<std::io::Result<PartData>>> {
         Poll::Ready(None)
     }

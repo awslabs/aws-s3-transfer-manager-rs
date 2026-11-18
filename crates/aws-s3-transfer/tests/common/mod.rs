@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use aws_s3_transfer::config::S3ClientConfig;
 use aws_sdk_s3::config::{Credentials, SharedCredentialsProvider};
-use aws_sdk_s3_transfer_manager::config::S3ClientConfig;
 use aws_smithy_runtime_api::client::http::HttpClient;
 
 /// Shared configuration with fixed test credentials/region and the supplied

@@ -14,9 +14,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
-use aws_sdk_s3_transfer_manager::io::walk::{FsWalker, S3Walker};
-use aws_sdk_s3_transfer_manager::types::ByteSize;
+use aws_s3_transfer::config::RuntimeConfig;
+use aws_s3_transfer::io::walk::{FsWalker, S3Walker};
+use aws_s3_transfer::types::ByteSize;
 use s3_mock_server::S3MockServer;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -37,7 +37,9 @@ async fn setup() -> MockTm {
 /// out by peers retrying into the same limit).
 async fn setup_with_concurrency(concurrency: usize) -> MockTm {
     mock_tm_with(RuntimeConfig::default(), |b| {
-        b.concurrency(aws_sdk_s3_transfer_manager::config::ConcurrencyMode::Explicit(concurrency))
+        b.concurrency(aws_s3_transfer::config::ConcurrencyMode::Explicit(
+            concurrency,
+        ))
     })
     .await
 }
@@ -563,7 +565,7 @@ async fn upload_objects_throttle_storm_aborts_transfer() {
             .expect_err("a persistent 503 storm across the fan-out currently aborts the transfer");
         assert_eq!(
             *err.kind(),
-            aws_sdk_s3_transfer_manager::error::ErrorKind::ChildOperationFailed,
+            aws_s3_transfer::error::ErrorKind::ChildOperationFailed,
             "a throttle storm aborts via a failed child operation, got {err:?}",
         );
         // The top-level Display names the first failing object (not a bare "child
@@ -584,7 +586,7 @@ async fn upload_objects_throttle_storm_aborts_transfer() {
             .expect("abort under Abort policy attaches the per-object failures");
         assert!(!failed.is_empty(), "at least one child failure recorded");
         let service_failure = failed.iter().any(|f| {
-            *f.error().kind() == aws_sdk_s3_transfer_manager::error::ErrorKind::ServiceError
+            *f.error().kind() == aws_s3_transfer::error::ErrorKind::ServiceError
         });
         assert!(
             service_failure,

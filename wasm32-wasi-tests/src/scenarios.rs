@@ -13,11 +13,11 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aws_sdk_s3_transfer_manager::error::ErrorKind;
-use aws_sdk_s3_transfer_manager::io::walk::{FsWalker, S3Walker};
-use aws_sdk_s3_transfer_manager::io::InputStream;
-use aws_sdk_s3_transfer_manager::types::FailedTransferPolicy;
-use aws_sdk_s3_transfer_manager::Client;
+use aws_s3_transfer::error::ErrorKind;
+use aws_s3_transfer::io::walk::{FsWalker, S3Walker};
+use aws_s3_transfer::io::InputStream;
+use aws_s3_transfer::types::FailedTransferPolicy;
+use aws_s3_transfer::Client;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use bytes::Bytes;
 
