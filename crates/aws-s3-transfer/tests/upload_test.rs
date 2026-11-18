@@ -2232,13 +2232,20 @@ async fn test_create_multipart_failure_releases_stream_while_handle_held() {
     assert_eq!(0, mock.record().upload_part_calls());
 }
 
+/// Panics the worker that sends UploadPart without running the panic hook. With
+/// `RUST_BACKTRACE` set, the hook captures and prints a backtrace before the worker unwinds, which
+/// takes seconds under ThreadSanitizer.
+fn upload_part_panic() -> ! {
+    std::panic::resume_unwind(Box::new("UploadPart panicked"))
+}
+
 // ref: awslabs/aws-s3-transfer-manager-rs#226
 /// A worker panic fails the upload from outside its state machine. The custom stream is still
 /// released while the caller holds the handle.
 #[tokio::test]
 async fn test_worker_panic_releases_stream_while_handle_held() {
     let upload_part = mock!(aws_sdk_s3::Client::upload_part)
-        .then_output(|| -> UploadPartOutput { panic!("UploadPart panicked") });
+        .then_output(|| -> UploadPartOutput { upload_part_panic() });
     let mock = MultipartMock::new().with_override(&upload_part);
     let (tx, handle) = upload_from_channel(&mock.tm());
 
@@ -2264,7 +2271,7 @@ impl HttpConnector for HeldPartThenPanicConnector {
             return HttpConnectorFuture::new(std::future::pending());
         }
         if uri.contains("partNumber=2") {
-            panic!("UploadPart panicked");
+            upload_part_panic();
         }
         assert!(
             request.method() == "POST" && uri.contains("uploads"),
