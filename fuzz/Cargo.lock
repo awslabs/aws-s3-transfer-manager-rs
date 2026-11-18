@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "aws-s3-transfer"
-version = "0.4.0"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "aws-config",
@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-execution"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aws-smithy-topology",
  "tokio",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-managed-http"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aws-smithy-execution",
  "aws-smithy-http-client",
@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-topology"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "many_cpus",
 ]
