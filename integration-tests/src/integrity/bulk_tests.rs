@@ -113,6 +113,10 @@ fn assert_downloaded(t: &TmTestClient, dest: &Path, key: &str, seed: u32, len: u
 /// One object of each algorithm-test shape that runs in a general purpose bucket, each with its own
 /// seed, downloads with `download_objects` to files equal to their sources.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "bulk round trips repeat download_tests' interleavings; see the integrity module"
+)]
 async fn download_objects_mixed_shapes_round_trip() {
     let t = Target::mock_gp().connect().await;
     // The object of each algorithm-test shape that runs on `mock_gp`, with the shape's first
@@ -204,6 +208,10 @@ async fn corrupt_child_continue(corrupted: Object, first_seed: u32) {
 /// A corrupted COMPOSITE child fails alone, with an integrity error, under
 /// `FailedTransferPolicy::Continue`.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "bulk round trips repeat download_tests' interleavings; see the integrity module"
+)]
 async fn download_objects_corrupt_composite_child_continue() {
     corrupt_child_continue(
         Object::mpu(Layout::Composite, Alg::Crc32)
@@ -217,6 +225,10 @@ async fn download_objects_corrupt_composite_child_continue() {
 /// A corrupted child uploaded with the default strategy, CRC64NVME FULL_OBJECT, fails alone, with
 /// an integrity error, under `FailedTransferPolicy::Continue`.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "bulk round trips repeat download_tests' interleavings; see the integrity module"
+)]
 // ref: RUST-1758
 async fn download_objects_corrupt_full_object_child_continue() {
     corrupt_child_continue(
@@ -231,6 +243,10 @@ async fn download_objects_corrupt_full_object_child_continue() {
 /// Under `FailedTransferPolicy::Abort`, a corrupted COMPOSITE child fails the operation, which
 /// reports the child's integrity error, and the child's file is not published.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "bulk round trips repeat download_tests' interleavings; see the integrity module"
+)]
 async fn download_objects_corrupt_child_abort() {
     let t = Target::mock_gp().connect().await;
     let corrupted = Object::mpu(Layout::Composite, Alg::Crc32)
@@ -275,6 +291,10 @@ async fn download_objects_corrupt_child_abort() {
 /// below the multipart threshold, and CRC64NVME FULL_OBJECT for a file above it, uploaded in
 /// parts.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "bulk round trips repeat download_tests' interleavings; see the integrity module"
+)]
 async fn upload_objects_stores_default_checksum() {
     const SMALL_SEED: u32 = 0x6275_0501;
     const LARGE_SEED: u32 = 0x6275_0502;
@@ -331,6 +351,10 @@ async fn upload_objects_stores_default_checksum() {
 /// fails alone with that error and stores nothing, and the other two files are stored with their
 /// bytes and default checksums.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "bulk round trips repeat download_tests' interleavings; see the integrity module"
+)]
 async fn upload_objects_rejected_child_continue() {
     let t = Target::mock_gp().connect().await;
     let files = [
@@ -413,6 +437,10 @@ async fn upload_objects_rejected_child_continue() {
 /// listed ETag, without HeadObject. That response's checksum still validates the child: a
 /// corrupted byte fails it with an integrity error in its algorithm.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "bulk round trips repeat download_tests' interleavings; see the integrity module"
+)]
 async fn download_objects_small_child_skips_head_and_is_validated() {
     let t = Target::mock_gp().connect().await;
     let objects = [
@@ -519,11 +547,19 @@ async fn small_composite_child_corrupted_at(flipped: u64, first_seed: u32) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "bulk round trips repeat download_tests' interleavings; see the integrity module"
+)]
 async fn download_objects_small_composite_child_corrupted_in_part_1() {
     small_composite_child_corrupted_at(7, 0x6275_0900).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "bulk round trips repeat download_tests' interleavings; see the integrity module"
+)]
 async fn download_objects_small_composite_child_corrupted_in_part_2() {
     small_composite_child_corrupted_at(5 * MIB + 7, 0x6275_0910).await;
 }

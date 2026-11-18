@@ -268,6 +268,9 @@ jobs:
             # concurrent transfer. Running those test processes in parallel can
             # exhaust macOS socket buffers without increasing product coverage.
             nextest_args+=(--test-threads 1)
+            # The `extended` integrity tier crosses object shapes with every
+            # algorithm; Linux runs it, as the E2E jobs do.
+            nextest_args+=(-E 'not test(::extended::)')
           fi
           cargo nextest run --locked --workspace --all-features --no-fail-fast "${nextest_args[@]}"
           cargo test --locked --doc --workspace --all-features --no-fail-fast
@@ -815,20 +818,13 @@ jobs:
             cfg: s3_tm_asan
             test_args: --test-threads 1 --nocapture
           # TSan uses the pre-instrumented standard-library target so happens-
-          # before edges inside std synchronization remain visible.
-          # The integrity suites skipped here run the same download and upload
-          # paths as `integrity::download_tests` with other objects or
-          # assertions; download_tests keeps the held, cut-short and
-          # out-of-order cases that exercise concurrency.
+          # before edges inside std synchronization remain visible. The
+          # integrity suites that repeat the same concurrent paths are ignored
+          # under `--cfg s3_tm_tsan`; see integration-tests/src/integrity.rs.
           - sanitizer: thread
             target: x86_64-unknown-linux-gnutsan
             cfg: s3_tm_tsan
-            test_args: >-
-              --test-threads 1 --nocapture
-              --skip integrity::algorithm_tests
-              --skip integrity::upload_tests
-              --skip integrity::service_tests
-              --skip integrity::negative_control_tests
+            test_args: --test-threads 1 --nocapture
     steps:
       - uses: actions/checkout@v4
       - name: Install llvm

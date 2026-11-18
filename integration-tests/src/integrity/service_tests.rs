@@ -259,6 +259,10 @@ async fn kms_head_needs_no_grant_beyond_get() {
 }
 
 target_tests! {
+    #![cfg_attr(
+        s3_tm_tsan,
+        ignore = "service behavior cases repeat download_tests' interleavings; see the integrity module"
+    )]
     upload_without_checksum_stores_crc64nvme: [mock_gp, mock_express, real_gp, real_express];
     full_object_mpu_first_range_checksum_by_bucket_type: [mock_gp, mock_express, real_gp, real_express];
     full_object_mpu_head_returns_object_crc: [mock_gp, mock_express, real_gp, real_express];

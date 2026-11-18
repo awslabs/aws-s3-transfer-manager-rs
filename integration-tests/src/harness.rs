@@ -631,36 +631,46 @@ impl TmTestClient {
 /// `#[tokio::test]` per listed target, named after the target, that runs
 /// `name(Target::<target>())`. The `real_*` functions are compiled only under `--cfg e2e_test`.
 /// So the test `mpu_intact` on the mock's directory bucket is `...::mpu_intact::mock_express`.
+///
+/// Attributes written first as `#![...]` apply to every generated test, as in
+/// `target_tests! { #![cfg_attr(s3_tm_tsan, ignore = "<reason>")] name: [mock_gp]; }`.
 macro_rules! target_tests {
-    ($( $name:ident: [$($target:ident),+ $(,)?]; )+) => {
+    ($(#![$attr:meta])* $( $name:ident: [$($target:ident),+ $(,)?]; )+) => {
+        $crate::harness::target_tests!(@mods [$(#[$attr])*] $( $name: [$($target),+]; )+);
+    };
+    (@mods $attrs:tt $( $name:ident: [$($target:ident),+]; )+) => {
         $(
             mod $name {
-                $( $crate::harness::target_tests!(@fn $name $target); )+
+                $( $crate::harness::target_tests!(@fn $attrs $name $target); )+
             }
         )+
     };
-    (@fn $name:ident mock_gp) => {
+    (@fn [$($attrs:tt)*] $name:ident mock_gp) => {
         #[tokio::test(flavor = "multi_thread")]
+        $($attrs)*
         async fn mock_gp() {
             super::$name($crate::harness::Target::mock_gp()).await;
         }
     };
-    (@fn $name:ident mock_express) => {
+    (@fn [$($attrs:tt)*] $name:ident mock_express) => {
         #[tokio::test(flavor = "multi_thread")]
+        $($attrs)*
         async fn mock_express() {
             super::$name($crate::harness::Target::mock_express()).await;
         }
     };
-    (@fn $name:ident real_gp) => {
+    (@fn [$($attrs:tt)*] $name:ident real_gp) => {
         #[cfg(e2e_test)]
         #[tokio::test(flavor = "multi_thread")]
+        $($attrs)*
         async fn real_gp() {
             super::$name($crate::harness::Target::real_gp()).await;
         }
     };
-    (@fn $name:ident real_express) => {
+    (@fn [$($attrs:tt)*] $name:ident real_express) => {
         #[cfg(e2e_test)]
         #[tokio::test(flavor = "multi_thread")]
+        $($attrs)*
         async fn real_express() {
             super::$name($crate::harness::Target::real_express()).await;
         }

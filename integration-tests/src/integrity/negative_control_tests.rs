@@ -62,6 +62,10 @@ const PER_PART_CORRUPT: &str =
 
 /// `validated` fails a download that reports `NotValidated`.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn validated_rejects_an_unvalidated_download() {
     let (case, run) = execute(UNVALIDATED).await;
     let case = changed(case, |c| c.expect = Expect::Validated(Crc32));
@@ -73,6 +77,10 @@ async fn validated_rejects_an_unvalidated_download() {
 
 /// `validated` fails a download validated with another algorithm than the one expected.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn validated_rejects_another_algorithm() {
     let (case, run) = execute(INTACT).await;
     let case = changed(case, |c| c.expect = Expect::Validated(Crc64Nvme));
@@ -84,6 +92,10 @@ async fn validated_rejects_another_algorithm() {
 
 /// `not_validated` fails a download that reports another reason.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn not_validated_rejects_another_reason() {
     let (case, run) = execute(UNVALIDATED).await;
     let case = changed(case, |c| c.expect = Expect::NotValidated(Unavailable));
@@ -92,6 +104,10 @@ async fn not_validated_rejects_another_reason() {
 
 /// A successful outcome fails a download that returned an error.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn success_rejects_a_failed_download() {
     let (case, run) = execute(CORRUPT).await;
     let case = changed(case, |c| c.expect = Expect::Validated(Crc32));
@@ -100,6 +116,10 @@ async fn success_rejects_a_failed_download() {
 
 /// `integrity_error` fails a download that succeeded.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn integrity_error_rejects_a_successful_download() {
     let (case, run) = execute(INTACT).await;
     let case = changed(case, |c| c.expect = Expect::IntegrityError(Crc32));
@@ -111,6 +131,10 @@ async fn integrity_error_rejects_a_successful_download() {
 
 /// `integrity_error` fails an integrity error in another algorithm than the one expected.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn integrity_error_rejects_another_algorithm() {
     let (case, run) = execute(CORRUPT).await;
     let case = changed(case, |c| c.expect = Expect::IntegrityError(Sha256));
@@ -123,6 +147,10 @@ async fn integrity_error_rejects_another_algorithm() {
 /// `integrity_error` fails an error whose checksum isn't the one the mechanism checks for the
 /// faulted byte: a per-part download reports the part's checksum, not the object's.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn integrity_error_requires_the_checked_checksum() {
     let (case, run) = execute(PER_PART_CORRUPT).await;
     let case = changed(case, |c| c.mechanism = Mechanism::WholeResponse);
@@ -132,6 +160,10 @@ async fn integrity_error_requires_the_checked_checksum() {
 /// The byte comparison fails a download that delivered a corrupted byte when the outcome says the
 /// bytes are intact.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn byte_check_rejects_a_corrupted_byte() {
     let (case, run) = execute(UNDETECTED).await;
     let case = changed(case, |c| c.expect = Expect::NotValidated(Disabled));
@@ -144,6 +176,10 @@ async fn byte_check_rejects_a_corrupted_byte() {
 /// `undetected` fails a download whose bytes are intact: the corruption must have reached the
 /// caller.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn undetected_rejects_intact_bytes() {
     let (case, run) = execute(UNVALIDATED).await;
     let case = changed(case, |c| {
@@ -158,6 +194,10 @@ async fn undetected_rejects_intact_bytes() {
 
 /// Enabling the object-value requirement rejects an execution that reported none.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn object_values_are_required_when_the_rule_says_so() {
     let (case, run) = execute(UNVALIDATED).await;
     let case = changed(case, |c| c.download.validation = true);
@@ -170,6 +210,10 @@ async fn object_values_are_required_when_the_rule_says_so() {
 
 /// Disabling the object-value requirement rejects an execution that reported values.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn object_values_are_absent_when_the_rule_says_so() {
     let (case, run) = execute(INTACT).await;
     let case = changed(case, |c| c.download.validation = false);
@@ -179,6 +223,10 @@ async fn object_values_are_absent_when_the_rule_says_so() {
 
 /// A failed stream download must end with the error as the body's last item.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn failed_stream_must_end_in_the_error() {
     let (case, mut run) = execute(CORRUPT).await;
     run.delivered.stream_ended_in_error = false;
@@ -187,6 +235,10 @@ async fn failed_stream_must_end_in_the_error() {
 
 /// A failed path download must leave the destination's sentinel in place.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn failed_path_download_must_leave_the_destination() {
     let (case, mut run) = execute(CORRUPT_PATH).await;
     run.delivered.bytes = b"replaced".to_vec();
@@ -195,6 +247,10 @@ async fn failed_path_download_must_leave_the_destination() {
 
 /// A failed path download must remove its temporary file.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn failed_path_download_must_remove_its_temporary_file() {
     let (case, mut run) = execute(CORRUPT_PATH).await;
     run.delivered.temp_file_remains = true;
@@ -203,6 +259,10 @@ async fn failed_path_download_must_remove_its_temporary_file() {
 
 /// A successful path download must hold exactly the object.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn successful_path_download_must_hold_the_object() {
     let (case, mut run) = execute(INTACT_PATH).await;
     run.delivered.bytes.truncate(10);
@@ -219,6 +279,10 @@ fn check_journal(case: &Case, run: &Execution) -> Result<(), String> {
 
 /// A `corrupt` case fails when no GET was corrupted.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn corrupt_requires_a_corrupted_get() {
     let (case, run) = execute(INTACT).await;
     let case = changed(case, |c| c.fault = fault::corrupt(At::First));
@@ -227,6 +291,10 @@ async fn corrupt_requires_a_corrupted_get() {
 
 /// A `truncate` case fails when no GET was cut short.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn truncate_requires_a_cut_get() {
     let (case, run) = execute(PER_PART).await;
     let case = changed(case, |c| c.fault = fault::truncate(At::Later));
@@ -235,6 +303,10 @@ async fn truncate_requires_a_cut_get() {
 
 /// A `corrupt_retry` case fails when the retry after the cut was served intact.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn corrupt_retry_requires_a_corrupted_retry() {
     let (case, run) = execute(PER_PART_TRUNCATED).await;
     let case = changed(case, |c| c.fault = fault::corrupt_retry(At::Later));
@@ -246,6 +318,10 @@ async fn corrupt_retry_requires_a_corrupted_retry() {
 
 /// A `truncate` case fails when the cut GET doesn't contain the named byte.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn truncate_requires_the_cut_to_contain_the_byte() {
     let (case, run) = execute(PER_PART_TRUNCATED).await;
     let case = changed(case, |c| c.fault = fault::truncate(At::First));
@@ -258,6 +334,10 @@ async fn truncate_requires_the_cut_to_contain_the_byte() {
 /// A `truncate` case fails when no GET of the cut GET's range was sent in full after it: the
 /// retry is what the download survives on. The execution's retry is given another range.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn truncate_requires_a_retry_of_the_cut_range() {
     let (case, mut run) = execute(PER_PART_TRUNCATED).await;
     let requests = run.requests.as_mut().expect("a mock execution");
@@ -278,6 +358,10 @@ async fn truncate_requires_a_retry_of_the_cut_range() {
 /// A `corrupt` case fails when the corruption was registered at another byte than the named
 /// one. The execution's fault is changed to another offset.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn corrupt_requires_the_named_offset() {
     let (case, mut run) = execute(PER_PART_CORRUPT).await;
     for r in run.requests.as_mut().expect("a mock execution") {
@@ -290,6 +374,10 @@ async fn corrupt_requires_the_named_offset() {
 
 /// A `corrupt` case fails when the mock flipped another byte than the named one.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn corrupt_requires_the_named_byte_flipped() {
     let (case, mut run) = execute(PER_PART_CORRUPT).await;
     for r in run.requests.as_mut().expect("a mock execution") {
@@ -304,6 +392,10 @@ async fn corrupt_requires_the_named_byte_flipped() {
 /// byte was computed: `later` is the range starting at `B`. The execution's corrupted GET is
 /// given a range that contains the byte but starts elsewhere.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn faults_require_the_named_range() {
     let (case, mut run) = execute(PER_PART_CORRUPT).await;
     let b = case.range_size();
@@ -320,6 +412,10 @@ async fn faults_require_the_named_range() {
 
 /// A held case fails when no GET was held.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn hold_requires_a_held_get() {
     let (case, run) = execute(PER_PART).await;
     let case = changed(case, |c| c.hold = Some(Hold::FirstRange));
@@ -329,6 +425,10 @@ async fn hold_requires_a_held_get() {
 /// A held `validated` case fails when the held body didn't end last. The execution's body orders
 /// are swapped so the held body ends first.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn hold_requires_the_held_body_to_end_last() {
     let (case, mut run) = execute(HELD).await;
     check_journal(case, &run).expect("the held case passes as executed");
@@ -358,6 +458,10 @@ async fn hold_requires_the_held_body_to_end_last() {
 
 /// `via: per_part` fails a download whose GET carried the object's checksum, not a part's.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn per_part_requires_part_checksums() {
     let (case, run) = execute(INTACT).await;
     let case = changed(case, |c| c.mechanism = Mechanism::PerPart);
@@ -366,6 +470,10 @@ async fn per_part_requires_part_checksums() {
 
 /// `via: whole_response` fails a download whose GETs carried part checksums.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn whole_response_requires_the_object_checksum() {
     let (case, run) = execute(PER_PART).await;
     let case = changed(case, |c| c.mechanism = Mechanism::WholeResponse);
@@ -377,6 +485,10 @@ async fn whole_response_requires_the_object_checksum() {
 
 /// `via: full_object` fails a download that sent no HeadObject reporting a full-object checksum.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn full_object_requires_a_head_object() {
     let (case, mut run) = execute(INTACT).await;
     case.check(&run)
@@ -394,6 +506,10 @@ async fn full_object_requires_a_head_object() {
 /// Fault positions resolve to the bytes the tables describe: 0, the download part size (the
 /// transfer manager's 8 MiB unless the options set one), and the object's last byte.
 #[test]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 fn fault_positions_resolve_to_object_bytes() {
     let auto = table_case("download_tests::full_object_mpu::crc32::default::validated::stream");
     assert_eq!(
@@ -413,6 +529,10 @@ fn fault_positions_resolve_to_object_bytes() {
 /// A later GET of the same range cannot excuse an earlier fully sent response
 /// that lacked a part checksum.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    s3_tm_tsan,
+    ignore = "negative controls check the checks, not interleavings; see the integrity module"
+)]
 async fn per_part_checks_every_fully_sent_response() {
     let (case, mut run) = execute(PER_PART).await;
     let requests = run.requests.as_mut().expect("mock journal");

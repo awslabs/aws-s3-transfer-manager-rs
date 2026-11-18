@@ -306,6 +306,10 @@ async fn provided_full_object_mismatch_mpu(target: Target) {
 }
 
 target_tests! {
+    #![cfg_attr(
+        s3_tm_tsan,
+        ignore = "upload integrity cases repeat download_tests' interleavings; see the integrity module"
+    )]
     mpu_intact: [mock_gp, mock_express, real_gp, real_express];
     path_many_parts_intact: [mock_gp, mock_express, real_gp, real_express];
     provided_full_object_put: [mock_gp, mock_express, real_gp, real_express];
