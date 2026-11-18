@@ -937,6 +937,8 @@ jobs:
       RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
     steps:
       - uses: actions/checkout@v4
+      # The baseline is the highest published release of `aws-s3-transfer` that is
+      # not above the manifest version.
       - name: Check semver
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
@@ -944,7 +946,6 @@ jobs:
           package: aws-s3-transfer
           feature-group: all-features
           rust-toolchain: ${{ env.rust_min }}
-          baseline-version: '0.3.0'
 
   features:
     name: features
