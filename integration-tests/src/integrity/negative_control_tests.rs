@@ -55,6 +55,8 @@ const PER_PART: &str = "download_tests::composite_mpu::crc32::aligned::validated
 const PER_PART_TRUNCATED: &str =
     "download_tests::composite_mpu::crc32::aligned::validated::truncate::later::stream";
 const HELD: &str = "download_tests::composite_mpu::crc32::out_of_order::validated::stream";
+const HELD_CORRUPT: &str =
+    "download_tests::composite_mpu::crc32::out_of_order::integrity_error::corrupt::later::path";
 const PER_PART_CORRUPT: &str =
     "download_tests::composite_mpu::crc32::aligned::integrity_error::corrupt::later::path";
 
@@ -353,6 +355,48 @@ async fn hold_requires_the_held_body_to_end_last() {
     assert_fails(
         check_journal(case, &run),
         "every other GET must end before the held body",
+    );
+}
+
+/// A held `integrity_error` case passes when the download failed before the GET covering byte 0
+/// reached the mock: the corrupted GET was still sent while the first range was outstanding.
+#[tokio::test(flavor = "multi_thread")]
+async fn held_integrity_error_passes_without_the_first_range_get() {
+    let (case, mut run) = execute(HELD_CORRUPT).await;
+    check_journal(case, &run).expect("the held case passes as executed");
+    let requests = run.requests.as_mut().expect("a mock execution");
+    requests.retain(|r| !matches!(r.fault, Some(FaultType::HoldBody { .. })));
+    check_journal(case, &run).expect("the case passes without the held GET");
+}
+
+/// A held `integrity_error` case fails when the held body ended before the corrupted GET's.
+#[tokio::test(flavor = "multi_thread")]
+async fn held_integrity_error_requires_the_corrupted_get_first() {
+    let (case, mut run) = execute(HELD_CORRUPT).await;
+    let requests = run.requests.as_mut().expect("a mock execution");
+    let corrupted = requests
+        .iter()
+        .position(|r| matches!(r.fault, Some(FaultType::CorruptByte { .. })))
+        .expect("a corrupted GET");
+    let corrupted_order = requests[corrupted]
+        .body
+        .expect("the corrupted body ended")
+        .order;
+    let mut held = requests
+        .iter()
+        .find(|r| matches!(r.fault, Some(FaultType::HoldBody { .. })))
+        .cloned()
+        .expect("a held GET");
+    let mut body = held
+        .body
+        .unwrap_or(requests[corrupted].body.expect("ended"));
+    body.order = corrupted_order.checked_sub(1).expect("an earlier order");
+    held.body = Some(body);
+    requests.retain(|r| !matches!(r.fault, Some(FaultType::HoldBody { .. })));
+    requests.push(held);
+    assert_fails(
+        check_journal(case, &run),
+        "the corrupted GET must be sent while the held body is held",
     );
 }
 
