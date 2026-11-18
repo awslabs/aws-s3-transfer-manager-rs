@@ -166,6 +166,7 @@ mod tests {
         ObjectCannedAcl, ObjectLockLegalHoldStatus, ObjectLockMode, RequestPayer,
         ServerSideEncryption, StorageClass,
     };
+    use crate::types::checksum::Crc32;
     use crate::types::ChecksumStrategy;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
@@ -182,9 +183,7 @@ mod tests {
             .bucket_key_enabled(true)
             .cache_control("max-age=3600")
             .checksum_strategy(
-                ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32)
-                    .unwrap()
-                    .with_expected_value("0xebe6c6e6"),
+                ChecksumStrategy::full_object(Crc32).with_expected_value("0xebe6c6e6"),
             )
             .content_disposition("attachment; filename=test.txt")
             .content_encoding("gzip")

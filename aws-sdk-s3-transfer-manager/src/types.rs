@@ -8,6 +8,7 @@ use std::ops;
 use std::str::FromStr;
 use std::time::Duration;
 
+pub mod checksum;
 mod checksum_strategy;
 pub use checksum_strategy::ChecksumStrategy;
 

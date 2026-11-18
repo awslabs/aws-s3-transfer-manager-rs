@@ -187,15 +187,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and g6e, and uses one network card's bandwidth for p5, p5e, p5en, p6-b200, p6-b300, trn1 and
   trn1n.
 - `ChecksumStrategy` moves from `operation::upload` to `types` and is built with
-  `ChecksumStrategy::full_object` or `ChecksumStrategy::composite`, which return
-  `ErrorKind::InputInvalid` for an algorithm the type doesn't support, and `with_expected_value`.
-  `with_calculated_crc64_nvme()`, `with_calculated_crc32()` and `with_calculated_crc32_c()` become
-  `full_object(ChecksumAlgorithm::Crc64Nvme)` (or `ChecksumStrategy::default()`), `full_object(Crc32)`
-  and `full_object(Crc32C)`; `with_crc64_nvme(v)`, `with_crc32(v)` and `with_crc32_c(v)` become
-  `full_object(..)?.with_expected_value(v)`; and the `with_calculated_*_composite_if_multipart()`
-  constructors become `composite(..)`. `ChecksumStrategyBuilder`, `ChecksumStrategy::builder` and
-  the `with_*` constructors are removed. `type_if_multipart` is renamed `multipart_checksum_type`,
-  and `full_object_checksum` is renamed `expected_value`.
+  `ChecksumStrategy::full_object` or `ChecksumStrategy::composite`, and `with_expected_value`. The
+  constructors take an algorithm type from `types::checksum` (`Crc64Nvme`, `Crc32`, `Crc32C`,
+  `Sha1` or `Sha256`) and cannot fail; an algorithm the checksum type doesn't support doesn't
+  compile. `with_calculated_crc64_nvme()`, `with_calculated_crc32()` and `with_calculated_crc32_c()`
+  become `full_object(Crc64Nvme)` (or `ChecksumStrategy::default()`), `full_object(Crc32)` and
+  `full_object(Crc32C)`; `with_crc64_nvme(v)`, `with_crc32(v)` and `with_crc32_c(v)` become
+  `full_object(Crc64Nvme).with_expected_value(v)`, `full_object(Crc32).with_expected_value(v)` and
+  `full_object(Crc32C).with_expected_value(v)`; and the
+  `with_calculated_*_composite_if_multipart()` constructors become `composite(..)`, for example
+  `with_calculated_sha256_composite_if_multipart()` becomes `composite(Sha256)`.
+  `ChecksumStrategyBuilder`, `ChecksumStrategy::builder` and the `with_*` constructors are
+  removed. `type_if_multipart` is renamed `multipart_checksum_type`, and `full_object_checksum` is
+  renamed `expected_value`.
 
 ### Fixed
 - `InputStream::from_path` and `PathBodyBuilder::build` reject a path that does not name a regular

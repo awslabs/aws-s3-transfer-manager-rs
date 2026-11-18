@@ -174,8 +174,7 @@ async fn adopted_file_upload_uses_configured_native_pool_and_retains_runtime_unt
             .bucket("test-bucket")
             .key("file")
             .checksum_strategy(
-                tm::types::ChecksumStrategy::full_object(tm::types::ChecksumAlgorithm::Crc32)
-                    .unwrap()
+                tm::types::ChecksumStrategy::full_object(tm::types::checksum::Crc32)
                     .with_expected_value(&checksum),
             )
             .body(tm::io::InputStream::from_path(file.path()).unwrap())

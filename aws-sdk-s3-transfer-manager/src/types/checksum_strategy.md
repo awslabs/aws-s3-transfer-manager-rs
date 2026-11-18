@@ -4,14 +4,19 @@ S3 checks each checksum an upload sends against the bytes it receives, and store
 the object. See [Checking object integrity](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html).
 A strategy answers three questions:
 
-1. **Which algorithm?** S3 stores the object's checksum in this algorithm.
+1. **Which algorithm?** S3 stores the object's checksum in this algorithm, named by a type from
+   [`checksum`](crate::types::checksum).
 2. **Should the stored checksum cover the whole object?**
    - [`full_object`](ChecksumStrategy::full_object): the stored checksum equals a checksum of the
-     whole object, so it can be compared with one computed elsewhere. CRC64NVME, CRC32 or CRC32C.
+     whole object, so it can be compared with one computed elsewhere. CRC64NVME, CRC32 or CRC32C:
+     the [`FullObjectAlgorithm`](crate::types::checksum::FullObjectAlgorithm) types.
    - [`composite`](ChecksumStrategy::composite): for a multipart upload, the stored checksum is a
      checksum of the part checksums. It depends on the part size and doesn't equal a checksum of
-     the object. CRC32, CRC32C, SHA1 or SHA256. A single-request upload sends a full object
-     checksum of the same algorithm.
+     the object. CRC32, CRC32C, SHA1 or SHA256: the
+     [`CompositeAlgorithm`](crate::types::checksum::CompositeAlgorithm) types. A single-request
+     upload sends a full object checksum of the same algorithm.
+
+   A constructor called with an algorithm its checksum type doesn't support doesn't compile.
 3. **Do you know the expected checksum?**
    [`with_expected_value`](ChecksumStrategy::with_expected_value) gives S3 the value to check the
    uploaded object against; S3 rejects the upload if it doesn't match. A single-request upload

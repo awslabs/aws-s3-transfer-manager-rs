@@ -694,7 +694,10 @@ fn nested_converters_keep_absent_and_empty_collections_distinct() {
 }
 
 #[test]
-fn modeled_checksum_values_do_not_enable_unsupported_execution_algorithms() {
+fn checksum_algorithms_round_trip_through_sdk_v1() {
+    use crate::types::checksum::{Crc32, Crc32C, Crc64Nvme, Sha1, Sha256};
+    use crate::types::ChecksumStrategy;
+
     for name in [
         "MD5",
         "SHA512",
@@ -708,15 +711,18 @@ fn modeled_checksum_values_do_not_enable_unsupported_execution_algorithms() {
             checksum_algorithm_from_sdk(&checksum_algorithm_to_sdk(&algorithm)),
             algorithm
         );
-        assert!(crate::types::ChecksumStrategy::full_object(algorithm.clone()).is_err());
-        assert!(crate::types::ChecksumStrategy::composite(algorithm).is_err());
     }
-    for name in ["CRC32", "CRC32C", "CRC64NVME", "SHA1", "SHA256"] {
-        let algorithm = model::ChecksumAlgorithm::from(name);
-        assert!(
-            crate::types::ChecksumStrategy::full_object(algorithm.clone())
-                .or_else(|_| crate::types::ChecksumStrategy::composite(algorithm))
-                .is_ok()
+    for strategy in [
+        ChecksumStrategy::full_object(Crc64Nvme),
+        ChecksumStrategy::full_object(Crc32),
+        ChecksumStrategy::full_object(Crc32C),
+        ChecksumStrategy::composite(Sha1),
+        ChecksumStrategy::composite(Sha256),
+    ] {
+        let algorithm = strategy.algorithm();
+        assert_eq!(
+            &checksum_algorithm_from_sdk(&checksum_algorithm_to_sdk(algorithm)),
+            algorithm
         );
     }
 }

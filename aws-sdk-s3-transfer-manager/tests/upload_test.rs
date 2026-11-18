@@ -23,7 +23,7 @@ use aws_sdk_s3_transfer_manager::io::{
 use aws_sdk_s3_transfer_manager::memory::{BufferPool, SegmentedBytes};
 use aws_sdk_s3_transfer_manager::types::ByteSize;
 use aws_sdk_s3_transfer_manager::types::FailedMultipartUploadPolicy;
-use aws_sdk_s3_transfer_manager::types::{ChecksumAlgorithm, ChecksumStrategy};
+use aws_sdk_s3_transfer_manager::types::{checksum::Crc32, ChecksumStrategy};
 use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
 use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
 use aws_smithy_runtime_api::client::http::{
@@ -1245,7 +1245,7 @@ async fn test_unknown_length_forwards_full_object_checksum() {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .checksum_strategy(ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap())
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32))
         .body(InputStream::from_part_stream(stream))
         .initiate()
         .unwrap();
@@ -2383,7 +2383,7 @@ async fn test_complete_not_sent_when_upload_ends_during_checksum() {
         .upload()
         .bucket("test-bucket")
         .key("test-key")
-        .checksum_strategy(ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap())
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32))
         .body(InputStream::from_part_stream(stream))
         .initiate()
         .unwrap();

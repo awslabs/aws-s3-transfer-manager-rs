@@ -16,7 +16,7 @@
 
 use aws_sdk_s3::types::ChecksumType;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData};
-use aws_sdk_s3_transfer_manager::types::{ChecksumAlgorithm, ChecksumStrategy};
+use aws_sdk_s3_transfer_manager::types::{checksum::Crc32, ChecksumStrategy};
 
 use crate::assertions::describe_error;
 use crate::harness::{target_tests, ClientOptions, Target, TmTestClient};
@@ -134,9 +134,7 @@ async fn provided_full_object_put(target: Target) {
         .bucket(t.bucket())
         .key(t.key(KEY))
         .checksum_strategy(
-            ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32)
-                .unwrap()
-                .with_expected_value(provided.value.clone()),
+            ChecksumStrategy::full_object(Crc32).with_expected_value(provided.value.clone()),
         )
         .body(InputStream::from(object_bytes(SEED, object.len as usize)))
         .initiate()
@@ -169,9 +167,7 @@ async fn provided_full_object_mpu(target: Target) {
         .bucket(t.bucket())
         .key(t.key(KEY))
         .checksum_strategy(
-            ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32)
-                .unwrap()
-                .with_expected_value(provided.value.clone()),
+            ChecksumStrategy::full_object(Crc32).with_expected_value(provided.value.clone()),
         )
         .body(InputStream::from(object_bytes(SEED, object.len as usize)))
         .initiate()
@@ -206,7 +202,7 @@ async fn part_checksum_mismatch_aborts_upload(target: Target) {
         .upload()
         .bucket(t.bucket())
         .key(t.key(KEY))
-        .checksum_strategy(ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap())
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32))
         .body(InputStream::from_part_stream(PrebuiltParts::new(
             parts,
             6 * PART,
@@ -266,9 +262,11 @@ async fn provided_full_object_mismatch_put(target: Target) {
         .bucket(t.bucket())
         .key(t.key(KEY))
         .checksum_strategy(
-            ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32)
-                .unwrap()
-                .with_expected_value(checksum_of(Alg::Crc32, OTHER_SEED, len)),
+            ChecksumStrategy::full_object(Crc32).with_expected_value(checksum_of(
+                Alg::Crc32,
+                OTHER_SEED,
+                len,
+            )),
         )
         .body(InputStream::from(object_bytes(SEED, len as usize)))
         .initiate()
@@ -296,9 +294,11 @@ async fn provided_full_object_mismatch_mpu(target: Target) {
         .bucket(t.bucket())
         .key(t.key(KEY))
         .checksum_strategy(
-            ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32)
-                .unwrap()
-                .with_expected_value(checksum_of(Alg::Crc32, OTHER_SEED, len)),
+            ChecksumStrategy::full_object(Crc32).with_expected_value(checksum_of(
+                Alg::Crc32,
+                OTHER_SEED,
+                len,
+            )),
         )
         .body(InputStream::from(object_bytes(SEED, len as usize)))
         .initiate()

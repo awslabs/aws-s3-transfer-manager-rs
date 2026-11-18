@@ -25,7 +25,7 @@
 use aws_sdk_s3_transfer_manager::config::PartSize;
 use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::types::ByteSize;
-use aws_sdk_s3_transfer_manager::types::{ChecksumAlgorithm, ChecksumStrategy};
+use aws_sdk_s3_transfer_manager::types::{checksum::Crc32, ChecksumStrategy};
 use s3_mock_server::S3MockServer;
 
 mod fault_connector;
@@ -101,7 +101,7 @@ async fn upload_part_single_dispatch_io_error_recovers() {
         .upload()
         .bucket("test-bucket")
         .key("obj")
-        .checksum_strategy(ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap())
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32))
         .body(InputStream::from(bytes::Bytes::from(body)))
         .initiate()
         .expect("initiate upload")
@@ -134,7 +134,7 @@ async fn upload_part_correlated_burst_dispatch_io_error() {
         .upload()
         .bucket("test-bucket")
         .key("obj")
-        .checksum_strategy(ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap())
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32))
         .body(InputStream::from(bytes::Bytes::from(body)))
         .initiate()
         .expect("initiate upload")
@@ -165,7 +165,7 @@ async fn upload_part_persistent_dispatch_io_error_fails() {
         .upload()
         .bucket("test-bucket")
         .key("obj")
-        .checksum_strategy(ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap())
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32))
         .body(InputStream::from(bytes::Bytes::from(body)))
         .initiate()
         .expect("initiate upload")
