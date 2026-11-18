@@ -160,9 +160,7 @@
 //!
 //! The macros whose names start with `__` are steps of the two public macros. Each level passes
 //! the settings that apply below it as one token tree, the context:
-//! `(<mechanism>, (<object>), (<download>), [<ignore>?], <tsan>, <extended>, [<targets>], <hold>)`.
-//! `<tsan>` is `tsan_runs` for download cases and `tsan_ignored` for algorithm cases, which the
-//! thread sanitizer job doesn't run (see the [`integrity`](crate::integrity) module).
+//! `(<mechanism>, (<object>), (<download>), [<ignore>?], <extended>, [<targets>], <hold>)`.
 //!
 //! [`Case`]: super::vocab::Case
 //! [`Case::run`]: super::vocab::Case::run
@@ -281,8 +279,7 @@ macro_rules! __fault {
 #[macro_export]
 macro_rules! __case {
     (
-        ($mech:ident, ($obj:expr), ($dl:expr), $ign:tt, $tsan:ident, $ext:tt, [$($t:ident),+],
-            $hold:ident),
+        ($mech:ident, ($obj:expr), ($dl:expr), $ign:tt, $ext:tt, [$($t:ident),+], $hold:ident),
         ($o:ident [$($args:tt)*]), $kind:ident, $fault:tt, $sink:ident
     ) => {
         pub(crate) mod $sink {
@@ -301,7 +298,7 @@ macro_rules! __case {
                 extended: $ext,
                 targets: &[$($crate::__target!($t)),+],
             };
-            $( $crate::__test_fn!($kind, $hold, $ign, $tsan, $t); )+
+            $( $crate::__test_fn!($kind, $hold, $ign, $t); )+
             pub(crate) fn cases(v: &mut Cases) {
                 v.push(&CASE);
             }
@@ -321,43 +318,32 @@ macro_rules! __expect {
 }
 
 /// A test function per target. A real target gets one only for a case with no fault and no
-/// hold, and only under `--cfg e2e_test`. A `tsan_ignored` case without its own ignore reason is
-/// ignored under `--cfg s3_tm_tsan`.
+/// hold, and only under `--cfg e2e_test`.
 #[macro_export]
 macro_rules! __test_fn {
-    ($f:ident, $h:ident, $ign:tt, $tsan:ident, mock_gp) => {
-        $crate::__test_fn!(@emit $ign, $tsan, mock_gp, MockGp);
+    ($f:ident, $h:ident, $ign:tt, mock_gp) => {
+        $crate::__test_fn!(@emit $ign, mock_gp, MockGp);
     };
-    ($f:ident, $h:ident, $ign:tt, $tsan:ident, mock_express) => {
-        $crate::__test_fn!(@emit $ign, $tsan, mock_express, MockExpress);
+    ($f:ident, $h:ident, $ign:tt, mock_express) => {
+        $crate::__test_fn!(@emit $ign, mock_express, MockExpress);
     };
-    (no_fault, no_hold, $ign:tt, $tsan:ident, real_gp) => {
+    (no_fault, no_hold, $ign:tt, real_gp) => {
         #[cfg(e2e_test)]
-        $crate::__test_fn!(@emit $ign, $tsan, real_gp, RealGp);
+        $crate::__test_fn!(@emit $ign, real_gp, RealGp);
     };
-    (no_fault, no_hold, $ign:tt, $tsan:ident, real_express) => {
+    (no_fault, no_hold, $ign:tt, real_express) => {
         #[cfg(e2e_test)]
-        $crate::__test_fn!(@emit $ign, $tsan, real_express, RealExpress);
+        $crate::__test_fn!(@emit $ign, real_express, RealExpress);
     };
-    ($f:ident, $h:ident, $ign:tt, $tsan:ident, real_gp) => {};
-    ($f:ident, $h:ident, $ign:tt, $tsan:ident, real_express) => {};
-    (@emit [], tsan_runs, $name:ident, $t:ident) => {
+    ($f:ident, $h:ident, $ign:tt, real_gp) => {};
+    ($f:ident, $h:ident, $ign:tt, real_express) => {};
+    (@emit [], $name:ident, $t:ident) => {
         #[tokio::test(flavor = "multi_thread")]
         async fn $name() {
             CASE.run(CaseTarget::$t).await
         }
     };
-    (@emit [], tsan_ignored, $name:ident, $t:ident) => {
-        #[tokio::test(flavor = "multi_thread")]
-        #[cfg_attr(
-            s3_tm_tsan,
-            ignore = "algorithm cases repeat download_tests' interleavings; see the integrity module"
-        )]
-        async fn $name() {
-            CASE.run(CaseTarget::$t).await
-        }
-    };
-    (@emit [$ign:literal], $tsan:ident, $name:ident, $t:ident) => {
+    (@emit [$ign:literal], $name:ident, $t:ident) => {
         #[tokio::test(flavor = "multi_thread")]
         #[ignore = $ign]
         async fn $name() {
@@ -442,8 +428,7 @@ macro_rules! download_cases {
             pub(crate) mod $setup {
                 $crate::download_cases!(
                     @hold [$($hold)?]
-                    ($mech, ({ let $a = alg::$alg; $obj }), ($dl), [$($ign)?], tsan_runs, false,
-                        $targets);
+                    ($mech, ({ let $a = alg::$alg; $obj }), ($dl), [$($ign)?], false, $targets);
                     $( $outcome($($($args)*)?) { $($body)* } )+
                 );
             }
@@ -521,8 +506,7 @@ macro_rules! algorithm_cases {
         ($io:ident [$($ia:tt)*]), ($co:ident [$($ca:tt)*])) => {
         pub(crate) mod $alg {
             $crate::__outcomes!(
-                ($mech, ({ let $a = alg::$alg; $obj }), $dl, $ign, tsan_ignored, $ext, $targets,
-                    no_hold);
+                ($mech, ({ let $a = alg::$alg; $obj }), $dl, $ign, $ext, $targets, no_hold);
                 $io($($ia)*) { [stream] }
                 $co($($ca)*) { corrupt(tail): [stream] }
             );

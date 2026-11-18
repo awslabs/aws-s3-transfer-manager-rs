@@ -89,18 +89,6 @@
 //! `algorithm_tests` crosses object shapes with every supported upload algorithm;
 //! `download_tests` covers faults, destinations and download options. CRC calculation
 //! and combination are checked independently against direct SDK hashing.
-//!
-//! ## Under the thread sanitizer
-//!
-//! The thread sanitizer finds races only in the interleavings a run produces, and only in
-//! `unsafe` code and atomics, such as the buffer pool's. Under `--cfg s3_tm_tsan`, the suites
-//! that produce distinct interleavings run: `download_tests`, whose held, cut-short, out-of-order
-//! and multi-wave cases drive concurrent range completion, and `liveness_tests`. The suites
-//! that repeat the same concurrent paths with other objects, algorithms or assertions are
-//! ignored there, with a reason naming this section: `algorithm_tests` (through
-//! `algorithm_cases!`), `upload_tests` and `service_tests` (through `target_tests!`),
-//! `negative_control_tests`, `bulk_tests`, and the many-part tests below. Every other job
-//! runs them.
 
 mod algorithm_tests;
 mod bulk_tests;
@@ -782,10 +770,6 @@ async fn many_part_file_download_round_trips(target: Target) {
 }
 
 #[tokio::test]
-#[cfg_attr(
-    s3_tm_tsan,
-    ignore = "large-data round trips that the other jobs run; see the integrity module"
-)]
 async fn many_part_file_download_round_trips_mock_gp() {
     many_part_file_download_round_trips(Target::mock_gp()).await;
 }
@@ -853,10 +837,6 @@ async fn tampered_many_part_file_cleans_up(target: Target) {
 }
 
 #[tokio::test]
-#[cfg_attr(
-    s3_tm_tsan,
-    ignore = "large-data round trips that the other jobs run; see the integrity module"
-)]
 async fn tampered_many_part_file_cleans_up_mock_gp() {
     tampered_many_part_file_cleans_up(Target::mock_gp()).await;
 }
