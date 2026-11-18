@@ -18,7 +18,7 @@ use crate::harness::{ClientOptions, TmTestClient};
 
 /// How long a held body waits for the other ranges before it is released anyway. The case then
 /// fails its hold check rather than hanging.
-const HOLD_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const HOLD_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Bytes a truncated GET sends before it is cut.
 ///

@@ -12,7 +12,7 @@
 //! check can't fail first. Where the condition can't be produced by a download, the test changes
 //! the recorded execution instead.
 
-use super::test_util::runner::Execution;
+use super::test_util::runner::{Execution, HOLD_DEADLINE};
 use super::test_util::table_case;
 use super::test_util::vocab::*;
 use s3_mock_server::FaultType;
@@ -374,23 +374,37 @@ async fn held_integrity_error_passes_without_the_first_range_get() {
 async fn held_integrity_error_requires_the_corrupted_get_first() {
     let (case, mut run) = execute(HELD_CORRUPT).await;
     let requests = run.requests.as_mut().expect("a mock execution");
+    // Make the held body the second-to-last to end and the corrupted body the last, whatever
+    // order the run produced; the corrupted body can be the first to end.
+    let last = requests
+        .iter()
+        .filter_map(|r| r.body.map(|b| b.order))
+        .max()
+        .expect("a body ended");
     let corrupted = requests
         .iter()
         .position(|r| matches!(r.fault, Some(FaultType::CorruptByte { .. })))
         .expect("a corrupted GET");
-    let corrupted_order = requests[corrupted]
-        .body
-        .expect("the corrupted body ended")
-        .order;
+    let mut corrupted_body = requests[corrupted].body.expect("the corrupted body ended");
+    corrupted_body.order = last + 2;
+    requests[corrupted].body = Some(corrupted_body);
     let mut held = requests
         .iter()
         .find(|r| matches!(r.fault, Some(FaultType::HoldBody { .. })))
         .cloned()
-        .expect("a held GET");
-    let mut body = held
-        .body
-        .unwrap_or(requests[corrupted].body.expect("ended"));
-    body.order = corrupted_order.checked_sub(1).expect("an earlier order");
+        .unwrap_or_else(|| {
+            // The run can fail before the held GET reaches the mock; stand one in.
+            let mut held = requests[corrupted].clone();
+            held.fault = Some(FaultType::HoldBody {
+                others: 0,
+                deadline: HOLD_DEADLINE,
+            });
+            held.flipped = None;
+            held.hold = None;
+            held
+        });
+    let mut body = held.body.unwrap_or(corrupted_body);
+    body.order = last + 1;
     held.body = Some(body);
     requests.retain(|r| !matches!(r.fault, Some(FaultType::HoldBody { .. })));
     requests.push(held);
