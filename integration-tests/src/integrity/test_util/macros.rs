@@ -109,7 +109,7 @@
 //!
 //! | Position | Byte                        | Range                                         |
 //! | -------- | --------------------------- | --------------------------------------------- |
-//! | `first`  | 0                           | The first, which discovery fetches            |
+//! | `first`  | 0                           | The first range                               |
 //! | `later`  | `B`, the download part size | The second, which the request planner fetches |
 //! | `tail`   | `L - 1`, the last byte      | The final range                               |
 //!

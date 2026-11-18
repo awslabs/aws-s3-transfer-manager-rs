@@ -218,7 +218,6 @@ async fn download_objects_corrupt_composite_child_continue() {
 /// an integrity error, under `FailedTransferPolicy::Continue`.
 #[tokio::test(flavor = "multi_thread")]
 // ref: RUST-1758
-#[ignore = "not validated against the full-object checksum"]
 async fn download_objects_corrupt_full_object_child_continue() {
     corrupt_child_continue(
         Object::mpu(Layout::FullObject, Alg::Crc64Nvme)
@@ -408,4 +407,123 @@ async fn upload_objects_rejected_child_continue() {
         assert_stored_bytes(&t, key, *seed, object.len).await;
     }
     t.shutdown().await;
+}
+
+/// A child that fits in one 8 MiB range is downloaded with one checksum-mode GET pinned to its
+/// listed ETag, without HeadObject. That response's checksum still validates the child: a
+/// corrupted byte fails it with an integrity error in its algorithm.
+#[tokio::test(flavor = "multi_thread")]
+async fn download_objects_small_child_skips_head_and_is_validated() {
+    let t = Target::mock_gp().connect().await;
+    let objects = [
+        ("intact", Object::single_put(Alg::Crc32).len(5 * MIB)),
+        ("corrupted", Object::single_put(Alg::Crc64Nvme).len(5 * MIB)),
+    ];
+    let uploaded = upload_all(&t, "small", &objects, 0x6275_0700).await;
+    const FLIPPED: u64 = 7;
+    t.mock().expect("a mock target").insert_fault_for(
+        FaultTarget::object(t.bucket(), t.key(&uploaded[1].0)).covering(FLIPPED),
+        FaultType::CorruptByte { offset: FLIPPED },
+        0,
+        Occurrence::Always,
+    );
+
+    let dest = tempfile::tempdir().expect("create destination");
+    let output = download_prefix(&t, "small", dest.path(), FailedTransferPolicy::Continue)
+        .join()
+        .await
+        .expect("download_objects");
+
+    let failed = output.failed_transfers();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(
+        failed[0].input().key(),
+        Some(t.key(&uploaded[1].0).as_str())
+    );
+    check_integrity_error(
+        failed[0].error(),
+        &Alg::Crc64Nvme.tm().expect("an algorithm"),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_downloaded(&t, dest.path(), &uploaded[0].0, uploaded[0].1, 5 * MIB);
+
+    let requests = t.mock().expect("a mock target").requests();
+    for (key, _) in &uploaded {
+        let key = t.key(key);
+        let sent = |operation: Operation| {
+            requests
+                .iter()
+                .filter(|r| r.key.as_deref() == Some(key.as_str()) && r.operation == operation)
+                .count()
+        };
+        assert_eq!(sent(Operation::HeadObject), 0, "{key}: {requests:#?}");
+        assert_eq!(sent(Operation::GetObject), 1, "{key}: {requests:#?}");
+    }
+    t.shutdown().await;
+}
+
+/// A small COMPOSITE multipart child fits in one 8 MiB range, but a single GET of it carries
+/// only the composite value, which can't validate the bytes. The child keeps HeadObject, so
+/// its ranges align to the stored parts and each part's checksum validates it: a corrupted
+/// byte in either part fails it with an integrity error.
+async fn small_composite_child_corrupted_at(flipped: u64, first_seed: u32) {
+    let t = Target::mock_gp().connect().await;
+    let objects = [
+        (
+            "corrupted",
+            Object::mpu(Layout::Composite, Alg::Crc32)
+                .len(6 * MIB)
+                .parts(5 * MIB),
+        ),
+        ("intact", Object::single_put(Alg::Crc32).len(5 * MIB)),
+    ];
+    let uploaded = upload_all(&t, "small_composite", &objects, first_seed).await;
+    let corrupted_key = t.key(&uploaded[0].0);
+    t.mock().expect("a mock target").insert_fault_for(
+        FaultTarget::object(t.bucket(), &corrupted_key).covering(flipped),
+        FaultType::CorruptByte { offset: flipped },
+        0,
+        Occurrence::Always,
+    );
+
+    let dest = tempfile::tempdir().expect("create destination");
+    let output = download_prefix(
+        &t,
+        "small_composite",
+        dest.path(),
+        FailedTransferPolicy::Continue,
+    )
+    .join()
+    .await
+    .expect("download_objects");
+
+    let failed = output.failed_transfers();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].input().key(), Some(corrupted_key.as_str()));
+    check_integrity_error(failed[0].error(), &Alg::Crc32.tm().expect("an algorithm"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_downloaded(&t, dest.path(), &uploaded[1].0, uploaded[1].1, 5 * MIB);
+
+    let requests = t.mock().expect("a mock target").requests();
+    let heads = requests
+        .iter()
+        .filter(|r| {
+            r.key.as_deref() == Some(corrupted_key.as_str()) && r.operation == Operation::HeadObject
+        })
+        .count();
+    assert_eq!(
+        heads, 1,
+        "a listed multipart child keeps HeadObject: {requests:#?}"
+    );
+    t.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn download_objects_small_composite_child_corrupted_in_part_1() {
+    small_composite_child_corrupted_at(7, 0x6275_0900).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn download_objects_small_composite_child_corrupted_in_part_2() {
+    small_composite_child_corrupted_at(5 * MIB + 7, 0x6275_0910).await;
 }

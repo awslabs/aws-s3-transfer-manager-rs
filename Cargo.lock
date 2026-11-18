@@ -273,6 +273,7 @@ dependencies = [
  "bytes-utils",
  "clap",
  "console-subscriber",
+ "crc-fast",
  "crossbeam-skiplist",
  "crossbeam-utils",
  "dial9",

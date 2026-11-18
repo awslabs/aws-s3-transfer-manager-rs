@@ -24,6 +24,7 @@ aws-sdk-s3 = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-observability = { workspace = true }
 aws-runtime = { workspace = true }
+aws-smithy-checksums = { workspace = true }
 aws-smithy-types = { workspace = true }
 aws-types = { workspace = true }
 bytes = "1"
@@ -108,9 +109,10 @@ aws-smithy-runtime = { workspace = true, features = ["client", "rt-tokio"] }
 windows-sys = { version = "0.59", features = ["Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
+# Reference implementation that tests check CRC combination against.
+crc-fast = "1.9"
 static_assertions = "1"
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest", "test-util"] }
-aws-smithy-checksums = { workspace = true }
 aws-smithy-mocks = { workspace = true }
 aws-smithy-runtime = { workspace = true, features = ["client", "test-util"] }
 aws-smithy-http-client = { workspace = true, features = ["test-util", "wire-mock", "rustls-aws-lc"] }

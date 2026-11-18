@@ -51,6 +51,8 @@ pub struct Error {
 struct ErrorExtra {
     /// Set when the error originated from an S3 service call.
     service: Option<ServiceMetadata>,
+    /// HTTP status of an unsuccessful service response, including bodyless HEAD errors.
+    http_status: Option<u16>,
     /// Set when the error is attributable to a specific chunk of an object.
     location: Option<ChunkRef>,
     /// Set when a local filesystem operation on a known path failed.
@@ -101,9 +103,7 @@ pub enum ErrorKind {
 
     /// The transfer manager could not continue for an internal reason that is
     /// neither an input, I/O, nor service failure: a worker panicked while
-    /// executing the transfer, the memory budget could not admit a request, or
-    /// a response violated an invariant the transfer depends on, such as a
-    /// `Content-Range` that does not match the requested range.
+    /// executing the transfer, or the memory budget could not admit a request.
     RuntimeError,
 
     /// Object discovery failed for a reason that is not a service-call error, such
@@ -111,7 +111,9 @@ pub enum ErrorKind {
     ObjectNotDiscoverable,
 
     /// A request to S3 failed, or S3 answered with a response the transfer
-    /// cannot use, such as an UploadPart response without an ETag. The
+    /// cannot use, such as an UploadPart response without an ETag or a ranged
+    /// GetObject or HeadObject response whose `Content-Range` doesn't match the
+    /// requested range. The
     /// originating operation, service error code (when S3 reported one),
     /// message, and request ids are available via the accessors on [`Error`]
     /// ([`Error::operation_name`], [`Error::code`], [`Error::request_id`]).
@@ -121,6 +123,14 @@ pub enum ErrorKind {
     /// (`if_match` / `if_none_match` on an upload) arrives here with
     /// [`Error::code`] of `"PreconditionFailed"`; S3 reports that code in the
     /// response body, so it is available whatever HTTP status carries it.
+    ///
+    /// A whole-object download with checksum validation enabled, or a download of an
+    /// open-ended or suffix range, discovers the object with HeadObject. S3 answers a
+    /// failed HeadObject without a body, so the error carries the HTTP status and
+    /// request ids but no message, and a code only where the status identifies one:
+    /// `"PreconditionFailed"` for 412, `"NotModified"` for 304, `"InvalidRange"` for
+    /// 416, and the SDK's `"NotFound"` for 404. A missing key is `"NotFound"`, not
+    /// `"NoSuchKey"` as a failed GetObject reports.
     ServiceError,
 
     /// Object integrity validation failed: the received bytes did not match the
@@ -294,6 +304,11 @@ impl Error {
     /// The service error code, if any (e.g. `"NoSuchKey"`, `"AccessDenied"`).
     pub fn code(&self) -> Option<&str> {
         self.service().and_then(|m| m.code.as_deref())
+    }
+
+    /// HTTP status of the service response, if the error has one.
+    pub(crate) fn http_status(&self) -> Option<u16> {
+        self.extra.as_ref().and_then(|e| e.http_status)
     }
 
     /// The service error message, if any.
@@ -604,6 +619,24 @@ where
     }
 }
 
+/// Returns an integrity error carrying the algorithm and stored/calculated S3 header values.
+///
+/// `expected` and `computed` are base64 checksum encodings for the same algorithm.
+pub(crate) fn integrity_mismatch(
+    algorithm: ChecksumAlgorithm,
+    expected: String,
+    computed: String,
+) -> Error {
+    Error::new(
+        ErrorKind::IntegrityError(IntegrityError {
+            algorithm: Some(algorithm),
+            expected: Some(expected),
+            computed: Some(computed),
+        }),
+        "calculated object checksum does not match its stored value",
+    )
+}
+
 /// The [`ChecksumAlgorithm`] named like a response checksum algorithm: its variant
 /// for that name, or `Unknown` for a name it has no variant for. It maps by name so
 /// an algorithm a newer SDK validates, which observability has no variant for yet,
@@ -691,15 +724,53 @@ pub(crate) trait SdkOperationError:
 /// failure.
 pub(crate) fn service_error<E: SdkOperationError>(e: SdkError<E, HttpResponse>) -> Error {
     let service = service_metadata(E::OPERATION_NAME, &e);
+    let http_status = e.raw_response().map(|response| response.status().as_u16());
     let transient_transport = is_sdk_transient_transport(&e);
     Error {
         kind: ErrorKind::ServiceError,
         source: Box::new(e),
         extra: Some(Box::new(ErrorExtra {
             service: Some(service),
+            http_status,
             transient_transport,
             ..Default::default()
         })),
+    }
+}
+
+/// Converts a failed HeadObject into an [`ErrorKind::ServiceError`].
+///
+/// S3 answers a failed HEAD with the status and request ids only. A HEAD response has
+/// no body, so it carries no error code or message. Where the status identifies a
+/// single S3 code, the code is filled in: 412 is `PreconditionFailed`, 304 is
+/// `NotModified`, and 416 is `InvalidRange`. Any other status keeps the code the SDK
+/// reported: `NotFound` for 404, and none otherwise.
+pub(crate) fn head_object_error(e: SdkError<HeadObjectError, HttpResponse>) -> Error {
+    let mut error = service_error(e);
+    let code = error
+        .extra
+        .as_ref()
+        .and_then(|extra| extra.http_status)
+        .and_then(head_status_code);
+    if let (Some(code), Some(service)) = (
+        code,
+        error
+            .extra
+            .as_mut()
+            .and_then(|extra| extra.service.as_mut()),
+    ) {
+        service.code.get_or_insert_with(|| code.to_owned());
+    }
+    error
+}
+
+/// The S3 error code a failed HEAD's `status` alone identifies, if there is exactly one.
+fn head_status_code(status: u16) -> Option<&'static str> {
+    match status {
+        304 => Some("NotModified"),
+        412 => Some("PreconditionFailed"),
+        416 => Some("InvalidRange"),
+        _ => None,
     }
 }
 
@@ -717,6 +788,22 @@ pub(crate) fn invalid_service_response<O>(
 where
     O: RequestId + RequestIdExt,
 {
+    invalid_service_response_ids(
+        operation,
+        output.request_id(),
+        output.extended_request_id(),
+        message,
+    )
+}
+
+/// [`invalid_service_response`] for a response already converted to transfer manager
+/// metadata, which carries the request ids but not the SDK's request id traits.
+pub(crate) fn invalid_service_response_ids(
+    operation: &'static str,
+    request_id: Option<&str>,
+    extended_request_id: Option<&str>,
+    message: impl Into<String>,
+) -> Error {
     let message = message.into();
     Error {
         kind: ErrorKind::ServiceError,
@@ -726,8 +813,8 @@ where
                 operation,
                 code: None,
                 message: Some(message),
-                request_id: output.request_id().map(str::to_owned),
-                extended_request_id: output.extended_request_id().map(str::to_owned),
+                request_id: request_id.map(str::to_owned),
+                extended_request_id: extended_request_id.map(str::to_owned),
             }),
             ..Default::default()
         })),

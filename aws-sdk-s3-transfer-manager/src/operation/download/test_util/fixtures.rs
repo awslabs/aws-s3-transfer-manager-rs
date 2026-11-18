@@ -23,6 +23,16 @@ pub(crate) fn object_bytes(len: usize) -> Arc<[u8]> {
     (0..len).map(|i| (i % 251) as u8 + 1).collect()
 }
 
+/// A whole-object HEAD response with stable size and ETag for any key.
+pub(crate) fn head_rule(object_len: u64) -> aws_smithy_mocks::Rule {
+    aws_smithy_mocks::mock!(aws_sdk_s3::Client::head_object).then_output(move || {
+        aws_sdk_s3::operation::head_object::HeadObjectOutput::builder()
+            .content_length(object_len as i64)
+            .e_tag("test-etag")
+            .build()
+    })
+}
+
 /// An S3 client that serves `object` for any key, answering each ranged
 /// `GetObject` with exactly the requested bytes.
 pub(crate) fn object_client(object: Arc<[u8]>) -> aws_sdk_s3::Client {
@@ -32,6 +42,7 @@ pub(crate) fn object_client(object: Arc<[u8]>) -> aws_sdk_s3::Client {
 
     use crate::http::header::{ByteRange, Range};
 
+    let head = head_rule(object.len() as u64);
     let get = mock!(aws_sdk_s3::Client::get_object).then_compute_response(move |req| {
         let last = object.len() as u64 - 1;
         let (start, end) = match req.range().and_then(|r| r.parse::<Range>().ok()) {
@@ -49,7 +60,7 @@ pub(crate) fn object_client(object: Arc<[u8]>) -> aws_sdk_s3::Client {
                 .build(),
         )
     });
-    mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get])
+    mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head, get])
 }
 
 /// An S3 client serving `object` by range that answers the range starting at
@@ -65,16 +76,21 @@ pub(crate) fn object_client_failing_at(
     use aws_smithy_mocks::MockResponse;
 
     let object_len = object.len();
-    strict_range_client(object, Some(failing_start), move |start, end, body| {
-        MockResponse::Output(
-            GetObjectOutput::builder()
-                .content_length(body.len() as i64)
-                .content_range(format!("bytes {start}-{end}/{object_len}"))
-                .e_tag("test-etag")
-                .body(ByteStream::from(body.to_vec()))
-                .build(),
-        )
-    })
+    strict_range_client(
+        object,
+        Some(failing_start),
+        None,
+        move |start, end, body| {
+            MockResponse::Output(
+                GetObjectOutput::builder()
+                    .content_length(body.len() as i64)
+                    .content_range(format!("bytes {start}-{end}/{object_len}"))
+                    .e_tag("test-etag")
+                    .body(ByteStream::from(body.to_vec()))
+                    .build(),
+            )
+        },
+    )
 }
 
 /// An S3 client serving `object` by range as HTTP responses that carry each
@@ -87,28 +103,52 @@ pub(crate) fn crc32_object_client(
     object: Arc<[u8]>,
     failing_start: Option<u64>,
 ) -> aws_sdk_s3::Client {
+    let mut checksum = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
+    checksum.update(&object);
+    crc32_object_client_with_stored_checksum(
+        object,
+        failing_start,
+        aws_smithy_types::base64::encode(checksum.finalize()),
+    )
+}
+
+/// Serves independently validated CRC32 ranges and reports `stored_checksum` on HEAD.
+///
+/// The stored value may disagree with the served object, while every range still
+/// passes SDK validation. The range at `failing_start`, if set, returns a server error.
+/// Panics on a request without an inclusive byte range.
+pub(crate) fn crc32_object_client_with_stored_checksum(
+    object: Arc<[u8]>,
+    failing_start: Option<u64>,
+    stored_checksum: String,
+) -> aws_sdk_s3::Client {
     use aws_smithy_mocks::MockResponse;
     use aws_smithy_runtime_api::http::{Response, StatusCode};
     use aws_smithy_types::body::SdkBody;
 
     let object_len = object.len();
-    strict_range_client(object, failing_start, move |start, end, body| {
-        let mut crc32 = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
-        crc32.update(body);
-        let mut response = Response::new(
-            StatusCode::try_from(200).unwrap(),
-            SdkBody::from(body.to_vec()),
-        );
-        let headers = response.headers_mut();
-        headers.insert("content-length", body.len().to_string());
-        headers.insert("content-range", format!("bytes {start}-{end}/{object_len}"));
-        headers.insert("etag", "test-etag");
-        headers.insert(
-            "x-amz-checksum-crc32",
-            aws_smithy_types::base64::encode(crc32.finalize()),
-        );
-        MockResponse::Http(response)
-    })
+    strict_range_client(
+        object,
+        failing_start,
+        Some(stored_checksum),
+        move |start, end, body| {
+            let mut crc32 = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
+            crc32.update(body);
+            let mut response = Response::new(
+                StatusCode::try_from(200).unwrap(),
+                SdkBody::from(body.to_vec()),
+            );
+            let headers = response.headers_mut();
+            headers.insert("content-length", body.len().to_string());
+            headers.insert("content-range", format!("bytes {start}-{end}/{object_len}"));
+            headers.insert("etag", "test-etag");
+            headers.insert(
+                "x-amz-checksum-crc32",
+                aws_smithy_types::base64::encode(crc32.finalize()),
+            );
+            MockResponse::Http(response)
+        },
+    )
 }
 
 /// An S3 client serving `object` by inclusive byte range, clamped to the object,
@@ -120,6 +160,7 @@ pub(crate) fn crc32_object_client(
 fn strict_range_client(
     object: Arc<[u8]>,
     failing_start: Option<u64>,
+    object_checksum: Option<String>,
     respond: impl Fn(
             u64,
             u64,
@@ -137,6 +178,14 @@ fn strict_range_client(
 
     use crate::http::header::{ByteRange, Range};
 
+    let object_len = object.len() as i64;
+    let head = mock!(aws_sdk_s3::Client::head_object).then_output(move || {
+        aws_sdk_s3::operation::head_object::HeadObjectOutput::builder()
+            .content_length(object_len)
+            .e_tag("test-etag")
+            .set_checksum_crc32(object_checksum.clone())
+            .build()
+    });
     let get = mock!(aws_sdk_s3::Client::get_object).then_compute_response(move |req| {
         let (start, end) = match req.range().and_then(|r| r.parse::<Range>().ok()) {
             Some(Range(ByteRange::Inclusive(start, end))) => {
@@ -152,7 +201,7 @@ fn strict_range_client(
         }
         respond(start, end, &object[start as usize..=end as usize])
     });
-    mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get], |conf| {
+    mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head, get], |conf| {
         conf.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
     })
 }
@@ -244,6 +293,25 @@ pub(crate) async fn assert_discovery_succeeds(transfer: &DownloadTransfer) {
     );
 }
 
+/// Completes discovery and accepts the first data range, if HEAD supplied no body.
+///
+/// Empty objects are already complete. GET-first discovery has already accepted
+/// its first body, so this helper does not issue the next range.
+pub(crate) async fn assert_first_range_succeeds(transfer: &DownloadTransfer) {
+    assert_discovery_succeeds(transfer).await;
+    if transfer.ctx().is_active() && transfer.ctx().metrics().network_rx == 0 {
+        let mut range = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            range.data_mut::<DownloadWork>(),
+            DownloadWork::GetObjectRange { .. }
+        ));
+        assert!(matches!(
+            execute(transfer, &mut range).await,
+            WorkOutcome::Success { .. }
+        ));
+    }
+}
+
 /// A two-part disk download writing through a scripted sink, stopped where
 /// `poll_work` has issued memory relief for the resident first part.
 pub(crate) struct ReliefScenario {
@@ -268,7 +336,7 @@ pub(crate) struct ReliefScenario {
 /// Builds a [`ReliefScenario`] whose destination writes go through `script`.
 ///
 /// The memory budget fits two parts, and a reservation outside the transfer
-/// holds one of them. Discovery fills the first part below the drain batch,
+/// holds one of them. The first range fills below the drain batch,
 /// the second part's claim then waits on memory, and `poll_work` relieves the
 /// resident first part. Each part's response carries its CRC32.
 pub(crate) async fn relief_scenario(script: &Arc<WriteScript>) -> ReliefScenario {
@@ -294,7 +362,7 @@ pub(crate) async fn relief_scenario(script: &Arc<WriteScript>) -> ReliefScenario
     let (transfer, consumer, dir) = disk_transfer(handle, &ScriptedSinkFactory(Arc::clone(script)));
     let path = dir.path().join("out");
 
-    assert_discovery_succeeds(&transfer).await;
+    assert_first_range_succeeds(&transfer).await;
     let mut relief = assert_ready(transfer.poll_work());
     assert!(
         matches!(

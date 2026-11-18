@@ -299,14 +299,16 @@ impl Case {
         if self.hold.is_some() {
             let held = gets
                 .iter()
-                .find(|r| matches!(r.fault, Some(FaultType::HoldBody { .. })))
-                .ok_or_else(|| format!("no GET was held: {gets:#?}"))?;
-            ensure!(
-                held.hold != Some(HoldEnd::Expired),
-                "the hold expired before the other ranges ended: {held:#?}"
-            );
+                .find(|r| matches!(r.fault, Some(FaultType::HoldBody { .. })));
+            if let Some(held) = held {
+                ensure!(
+                    held.hold != Some(HoldEnd::Expired),
+                    "the hold expired before the other ranges ended: {held:#?}"
+                );
+            }
             match self.expect {
                 Expect::Validated(_) => {
+                    let held = held.ok_or_else(|| format!("no GET was held: {gets:#?}"))?;
                     ensure!(sent(held), "the held body must be sent in full: {held:#?}");
                     let others_ended_first = gets
                         .iter()
@@ -318,12 +320,16 @@ impl Case {
                     );
                 }
                 Expect::IntegrityError(_) => {
+                    // The download fails on the corrupted range and stops its other GETs. It can
+                    // fail before the GET covering byte 0 reaches the mock, so that GET isn't
+                    // required; if it was sent, its body must not end before the corrupted GET's.
                     let corrupted = gets
                         .iter()
                         .find(|r| is_corrupt(r) && sent(r))
                         .ok_or_else(|| format!("no corrupted GET was sent in full: {gets:#?}"))?;
                     ensure!(
-                        order(held).is_none_or(|held| Some(held) > order(corrupted)),
+                        held.and_then(|r| order(r))
+                            .is_none_or(|held| Some(held) > order(corrupted)),
                         "the corrupted GET must be sent while the held body is held: {gets:#?}"
                     );
                 }
@@ -353,17 +359,10 @@ impl Case {
                 "no GET carried the object's checksum: {gets:#?}"
             ),
             (Expect::Validated(_), Mechanism::PerPart) => {
-                // Discovery may fetch range 0, discard it, and fetch it again by part number.
-                let refetched = |i: usize| {
-                    gets[i].range.as_ref().is_some_and(|r| r.start == 0)
-                        && gets[i + 1..]
-                            .iter()
-                            .any(|r| r.range.as_ref().is_some_and(|r| r.start == 0))
-                };
-                let without = (0..gets.len())
-                    .filter(|&i| sent(gets[i]) && !refetched(i))
-                    .filter(|&i| scope(gets[i]) != Some(ChecksumScope::Part))
-                    .map(|i| gets[i])
+                let without = gets
+                    .iter()
+                    .copied()
+                    .filter(|r| sent(r) && scope(r) != Some(ChecksumScope::Part))
                     .collect::<Vec<_>>();
                 ensure!(
                     without.is_empty(),

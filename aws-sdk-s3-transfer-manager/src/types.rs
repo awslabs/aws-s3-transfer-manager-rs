@@ -222,10 +222,13 @@ impl Bucket {
 /// outcome of checksum validation over the delivered bytes. Validation is a
 /// completion-time fact, distinct from the discovery-time [`ObjectMetadata`].
 ///
-/// Checksum values are present only when a single returned checksum covers the
-/// whole delivered object. They are `None` for a [`ChecksumType::Composite`]
-/// checksum, a checksum of part checksums that a checksum over the delivered
-/// bytes does not reproduce.
+/// Whole-object downloads with checksum validation enabled report the stored
+/// values returned by checksum-mode HEAD. Caller ranges do not report object
+/// checksum values. Validation-off downloads can report stored values only
+/// when discovery receives the whole object in one GET.
+/// Values are `None` for a [`ChecksumType::Composite`] checksum, a checksum of
+/// part checksums that a checksum over the delivered bytes does not reproduce;
+/// the type is still reported.
 ///
 /// A checksum mismatch is not represented here; it surfaces as an `Err` from the
 /// download's `join()`. On a successful `DownloadOutput`, [`ChecksumValidation`]
@@ -284,18 +287,22 @@ impl IntegrityChecks {
 /// Whether the bytes a download delivered were validated against S3's checksums.
 ///
 /// Validation checks the bytes as they were received from S3, not the destination
-/// they were written to. `Validated` means a response checksum covered every
-/// delivered byte, and every one of those checksums matched. Anything less is
-/// `NotValidated` with a [`NotValidatedReason`]; partial coverage is
-/// `NotValidated { reason: PartialCoverage }`, not a separate state.
+/// they were written to. `Validated` means every delivered byte was covered
+/// by matching response checksums or the complete object matched its stored
+/// CRC32, CRC32C or CRC64NVME checksum. Empty objects with a usable stored CRC
+/// are validated against the checksum of empty input.
+///
+/// Response checks remain active when a whole-object CRC is required; neither
+/// check can bypass a mismatch in the other. Without whole-object validation,
+/// partial response coverage is `NotValidated { reason: PartialCoverage }`.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChecksumValidation {
-    /// A response checksum covered every delivered byte, and every one of those
-    /// checksums matched.
+    /// All delivered bytes passed response validation or whole-object CRC validation.
     #[non_exhaustive]
     Validated {
-        /// The algorithm of the checksum that covered the lowest-offset delivered bytes.
+        /// The lowest-offset response's algorithm when all bytes passed response checks;
+        /// otherwise the algorithm of the matching whole-object CRC.
         algorithm: crate::model::ChecksumAlgorithm,
     },
     /// Not every delivered byte was validated. `reason` says why.
@@ -323,8 +330,8 @@ pub enum NotValidatedReason {
     CompositeChecksum,
     /// Some delivered bytes were validated, and some were not.
     PartialCoverage,
-    /// No response carried a checksum that could be checked, for example because the
-    /// object has no stored checksum. Also reported when no bytes were delivered.
+    /// No response checksum was checked and no whole-object CRC was validated.
+    /// Includes objects without stored checksums and empty objects without a usable CRC.
     Unavailable,
     /// A response carried checksums only in algorithms the SDK does not compute,
     /// such as MD5.

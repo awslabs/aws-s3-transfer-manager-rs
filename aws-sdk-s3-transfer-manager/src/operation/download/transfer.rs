@@ -3,7 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Download transfer implementation for scheduler integration.
+//! Download transfer state machine.
+//!
+//! [`DownloadTransfer`] resolves metadata and validation requirements through
+//! discovery, then issues range reads and destination drains under the state lock.
+//! Workers collect bytes and calculate required digests outside the lock. Only
+//! successfully published ranges and their required writes supply checksum evidence.
+//! The last completed work item claims exclusive completion ownership under the
+//! lock, then verifies integrity and finalizes the destination after releasing it.
 
 use std::cmp;
 use std::future::Future;
@@ -18,7 +25,7 @@ use crate::sdk_v1::copy_download_input_fields_to_get_object as copy_fields_to_ge
 
 use crate::error::{self, ChunkRef, Error};
 use crate::operation::download::body::{BodySlot, BodyWriter, ChunkOutput, DrainError, Drained};
-use crate::operation::download::checksum::ChecksumTally;
+use crate::operation::download::checksum::{DownloadIntegrity, RangeCompletion, RangeDigestPlan};
 use crate::operation::download::context::{
     CompletionClaim, DownloadPendingReason, DownloadState, PendingClaim,
 };
@@ -38,7 +45,7 @@ use crate::runtime::buffer_pool::{
 use crate::telemetry::TARGET_TRANSFER_DOWNLOAD;
 use crate::transfer::{IoRequest, PollWork, Transfer, TransferContext, TransferId, WorkOutcome};
 use crate::types::BucketType;
-use aws_smithy_observability::unit_of_work::checksums::{ChecksumCapture, ChecksumOutcome};
+use aws_smithy_observability::unit_of_work::checksums::ChecksumCapture;
 use aws_smithy_observability::unit_of_work::Capture;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use tracing::Instrument;
@@ -79,16 +86,25 @@ struct DownloadTransferInner {
     expected_download_len: std::sync::OnceLock<u64>,
     /// Notified when discovery completes (success or failure)
     discovery_notify: tokio::sync::Notify,
+    /// The object as a `download_objects` listing reported it, for a child download.
+    listed: Option<super::ListedObject>,
 }
 
 /// Download-specific work data.
 #[derive(Debug)]
-pub(crate) enum DownloadWork {
+pub(super) enum DownloadWork {
+    /// Resolves object metadata, range geometry and the validation plan.
     Discovery,
+    /// Collects one range, then publishes its bytes and accepted checksum evidence.
     GetObjectRange {
+        /// Inclusive source-object bounds of this request.
         range: std::ops::RangeInclusive<u64>,
+        /// Claimed delivery slot; taken once when execution starts.
         slot: Option<BodySlot>,
+        /// `If-Match` condition pinning the request to the discovered version, when available.
         etag: Option<Arc<str>>,
+        /// Additional checksum calculation required for this range.
+        digest_plan: RangeDigestPlan,
     },
     /// Memory-pressure relief: flush the resident filled run to disk, returning
     /// its carrier charges before the transfer waits for more memory. Handled in
@@ -111,10 +127,9 @@ impl DownloadWork {
 macro_rules! bail_if_terminal {
     ($self:expr) => {
         if !$self.inner.ctx.is_active() {
-            // Bailing before any drain: no occupancy freed on this path. The transfer is
-            // no longer active, so a completion this retirement claims is dropped rather
-            // than finalized: the cancellation's terminal path owns the destination (see
-            // `CompletionClaim`).
+            // No occupancy is freed before a drain. If decrementing the in-flight
+            // count claims completion, drop the claim: cancellation's terminal path
+            // owns the destination (see `CompletionClaim`).
             let _ = $self.decrement_in_flight(0, None);
             return WorkOutcome::Cancelled;
         }
@@ -127,6 +142,18 @@ impl DownloadTransfer {
         bucket_type: BucketType,
         input: DownloadInput,
         writer: BodyWriter,
+    ) -> Self {
+        Self::new_listed(ctx, bucket_type, input, writer, None)
+    }
+
+    /// [`Self::new`] for an object a listing reported as `listed`, which discovery
+    /// may use to skip HeadObject.
+    pub(crate) fn new_listed(
+        ctx: TransferContext,
+        bucket_type: BucketType,
+        input: DownloadInput,
+        writer: BodyWriter,
+        listed: Option<super::ListedObject>,
     ) -> Self {
         // Resolve the read-ahead knob (per-request override, else client default)
         // to a window in parts before `ctx` and `input` are moved into the struct.
@@ -155,6 +182,7 @@ impl DownloadTransfer {
             integrity_checks: std::sync::OnceLock::new(),
             expected_download_len: std::sync::OnceLock::new(),
             discovery_notify: tokio::sync::Notify::new(),
+            listed,
         });
         Self { inner }
     }
@@ -162,6 +190,11 @@ impl DownloadTransfer {
     /// Access the transfer context.
     pub(crate) fn ctx(&self) -> &TransferContext {
         &self.inner.ctx
+    }
+
+    /// The object as a `download_objects` listing reported it, for a child download.
+    pub(super) fn listed_object(&self) -> Option<&super::ListedObject> {
+        self.inner.listed.as_ref()
     }
 
     /// Starts one request measurement attributed to download request kind.
@@ -322,7 +355,7 @@ impl DownloadTransfer {
     /// - `PollWork::Done` - transfer complete
     ///
     /// This issues work and parks; it never completes a transfer. Each item it
-    /// issues is counted when issued, and the item that retires last with
+    /// issues is counted when issued, and the work item that finishes last with
     /// nothing left to issue claims completion and finalizes, as
     /// [`DownloadState`] describes.
     #[tracing::instrument(
@@ -365,7 +398,7 @@ impl DownloadTransfer {
                 part_size,
                 gate,
                 pending,
-                integrity: _,
+                integrity,
             } => {
                 // Resolve the slot to issue into this poll, if one is ready. Two gates
                 // compose in order: the per-transfer read-ahead window, then shared
@@ -465,9 +498,9 @@ impl DownloadTransfer {
                     );
                     return self.park(DownloadPendingReason::RangeCompletion, snapshot);
                 } else if *drains_in_flight > 0 {
-                    // Every range retired, but the memory-relief item is still in
+                    // Every range completed, but the memory-relief item is still in
                     // flight and may hold a claimed run that finalization cannot see.
-                    // It completes the transfer when it retires.
+                    // It completes the transfer when it finishes.
                     let snapshot = transferring_snapshot(
                         remaining.as_ref(),
                         *ranges_in_flight,
@@ -490,10 +523,8 @@ impl DownloadTransfer {
 
                 // A slot is ready. Commit the range it issues, sliced from the unchanged
                 // `remaining` (identical for a fresh claim or a resumed pending one).
-                // `part_size` is the stored part size for a validated multipart object
-                // (so each range aligns to a stored part boundary and S3 returns the
-                // part's checksum for the SDK to validate), else the configured download
-                // part size. Set at discovery.
+                // Automatic COMPOSITE validation uses the stored first-part size;
+                // other plans use the configured download part size. Discovery resolves it.
                 let part_size = *part_size;
                 let range = remaining
                     .as_ref()
@@ -511,7 +542,7 @@ impl DownloadTransfer {
                     all_ranges_issued = false;
                 } else {
                     // The final range was just issued: issuance is done and the transfer
-                    // drains its in-flight tail, completed by the item that retires last.
+                    // drains its in-flight tail, completed by the work item that finishes last.
                     // Logged once per transfer.
                     *remaining = None;
                     all_ranges_issued = true;
@@ -549,6 +580,7 @@ impl DownloadTransfer {
                         range: chunk_range,
                         slot: Some(slot),
                         etag: etag.clone(),
+                        digest_plan: integrity.range_digest_plan(),
                     })),
                 })
             }
@@ -721,11 +753,17 @@ impl DownloadTransfer {
         tracing::Span::current().record("work", data.kind());
         match data {
             DownloadWork::Discovery => self.execute_discovery().await,
-            DownloadWork::GetObjectRange { range, slot, etag } => {
+            DownloadWork::GetObjectRange {
+                range,
+                slot,
+                etag,
+                digest_plan,
+            } => {
                 self.execute_get_range(
                     range.clone(),
                     slot.take().expect("slot already consumed"),
                     etag.clone(),
+                    *digest_plan,
                 )
                 .await
             }
@@ -741,7 +779,7 @@ impl DownloadTransfer {
     /// issued it, and is uncounted here, under the state lock, once it has
     /// written every run it claimed. Success therefore cannot be claimed while
     /// the item is queued or a claimed run is still being written, and whichever
-    /// item retires last, the final range or the relief item, claims the
+    /// work item finishes last, the final range or the relief item, claims the
     /// terminal transition exactly once. A relief item that finds the transfer
     /// no longer active writes nothing: its count goes with the `Transferring`
     /// state, and the terminal drain owns any resident run. A failed write
@@ -808,11 +846,6 @@ impl DownloadTransfer {
     async fn execute_discovery(&self) -> WorkOutcome {
         let input = self.inner.request.as_ref();
 
-        // Resolve the effective validation state the same way the SDK's GetObject
-        // mutator does: enabled if the request set ChecksumMode=Enabled, or the
-        // request left it unset and the client's ResponseChecksumValidation is not
-        // WhenRequired (WhenSupported, the default, and unknown values enable it).
-        // Computed before discovery because it drives range alignment.
         let validation_enabled = self.validation_enabled(input);
 
         let discovery = match discover_obj(self, input, validation_enabled).await {
@@ -830,22 +863,32 @@ impl DownloadTransfer {
             initial_chunk,
             chunk_meta,
             effective_part_size,
+            validation_plan,
         } = discovery;
 
         // Store object_meta for object_meta() and join(), without checksum values
-        // that describe a part. The local `object_meta` keeps the discovery
-        // response unchanged.
+        // that don't describe the object's bytes: a composite value, and a value
+        // from a response for part of the object. Whole-object checksum-mode HEAD
+        // metadata keeps its other values. The local `object_meta` keeps the
+        // discovery response unchanged.
         let _ = self
             .inner
             .object_meta
             .set(process_object_metadata(object_meta.clone()));
 
-        // Object checksum is known only when the whole object arrived in this
-        // chunk. A larger multipart object's discovery chunk carries part 1's
-        // checksum, which is not the object checksum.
-        let whole_object_in_chunk = input.range.is_none() && remaining.is_none();
-        let mut integrity = Box::<ChecksumTally>::default();
-        integrity.record_discovery(chunk_meta.as_ref(), whole_object_in_chunk);
+        // HEAD reports object values even when later GETs carry only part metadata.
+        // GET-first discovery reports object values only for a whole-object response.
+        let object_checksum_metadata =
+            if input.range.is_none() && (validation_enabled || remaining.is_none()) {
+                Some(object_meta.clone())
+            } else {
+                None
+            };
+        let integrity = Box::new(DownloadIntegrity::new(
+            validation_plan,
+            object_checksum_metadata,
+        ));
+        let digest_plan = integrity.range_digest_plan();
 
         // Notify waiters that discovery completed
         self.inner.discovery_notify.notify_waiters();
@@ -945,7 +988,7 @@ impl DownloadTransfer {
             };
             let snapshot = self.snapshot(&work);
             // With no chunk and nothing remaining, discovery is the last work item to
-            // retire, so it claims completion under the lock that publishes the state.
+            // finish, so it claims completion under the lock that publishes the state.
             // A transfer that is no longer active is not completed.
             let completion = if self.inner.ctx.is_active() {
                 work.try_claim_completion()
@@ -980,8 +1023,15 @@ impl DownloadTransfer {
         // If discovery returned an initial chunk, process it
         match initial_work {
             Some((initial, request, chunk_meta, slot)) => {
-                self.execute_read_discovery_body(initial, request, slot, chunk_meta, etag)
-                    .await
+                self.execute_read_discovery_body(
+                    initial,
+                    request,
+                    slot,
+                    chunk_meta,
+                    etag,
+                    digest_plan,
+                )
+                .await
             }
             None => WorkOutcome::Success { data: None },
         }
@@ -994,6 +1044,7 @@ impl DownloadTransfer {
         slot: BodySlot,
         chunk_meta: ChunkMetadata,
         etag: Option<Arc<str>>,
+        digest_plan: RangeDigestPlan,
     ) -> WorkOutcome {
         let InitialChunk {
             body,
@@ -1086,7 +1137,7 @@ impl DownloadTransfer {
                     || ctx.is_active(),
                 )
                 .await
-                .map(|bytes| (bytes, checksum))
+                .map(|segmented| (segmented, checksum))
                 .map_err(crate::retry::GuardError::Inner)
             }
         })
@@ -1098,10 +1149,10 @@ impl DownloadTransfer {
         .await;
         let _ = req_metrics.finish();
 
-        let (bytes, checksum) = match result {
+        let (segmented, checksum) = match result {
             Ok(val) => val,
-            // Go terminal without retiring this chunk: fail() sets Terminal under
-            // the lock, so no later retirement can claim completion over this
+            // Go terminal without completing this range work: fail() sets Terminal under
+            // the lock, so no later work completion can claim completion over this
             // error. The in-flight count is abandoned with the Transferring state.
             Err(e) => {
                 let guard = self.inner.state.lock().unwrap();
@@ -1109,14 +1160,25 @@ impl DownloadTransfer {
             }
         };
 
+        // Collection may finish after cancellation; stop before hashing or publication.
+        bail_if_terminal!(self);
         let offset = reissue_range
             .as_ref()
             .map(|range| *range.start())
             .unwrap_or(0);
+        // Only the successful attempt supplies evidence. Hash frozen delivery bytes
+        // before publishing them, outside both the retry loop and the state lock.
+        let completed =
+            match RangeCompletion::capture(offset, &segmented, checksum.try_outcome(), digest_plan)
+            {
+                Ok(completed) => completed,
+                Err(error) => return self.fail_range(ChunkRef::new(seq, None), error),
+            };
+        let bytes_received = completed.range.end - completed.range.start;
         let chunk = ChunkOutput {
             seq,
             offset,
-            data: bytes,
+            data: segmented,
             metadata: chunk_meta,
         };
 
@@ -1140,14 +1202,11 @@ impl DownloadTransfer {
             }
         }
 
-        let bytes_received =
-            u64::try_from(expected_len).expect("validated discovery length originated from u64");
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_rx: bytes_received,
             ..Default::default()
         });
-        let completed = Some((offset, bytes_received, checksum.try_outcome()));
-        if let Some(claim) = self.decrement_in_flight(freed, completed) {
+        if let Some(claim) = self.decrement_in_flight(freed, Some(completed)) {
             return self.finalize_completion(claim);
         }
 
@@ -1159,6 +1218,7 @@ impl DownloadTransfer {
         range: std::ops::RangeInclusive<u64>,
         slot: BodySlot,
         etag: Option<Arc<str>>,
+        digest_plan: RangeDigestPlan,
     ) -> WorkOutcome {
         let seq = slot.seq();
         let input = self.inner.request.as_ref();
@@ -1192,6 +1252,11 @@ impl DownloadTransfer {
         // the retry loop.
         let mut req_metrics = self.start_request(DownloadRequestKind::Range);
         let retry_classify = crate::retry::classify_body_retry;
+        let object_len = self
+            .inner
+            .object_meta
+            .get()
+            .map(ObjectMetadata::total_object_size);
         let result =
             crate::retry::retry(req_metrics.metrics_mut(), retry_classify, |allow_hedge| {
                 let rh = range_header.clone();
@@ -1218,13 +1283,21 @@ impl DownloadTransfer {
                     let resp = recv_latencies
                         .guarded(allow_hedge, async move {
                             let resp = req.send().await.map_err(error::service_error)?;
-                            validate_content_range(&rh_validate, resp.content_range())?;
+                            validate_content_range(
+                                &rh_validate,
+                                resp.content_range(),
+                                resp.content_length(),
+                                object_len,
+                            )
+                            .map_err(|message| {
+                                error::invalid_service_response("GetObject", &resp, message)
+                            })?;
                             Ok::<_, crate::error::Error>(resp)
                         })
                         .await?;
                     // Untimed: drain the body. Errors here are inner (retryable IO).
                     let chunk_meta = crate::sdk_v1::chunk_metadata_from_get_object(&resp);
-                    let bytes = collect_response_body(
+                    let segmented = collect_response_body(
                         &ctx.handle.buffer_pool,
                         resp.body,
                         &checksum,
@@ -1235,7 +1308,7 @@ impl DownloadTransfer {
                     .await
                     .map_err(crate::retry::GuardError::Inner)?;
                     Ok::<_, crate::retry::GuardError<crate::error::Error>>((
-                        chunk_meta, bytes, checksum,
+                        chunk_meta, segmented, checksum,
                     ))
                 }
             })
@@ -1247,18 +1320,31 @@ impl DownloadTransfer {
             .await;
         let _ = req_metrics.finish();
 
-        let (chunk_meta, bytes, checksum) = match result {
+        let (chunk_meta, segmented, checksum) = match result {
             Ok(val) => val,
             Err(e) => {
                 return self.fail_range(ChunkRef::new(seq, Some(*range.start()..=*range.end())), e)
             }
         };
 
+        // Collection may finish after cancellation; stop before hashing or publication.
         bail_if_terminal!(self);
+        // Capture the immutable bytes that will be published, not response frames
+        // or failed retry attempts. The delivery cursor remains unchanged.
+        let completed = match RangeCompletion::capture(
+            *range.start(),
+            &segmented,
+            checksum.try_outcome(),
+            digest_plan,
+        ) {
+            Ok(completed) => completed,
+            Err(error) => return self.fail_range(ChunkRef::new(seq, Some(range.clone())), error),
+        };
+        let bytes_received = completed.range.end - completed.range.start;
         let chunk = ChunkOutput {
             seq,
             offset: *range.start(),
-            data: bytes,
+            data: segmented,
             metadata: chunk_meta,
         };
 
@@ -1284,14 +1370,11 @@ impl DownloadTransfer {
             }
         }
 
-        let bytes_received =
-            u64::try_from(expected_len).expect("validated range length originated from u64");
         self.inner.ctx.record_io(&crate::metrics::IoSample {
             network_rx: bytes_received,
             ..Default::default()
         });
-        let completed = Some((*range.start(), bytes_received, checksum.try_outcome()));
-        if let Some(claim) = self.decrement_in_flight(freed, completed) {
+        if let Some(claim) = self.decrement_in_flight(freed, Some(completed)) {
             return self.finalize_completion(claim);
         }
 
@@ -1308,23 +1391,23 @@ impl DownloadTransfer {
     /// Fail a range request with an error, tagging the chunk it belongs to.
     fn fail_range(&self, location: ChunkRef, e: Error) -> WorkOutcome {
         // Go terminal before any wake (see the discovery-body error path). Do not
-        // decrement_in_flight first: as the last item to retire it would claim
+        // decrement_in_flight first: as the last work item to finish it would claim
         // completion and finalize over this error.
         let guard = self.inner.state.lock().unwrap();
         self.fail(guard, e.with_chunk(location))
     }
 
-    /// Retire one in-flight range: record the checksum outcome of a range that
-    /// `completed`, drop `ranges_in_flight` and release `freed` parts of read-ahead
-    /// occupancy, then claim completion if no range remains and no range or
-    /// memory-relief item is still in flight. All of it happens under the state lock,
-    /// so completion is claimed exactly once, and the claim carries the outcome of
-    /// every range that retired before it; the caller that receives the claim
-    /// finalizes the transfer.
+    /// Completes one in-flight range work item and releases its read-ahead occupancy.
     ///
-    /// `completed` is the offset, length and checksum outcome of the bytes a
-    /// successful range delivered, and `None` for a range retired without
-    /// delivering, on cancellation.
+    /// Under the state lock, records `completed` evidence, decrements the range
+    /// count and releases `freed` parts. Claims completion exactly once when no
+    /// range remains and no range or memory-relief work is still in flight.
+    /// The claim carries every successfully completed range's evidence; its owner
+    /// verifies integrity and finalizes the destination outside the lock.
+    ///
+    /// `completed` describes bytes successfully published and written where required.
+    /// Cancelled work supplies `None`; failed work must fail the transfer before
+    /// decrementing the in-flight count so it cannot claim completion over an error.
     ///
     /// Releasing the occupancy under the same lock `poll_work` reads the gate and arms
     /// `set_pending` under is what orders this completion's release against the issuer's
@@ -1333,7 +1416,7 @@ impl DownloadTransfer {
     fn decrement_in_flight(
         &self,
         freed: u64,
-        completed: Option<(u64, u64, Option<ChecksumOutcome>)>,
+        completed: Option<RangeCompletion>,
     ) -> Option<CompletionClaim> {
         let (completion, snapshot) = {
             let mut work = self.inner.state.lock().unwrap();
@@ -1346,8 +1429,8 @@ impl DownloadTransfer {
                     integrity,
                     ..
                 } => {
-                    if let Some((offset, len, outcome)) = completed {
-                        integrity.record(offset, len, outcome);
+                    if let Some(completed) = completed {
+                        integrity.record(completed);
                     }
                     *ranges_in_flight = ranges_in_flight.saturating_sub(1);
                     gate.release(freed);
@@ -1379,15 +1462,20 @@ impl DownloadTransfer {
         completion
     }
 
-    /// Finalize a transfer whose successful completion `claim` proves: flush the tail to
-    /// disk (returning the last carrier charges as `ChunkOutput`s drop), establish the
-    /// destination length, set the terminal status, and signal waiters. A finalization
-    /// error fails the transfer with `ErrorKind::IOError` instead.
+    /// Verifies accepted checksum evidence, flushes the destination tail, establishes
+    /// its length and publishes successful completion in that order.
     ///
-    /// The state is already `Terminal`, entered when the claim was taken; this runs after
-    /// the state lock is released so disk IO never happens under it. Symmetric with
-    /// `fail`, which error paths call from `execute`.
+    /// Integrity or coverage failure skips destination finalization and publishes no
+    /// verdict. Destination failure reports `ErrorKind::IOError`. The state is already
+    /// `Terminal`; verification and disk IO run after releasing the state lock.
     fn finalize_completion(&self, claim: CompletionClaim) -> WorkOutcome {
+        let integrity_checks = match claim.finish_integrity() {
+            Ok(checks) => checks,
+            Err(error) => {
+                let guard = self.inner.state.lock().unwrap();
+                return self.fail(guard, error);
+            }
+        };
         let expected_len = *self
             .inner
             .expected_download_len
@@ -1400,8 +1488,6 @@ impl DownloadTransfer {
             let guard = self.inner.state.lock().unwrap();
             return self.fail(guard, error::Error::new(error::ErrorKind::IOError, e));
         }
-        let validation_enabled = self.validation_enabled(&self.inner.request);
-        let integrity_checks = claim.checksum_tally().integrity_checks(validation_enabled);
         let _ = self.inner.integrity_checks.set(integrity_checks);
         let state_snapshot = {
             let state = self.inner.state.lock().expect("lock poisoned");
@@ -1442,7 +1528,7 @@ impl DownloadTransfer {
             // runs from a work item that is still counted, from discovery
             // before `Transferring`, from `poll_work` while the transfer is
             // active, or from `finalize_completion` before `set_completed`, and
-            // completion requires every counted item to have retired. Release
+            // completion requires every counted item to have finished. Release
             // builds log instead, since a panic would change nothing there:
             // success was already reported, and the scheduler contains panics.
             debug_assert!(
@@ -1717,26 +1803,37 @@ fn parse_byte_range(s: &str) -> Option<(u64, u64)> {
     (start <= end).then_some((start, end))
 }
 
-/// Validate that the response Content-Range matches the requested range.
+/// Validate that a range response delivered the requested range.
 ///
-/// Both the requested range and the response are parsed to numeric `(start, end)` and
-/// compared for equality. Returns `Err` when either side is absent or unparseable, or
-/// when the parsed ranges differ.
+/// Both the requested range and the response's Content-Range are parsed to numeric
+/// `(start, end)` and compared for equality. A response without Content-Range is
+/// accepted only when the request covers the whole `object_len`-byte object and the
+/// response's Content-Length is `object_len`, as from a server that ignores Range
+/// and returns the complete object with `200 OK`. Those bytes are exactly the
+/// requested range. Returns the mismatch description otherwise.
 fn validate_content_range(
     requested_range: &str,
     response_content_range: Option<&str>,
-) -> Result<(), Error> {
+    response_content_length: Option<i64>,
+    object_len: Option<u64>,
+) -> Result<(), String> {
     let requested = parse_byte_range(requested_range);
     let response = response_content_range.and_then(parse_byte_range);
 
+    let whole_object = |len: u64| len.checked_sub(1).map(|end| (0, end));
     match (requested, response) {
         (Some(req), Some(resp)) if req == resp => Ok(()),
-        _ => Err(error::Error::new(
-            error::ErrorKind::RuntimeError,
-            format!(
-                "content range mismatch: requested {}, response {:?}",
-                requested_range, response_content_range
-            ),
+        (Some(req), None)
+            if response_content_range.is_none()
+                && object_len.and_then(whole_object) == Some(req)
+                && response_content_length.and_then(|len| u64::try_from(len).ok())
+                    == object_len =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "content range mismatch: requested {}, response {:?}",
+            requested_range, response_content_range
         )),
     }
 }
@@ -1782,8 +1879,9 @@ mod tests {
     use crate::model::ChecksumType;
     use crate::operation::download::sink::FileSinkFactory;
     use crate::operation::download::test_util::fixtures::{
-        assert_discovery_succeeds, crc32_object_client, disk_test_handle, disk_transfer, execute,
-        finalize_started, object_client_failing_at, relief_scenario, spawn_relief,
+        assert_discovery_succeeds, assert_first_range_succeeds, crc32_object_client,
+        disk_test_handle, disk_transfer, execute, finalize_started, head_rule,
+        object_client_failing_at, relief_scenario, spawn_relief,
     };
     use crate::operation::download::DownloadInput;
     use crate::scheduler::test_util::{assert_done, assert_pending, assert_ready};
@@ -2218,17 +2316,19 @@ mod tests {
                 .body(ByteStream::from(chunk.clone()))
                 .build()
         });
-        create_download_with_client_and_detail(
+        create_get_first_download_with_client_and_detail(
             mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]),
             part_size,
             detail,
+            Some(object_size),
         )
     }
 
-    fn create_download_with_client_and_detail(
+    fn create_get_first_download_with_client_and_detail(
         client: aws_sdk_s3::Client,
         part_size: u64,
         detail: u64,
+        object_size: Option<u64>,
     ) -> DownloadTransfer {
         let config = crate::Config::builder()
             .sdk_client(client)
@@ -2242,6 +2342,7 @@ mod tests {
         let input = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
+            .set_range(object_size.map(|len| format!("bytes=0-{}", len - 1)))
             .build()
             .unwrap();
 
@@ -2249,6 +2350,45 @@ mod tests {
         let (ctx, _completion_rx) = TransferContext::new(handle);
 
         DownloadTransfer::new(ctx, BucketType::Standard, input, writer)
+    }
+
+    /// Request mode overrides client policy; an unset mode follows the client default.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn validation_enabled_resolves_request_and_client_settings() {
+        use aws_sdk_s3::config::ResponseChecksumValidation::{WhenRequired, WhenSupported};
+
+        for (client_setting, unset_enabled) in [
+            (None, true),
+            (Some(WhenSupported), true),
+            (Some(WhenRequired), false),
+        ] {
+            let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[head_rule(0)], |conf| {
+                match client_setting {
+                    Some(setting) => conf.response_checksum_validation(setting),
+                    None => conf,
+                }
+            });
+            let transfer =
+                create_get_first_download_with_client_and_detail(client, 8 * MB, 0, None);
+            for (request_mode, expected) in [
+                (None, unset_enabled),
+                (Some(crate::model::ChecksumMode::Enabled), true),
+            ] {
+                let input = DownloadInput::builder()
+                    .bucket("test-bucket")
+                    .key("test-key")
+                    .set_checksum_mode(request_mode)
+                    .build()
+                    .unwrap();
+                assert_eq!(
+                    transfer.validation_enabled(&input),
+                    expected,
+                    "client={client_setting:?}, request={:?}",
+                    input.checksum_mode,
+                );
+            }
+        }
     }
 
     // FIXME: crossbeam-epoch is incompatible with miri (https://github.com/crossbeam-rs/crossbeam/issues/1181)
@@ -2343,8 +2483,17 @@ mod tests {
         let part = mock!(aws_sdk_s3::Client::get_object)
             .match_requests(|request| request.part_number() == Some(1))
             .then_output(|| GetObjectOutput::builder().content_length(0).build());
-        let client = mock_client!(aws_sdk_s3, &[&ranged, &part]);
-        let transfer = create_download_with_client_and_detail(client, part_size, 1);
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::Sequential,
+            &[&ranged, &part],
+            |conf| {
+                conf.response_checksum_validation(
+                    aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+                )
+            }
+        );
+        let transfer = create_get_first_download_with_client_and_detail(client, part_size, 1, None);
 
         assert_discovery_succeeds(&transfer).await;
         assert_done(transfer.poll_work());
@@ -2366,7 +2515,7 @@ mod tests {
     }
 
     /// A zero-byte object has no ranges, so discovery is the last work item to
-    /// retire: its `execute` claims completion and finalizes the destination,
+    /// finish: its `execute` claims completion and finalizes the destination,
     /// and the next poll finds the transfer done.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -2376,16 +2525,7 @@ mod tests {
         };
 
         let part_size = 8 * MB;
-        let expected_range = format!("bytes=0-{}", part_size - 1);
-        let ranged = mock!(aws_sdk_s3::Client::get_object)
-            .match_requests(move |request| request.range() == Some(expected_range.as_str()))
-            .then_error(|| {
-                GetObjectError::generic(ErrorMetadata::builder().code("InvalidRange").build())
-            });
-        let part = mock!(aws_sdk_s3::Client::get_object)
-            .match_requests(|request| request.part_number() == Some(1))
-            .then_output(|| GetObjectOutput::builder().content_length(0).build());
-        let client = mock_client!(aws_sdk_s3, &[&ranged, &part]);
+        let client = mock_client!(aws_sdk_s3, &[head_rule(0)]);
         let script = Arc::new(WriteScript::default());
         let (transfer, _consumer, _dir) = disk_transfer(
             disk_test_handle(client, part_size),
@@ -2698,7 +2838,8 @@ mod tests {
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj], |conf| {
             conf.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
         });
-        let transfer = create_download_with_client_and_detail(client, part_size, 1);
+        let transfer =
+            create_get_first_download_with_client_and_detail(client, part_size, 1, Some(part_size));
 
         assert_discovery_succeeds(&transfer).await;
 
@@ -2771,6 +2912,23 @@ mod tests {
             use aws_smithy_runtime_api::client::http::HttpConnectorFuture;
             use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 
+            if request.method() == "HEAD" {
+                let mut response = HttpResponse::new(
+                    200.try_into().unwrap(),
+                    aws_smithy_types::body::SdkBody::empty(),
+                );
+                response
+                    .headers_mut()
+                    .insert("content-length", self.object_size.to_string());
+                response.headers_mut().insert("etag", "\"abc-2\"");
+                response
+                    .headers_mut()
+                    .insert("x-amz-checksum-crc32", "AAAAAA==-2");
+                response
+                    .headers_mut()
+                    .insert("x-amz-checksum-type", "COMPOSITE");
+                return HttpConnectorFuture::ready(Ok(response));
+            }
             let is_part_request = request.uri().contains("partNumber=1");
             let (start, end) = if is_part_request {
                 (0, self.stored_part_size - 1)
@@ -2806,12 +2964,10 @@ mod tests {
         }
     }
 
-    /// The multipart realignment re-issue belongs to the `partNumber=1`
-    /// discovery request. The superseded ranged discovery must not accrue the
-    /// re-issue's latency while its unread body is held.
+    /// The layout GET accrues its own latency independently of the completed HEAD.
     #[cfg_attr(miri, ignore)]
     #[tokio::test(start_paused = true)]
-    async fn discovery_realign_reissue_is_excluded_from_first_discovery_elapsed() {
+    async fn layout_get_latency_is_excluded_from_head_discovery_elapsed() {
         let stored_part_size = 8 * MB;
         let part_delay = std::time::Duration::from_secs(10);
         let connector = aws_smithy_runtime_api::client::http::SharedHttpConnector::new(
@@ -2830,8 +2986,7 @@ mod tests {
                 .with_test_defaults()
                 .build(),
         );
-        // No explicit part size: discovery issues the Auto-sized ranged GET,
-        // then realigns to the stored part size via partNumber=1.
+        // Automatic sizing uses the stored first part after checksum-mode HEAD.
         let config = crate::Config::builder()
             .sdk_client(client)
             .diagnostics_for_test(crate::config::MemoryDiagnosticsConfig::default(), 1)
@@ -2858,18 +3013,18 @@ mod tests {
         let summary = transfer
             .test_terminal_summary()
             .expect("summary diagnostics enabled");
-        assert_eq!(summary.requests.discovery_range.requests, 1);
+        assert_eq!(summary.requests.discovery_head.requests, 1);
         assert_eq!(summary.requests.discovery_part.requests, 1);
         assert_eq!(summary.requests.range.requests, 1);
         assert!(
             summary.requests.discovery_part.elapsed >= part_delay,
-            "the delayed re-issue accrues to its own request: {:?}",
+            "the delayed layout GET accrues to its own request: {:?}",
             summary.requests.discovery_part.elapsed,
         );
         assert!(
-            summary.requests.discovery_range.elapsed < part_delay / 10,
-            "superseded discovery elapsed {:?} includes the {part_delay:?} re-issue",
-            summary.requests.discovery_range.elapsed,
+            summary.requests.discovery_head.elapsed < part_delay / 10,
+            "HEAD discovery elapsed {:?} includes the {part_delay:?} re-issue",
+            summary.requests.discovery_head.elapsed,
         );
     }
 
@@ -2934,6 +3089,7 @@ mod tests {
         let input = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
+            .range(format!("bytes=0-{}", object_size - 1))
             .build()
             .unwrap();
 
@@ -3315,6 +3471,7 @@ mod tests {
         let input = DownloadInput::builder()
             .bucket("test-bucket")
             .key("test-key")
+            .range(format!("bytes=0-{}", object_size - 1))
             .build()
             .unwrap();
 
@@ -3383,7 +3540,7 @@ mod tests {
         let (transfer, _consumer, dir) = disk_transfer(handle, &FileSinkFactory);
         let path = dir.path().join("out");
 
-        assert_discovery_succeeds(&transfer).await;
+        assert_first_range_succeeds(&transfer).await;
         let mut second = assert_ready(transfer.poll_work());
         execute(&transfer, &mut second).await;
         let metrics = transfer.ctx().metrics();
@@ -3499,7 +3656,7 @@ mod tests {
         let (transfer, _consumer, _dir) =
             disk_transfer(handle, &ScriptedSinkFactory(Arc::clone(&script)));
 
-        assert_discovery_succeeds(&transfer).await;
+        assert_first_range_succeeds(&transfer).await;
         let writer = transfer.writer().clone();
         let untracked = std::thread::spawn(move || writer.drain(DrainMode::Eager));
         let held = script.wait_held(TIMEOUT);
@@ -3549,7 +3706,7 @@ mod tests {
         let (transfer, _consumer, dir) =
             disk_transfer(disk_test_handle(client, part_size), &FileSinkFactory);
 
-        assert_discovery_succeeds(&transfer).await;
+        assert_first_range_succeeds(&transfer).await;
         let mut failing = assert_ready(transfer.poll_work());
         let mut behind = assert_ready(transfer.poll_work());
         execute(&transfer, &mut behind).await;
@@ -3567,6 +3724,152 @@ mod tests {
             std::fs::read(dir.path().join("out")).unwrap(),
             &object[..part_size as usize]
         );
+    }
+
+    /// Accepted range evidence must hash the published bytes, independently of
+    /// the SDK's per-response verdict. A later range supplies the remaining
+    /// coverage so missing or incorrect evidence from the worker fails finish.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn accepted_range_supplies_frozen_crc_evidence() {
+        use crate::operation::download::test_util::fixtures::object_bytes;
+
+        let part_size = 5 * MB;
+        let object = object_bytes(2 * part_size as usize);
+        let (transfer, _consumer, dir) = disk_transfer(
+            disk_test_handle(crc32_object_client(Arc::clone(&object), None), part_size),
+            &FileSinkFactory,
+        );
+        transfer.inner.writer.sync_drain_batch(1);
+        assert_first_range_succeeds(&transfer).await;
+        let mut integrity = {
+            let mut state = transfer.inner.state.lock().unwrap();
+            let DownloadState::Transferring { integrity, .. } =
+                std::mem::replace(&mut *state, DownloadState::Terminal)
+            else {
+                panic!("first range must leave the second range outstanding");
+            };
+            integrity
+        };
+        let remaining = SegmentedBytes::from(Bytes::copy_from_slice(&object[part_size as usize..]));
+        integrity.record(
+            RangeCompletion::capture(part_size, &remaining, None, integrity.range_digest_plan())
+                .unwrap(),
+        );
+        assert_eq!(
+            integrity.finish().unwrap().checksum_validation(),
+            &crate::types::ChecksumValidation::Validated {
+                algorithm: crate::types::ChecksumAlgorithm::Crc32,
+            },
+        );
+        assert!(std::fs::read(dir.path().join("out")).unwrap() == object[..part_size as usize]);
+    }
+
+    /// SDK-valid ranges cannot bypass a failed stored-object CRC. Verification
+    /// must precede the destination's scripted finalize failure and publish no verdict.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn whole_object_mismatch_precedes_destination_finalization() {
+        use crate::operation::download::test_util::fixtures::{
+            crc32_object_client_with_stored_checksum, object_bytes,
+        };
+        use crate::operation::download::test_util::sink::{
+            Action, Event, Match, Op, ScriptedSinkFactory, WriteScript,
+        };
+
+        let part_size = 5 * MB;
+        let object = object_bytes(part_size as usize + 37);
+        let expected = aws_smithy_types::base64::encode(0u32.to_be_bytes());
+        let mut crc = aws_smithy_checksums::ChecksumAlgorithm::Crc32.into_impl();
+        crc.update(&object);
+        let computed = aws_smithy_types::base64::encode(crc.finalize());
+        assert_ne!(expected, computed, "the stored checksum must mismatch");
+        let script = Arc::new(WriteScript::default()).on(
+            Match::Finalize,
+            Action::Fail(std::io::ErrorKind::StorageFull),
+        );
+        let (transfer, _consumer, _dir) = disk_transfer(
+            disk_test_handle(
+                crc32_object_client_with_stored_checksum(object, None, expected.clone()),
+                part_size,
+            ),
+            &ScriptedSinkFactory(Arc::clone(&script)),
+        );
+        assert_first_range_succeeds(&transfer).await;
+        let mut last = assert_ready(transfer.poll_work());
+        assert!(matches!(
+            execute(&transfer, &mut last).await,
+            WorkOutcome::Failed { .. }
+        ));
+        let error = transfer
+            .ctx()
+            .take_error()
+            .expect("failed transfer records its error");
+        let error::ErrorKind::IntegrityError(detail) = error.kind() else {
+            panic!("whole-object mismatch must win over destination failure: {error:?}");
+        };
+        assert_eq!(
+            detail.algorithm(),
+            Some(&crate::types::ChecksumAlgorithm::Crc32)
+        );
+        assert_eq!(detail.expected(), Some(expected.as_str()));
+        assert_eq!(detail.computed(), Some(computed.as_str()));
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Failed
+        );
+        assert!(transfer.integrity_checks().is_none());
+        assert!(!script
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::Started(Op::Finalize { .. }))));
+        assert_done(transfer.poll_work());
+    }
+
+    /// Losing one range's calculated evidence is a terminal coverage error,
+    /// even though the SDK validated every response. It must not finalize the file.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn missing_whole_object_evidence_prevents_destination_finalization() {
+        use crate::operation::download::test_util::fixtures::object_bytes;
+        use crate::operation::download::test_util::sink::{
+            Event, Op, ScriptedSinkFactory, WriteScript,
+        };
+
+        let part_size = 5 * MB;
+        let script = Arc::new(WriteScript::default());
+        let (transfer, _consumer, _dir) = disk_transfer(
+            disk_test_handle(
+                crc32_object_client(object_bytes(part_size as usize + 37), None),
+                part_size,
+            ),
+            &ScriptedSinkFactory(Arc::clone(&script)),
+        );
+        assert_first_range_succeeds(&transfer).await;
+        let mut last = assert_ready(transfer.poll_work());
+        let DownloadWork::GetObjectRange { digest_plan, .. } = last.data_mut::<DownloadWork>()
+        else {
+            panic!("last work item must be the second range");
+        };
+        *digest_plan = RangeDigestPlan::None;
+        assert!(matches!(
+            execute(&transfer, &mut last).await,
+            WorkOutcome::Failed { .. }
+        ));
+        assert_eq!(
+            transfer.ctx().take_error().unwrap().kind(),
+            &error::ErrorKind::RuntimeError
+        );
+        assert_eq!(
+            transfer.ctx().transfer_status(),
+            crate::types::TransferStatus::Failed
+        );
+        assert!(transfer.integrity_checks().is_none());
+        assert!(!script
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::Started(Op::Finalize { .. }))));
+        assert_done(transfer.poll_work());
     }
 
     /// Runs a three-part disk download over `crc32_object_client` whose part
@@ -3593,7 +3896,7 @@ mod tests {
             &FileSinkFactory,
         );
 
-        assert_discovery_succeeds(&transfer).await;
+        assert_first_range_succeeds(&transfer).await;
         let mut second = assert_ready(transfer.poll_work());
         let mut third = assert_ready(transfer.poll_work());
         let outcome = execute(&transfer, &mut second).await;
@@ -3656,9 +3959,9 @@ mod tests {
         }
     }
 
-    /// The final range retiring while a memory-relief write is still landing does
+    /// The final range completing while a memory-relief write is still landing does
     /// not complete the transfer: finalization cannot see the run that write
-    /// claimed. The relief write completes the transfer when it retires, and the
+    /// claimed. The relief write completes the transfer when it finishes, and the
     /// destination then holds the whole object.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -3712,7 +4015,7 @@ mod tests {
         assert_done(transfer.poll_work());
     }
 
-    /// A memory-relief write that fails after every range has retired fails the
+    /// A memory-relief write that fails after every range has completed fails the
     /// transfer instead of being discarded behind a completion.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
@@ -3804,9 +4107,9 @@ mod tests {
         );
     }
 
-    /// The final range retiring while a relief item is queued does not complete
+    /// The final range completing while a relief item is queued does not complete
     /// the transfer, since the item has yet to claim and write the run it
-    /// relieves. The relief item completes the transfer when it retires.
+    /// relieves. The relief item completes the transfer when it finishes.
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn final_range_waits_for_a_queued_relief_item() {
@@ -3863,7 +4166,7 @@ mod tests {
     /// write occupies one slot, and keeps it off the held write's thread.
     /// Relief is issued one item at a time, so the held write is the only
     /// relief item, and the final range gets the second slot only once
-    /// discovery has retired. The held write's thread is then the only loaded
+    /// discovery has finished. The held write's thread is then the only loaded
     /// one, and routing, which picks the less loaded of two threads, picks
     /// another. With one detected partition, the final range instead waits
     /// for the held write to be released.
@@ -4040,7 +4343,7 @@ mod tests {
 
     /// A failure after the transfer completed panics in debug builds. The case
     /// is unreachable in practice, since completion is claimed only once every
-    /// counted work item has retired. The test reaches it by construction,
+    /// counted work item has finished. The test reaches it by construction,
     /// calling `fail` directly on a completed single-part download.
     #[cfg(debug_assertions)]
     #[cfg_attr(miri, ignore)]
@@ -4049,7 +4352,7 @@ mod tests {
     async fn failure_after_completion_panics_in_debug_builds() {
         // A single-part object: discovery receives it whole and completes.
         let transfer = create_download(8 * MB, 8 * MB);
-        assert_discovery_succeeds(&transfer).await;
+        assert_first_range_succeeds(&transfer).await;
         assert_eq!(
             transfer.ctx().transfer_status(),
             crate::types::TransferStatus::Completed
@@ -4068,7 +4371,7 @@ mod tests {
     /// In release builds, a failure after the transfer completed leaves it
     /// completed and is logged at error level with its cause. The case is
     /// unreachable in practice, since completion is claimed only once every
-    /// counted work item has retired. The test reaches it by construction,
+    /// counted work item has finished. The test reaches it by construction,
     /// calling `fail` directly on a completed single-part download.
     #[cfg(not(debug_assertions))]
     #[cfg_attr(miri, ignore)]
@@ -4078,7 +4381,7 @@ mod tests {
 
         // A single-part object: discovery receives it whole and completes.
         let transfer = create_download(8 * MB, 8 * MB);
-        assert_discovery_succeeds(&transfer).await;
+        assert_first_range_succeeds(&transfer).await;
         assert_eq!(
             transfer.ctx().transfer_status(),
             crate::types::TransferStatus::Completed
@@ -4207,7 +4510,11 @@ mod tests {
             .build()
             .expect("test pool");
         let config = crate::Config::builder()
-            .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+            .sdk_client(mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                &[head_rule(object_size), get_obj]
+            ))
             .part_size(crate::config::PartSize::Target(ByteSize::new(part_size)))
             .memory(crate::config::MemoryConfig::Explicit(pool.clone()))
             .build()
@@ -4292,7 +4599,11 @@ mod tests {
             .build()
             .expect("test pool");
         let config = crate::Config::builder()
-            .sdk_client(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj]))
+            .sdk_client(mock_client!(
+                aws_sdk_s3,
+                RuleMode::MatchAny,
+                &[head_rule(object_size), get_obj]
+            ))
             .part_size(crate::config::PartSize::Target(ByteSize::new(part_size)))
             .memory(crate::config::MemoryConfig::Explicit(pool.clone()))
             .build()
@@ -4309,7 +4620,7 @@ mod tests {
         // discovery fills seq 0, then (resident-1) range GETs fill seqs 1.. . Each fill's
         // in-execute Batched drain frees nothing (below batch), so all stay resident.
         async fn fill_resident(t: &DownloadTransfer, resident: u64) {
-            assert_discovery_succeeds(t).await; // seq 0 filled + reserved
+            assert_first_range_succeeds(t).await; // seq 0 filled + reserved
             for _ in 1..resident {
                 let mut w = assert_ready(t.poll_work());
                 execute(t, &mut w).await;
@@ -4401,7 +4712,7 @@ mod tests {
     #[tokio::test]
     async fn test_io_ctl_set_read_ahead_resizes_window() {
         let (transfer, _consumer) = create_download_for_gate(128 * MB, 8 * MB);
-        assert_discovery_succeeds(&transfer).await;
+        assert_first_range_succeeds(&transfer).await;
 
         // Parts(n) resolves to n + 1 (n speculative parts plus the demand part).
         transfer
@@ -4523,63 +4834,98 @@ mod tests {
                 }
             });
 
-            create_download_with_client_and_detail(
+            create_get_first_download_with_client_and_detail(
                 mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[get_obj], |conf| {
                     conf.retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
                 }),
                 part_size,
                 detail,
+                Some(object_size),
             )
         }
     }
 
     #[test]
     fn test_validate_content_range_success() {
-        assert!(validate_content_range("bytes=1024-2047", Some("bytes 1024-2047/4096")).is_ok());
-        assert!(validate_content_range("1024-2047", Some("bytes 1024-2047/4096")).is_ok());
+        assert!(validate_content_range(
+            "bytes=1024-2047",
+            Some("bytes 1024-2047/4096"),
+            None,
+            None
+        )
+        .is_ok());
+        assert!(
+            validate_content_range("1024-2047", Some("bytes 1024-2047/4096"), None, None).is_ok()
+        );
     }
 
     #[test]
     fn test_validate_content_range_mismatch() {
-        assert!(validate_content_range("bytes=1024-2047", Some("bytes 2048-3071/4096")).is_err());
+        assert!(validate_content_range(
+            "bytes=1024-2047",
+            Some("bytes 2048-3071/4096"),
+            None,
+            None
+        )
+        .is_err());
     }
 
     #[test]
     fn test_validate_content_range_missing() {
-        assert!(validate_content_range("bytes=1024-2047", None).is_err());
+        assert!(validate_content_range("bytes=1024-2047", None, None, None).is_err());
     }
 
     #[test]
     fn test_validate_content_range_substring_false_positive() {
         // The substring "0-9" appears in "bytes 10-99/100", but the ranges differ.
         // A naive `.contains()` match would wrongly pass this.
-        assert!(validate_content_range("bytes=0-9", Some("bytes 10-99/100")).is_err());
+        assert!(validate_content_range("bytes=0-9", Some("bytes 10-99/100"), None, None).is_err());
     }
 
     #[test]
     fn test_validate_content_range_exact_match_small_range() {
-        assert!(validate_content_range("bytes=0-9", Some("bytes 0-9/100")).is_ok());
+        assert!(validate_content_range("bytes=0-9", Some("bytes 0-9/100"), None, None).is_ok());
     }
 
     #[test]
     fn test_validate_content_range_unsized_total() {
         // RFC 7233 allows `bytes START-END/*` when the total is unknown.
-        assert!(validate_content_range("bytes=0-9", Some("bytes 0-9/*")).is_ok());
+        assert!(validate_content_range("bytes=0-9", Some("bytes 0-9/*"), None, None).is_ok());
     }
 
     #[test]
     fn test_validate_content_range_large_range_match() {
-        assert!(validate_content_range("bytes=100-199", Some("bytes 100-199/500")).is_ok());
+        assert!(
+            validate_content_range("bytes=100-199", Some("bytes 100-199/500"), None, None).is_ok()
+        );
     }
 
     #[test]
     fn test_validate_content_range_response_none() {
-        assert!(validate_content_range("bytes=0-9", None).is_err());
+        assert!(validate_content_range("bytes=0-9", None, None, None).is_err());
+    }
+
+    /// A server that ignores Range may answer a request for the whole object with the
+    /// complete object and no Content-Range. Only a whole-object request whose response
+    /// length is the object's length is accepted.
+    #[test]
+    fn test_validate_content_range_complete_response_without_content_range() {
+        assert!(validate_content_range("bytes=0-4", None, Some(5), Some(5)).is_ok());
+        // Part of the object, even if the response length matches the request.
+        assert!(validate_content_range("bytes=0-4", None, Some(5), Some(10)).is_err());
+        assert!(validate_content_range("bytes=5-9", None, Some(10), Some(10)).is_err());
+        // The whole object, but the response length is wrong or missing.
+        assert!(validate_content_range("bytes=0-4", None, Some(4), Some(5)).is_err());
+        assert!(validate_content_range("bytes=0-4", None, None, Some(5)).is_err());
+        // The object length is unknown.
+        assert!(validate_content_range("bytes=0-4", None, Some(5), None).is_err());
+        // A Content-Range that is present must still match.
+        assert!(validate_content_range("bytes=0-4", Some("bytes abc"), Some(5), Some(5)).is_err());
     }
 
     #[test]
     fn test_validate_content_range_garbage_response() {
-        assert!(validate_content_range("bytes=0-9", Some("bytes abc")).is_err());
+        assert!(validate_content_range("bytes=0-9", Some("bytes abc"), None, None).is_err());
     }
 
     #[test]

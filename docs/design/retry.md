@@ -117,8 +117,10 @@ place and makes each classifier a small, exhaustively-testable match. Three exis
   reset, truncation, SSP stall), and a throttle. A checksum mismatch (`IntegrityError`) is terminal —
   a corrupt body must never be re-fetched and masked.
 - **`classify_discovery_retry`** — the discovery send (GetObject / HeadObject / partNumber GET). No
-  body, no deadline. Retries a throttle and a transient transport; everything else, including
-  `InvalidRange` and `NotFound`, is terminal.
+  body, no deadline. Retries a throttle and a transient transport. Bodyless HeadObject
+  responses with status 429 or 503 use throttle backoff, since no error body is available
+  to supply a service code. Everything else, including `InvalidRange`, `NotFound` and
+  precondition failures, is terminal.
 - **`classify_upload_part_retry`** — the upload part-send. Retries a transient transport and a
   throttle; a modeled non-throttle service error is terminal. Uploads carry no deadline, so the
   `DeadlineExceeded` arm is unreachable but retained for exhaustiveness.

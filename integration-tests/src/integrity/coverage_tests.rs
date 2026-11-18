@@ -565,80 +565,10 @@ fn required_coverage_reports_removals() {
     );
 }
 
-/// The reason the cases full-object validation must make pass are ignored with.
-const NEEDS_FULL_OBJECT: &str = "not validated against the full-object checksum";
-
 /// The table cases that are ignored, and why: a shape or group, its algorithms (all if empty),
 /// its setup (all if `None`), and the ignore reason. Every ignored case must be listed, and every
 /// listed case ignored with the reason, so ignoring or un-ignoring a case is a reviewed edit here.
-const IGNORED: &[(&str, &[Alg], Option<&str>, &str)] = &[
-    (
-        "algorithm_tests::single_put_split",
-        FULL_OBJECT_CRCS,
-        None,
-        NEEDS_FULL_OBJECT,
-    ),
-    (
-        "algorithm_tests::full_object_mpu",
-        &[],
-        None,
-        NEEDS_FULL_OBJECT,
-    ),
-    (
-        "algorithm_tests::full_object_mpu_small",
-        &[],
-        None,
-        NEEDS_FULL_OBJECT,
-    ),
-    (
-        "algorithm_tests::client_sent_no_checksum",
-        &[],
-        None,
-        NEEDS_FULL_OBJECT,
-    ),
-    (
-        "algorithm_tests::express_full_object_misaligned",
-        &[],
-        None,
-        NEEDS_FULL_OBJECT,
-    ),
-    (
-        "download_tests::single_put_split",
-        &[],
-        Some("default"),
-        NEEDS_FULL_OBJECT,
-    ),
-    (
-        "download_tests::full_object_mpu",
-        &[],
-        Some("default"),
-        NEEDS_FULL_OBJECT,
-    ),
-    (
-        "download_tests::full_object_mpu",
-        &[],
-        Some("out_of_order"),
-        NEEDS_FULL_OBJECT,
-    ),
-    (
-        "download_tests::full_object_mpu",
-        &[],
-        Some("odd_part_size"),
-        NEEDS_FULL_OBJECT,
-    ),
-    (
-        "download_tests::full_object_waves",
-        &[],
-        Some("out_of_order"),
-        NEEDS_FULL_OBJECT,
-    ),
-    (
-        "download_tests::empty_crc",
-        &[],
-        Some("default"),
-        NEEDS_FULL_OBJECT,
-    ),
-];
+const IGNORED: &[(&str, &[Alg], Option<&str>, &str)] = &[];
 
 /// The [`IGNORED`] entry a case falls under, if any.
 fn ignored_entry(
@@ -760,12 +690,12 @@ fn reports_object_values_by_case_kind() {
     assert!(reports(
         "download_tests::full_object_mpu::crc32::default::validated::stream"
     ));
-    // An empty object: its one response is the whole object.
+    // HEAD reports an empty object's value without a data response.
     assert!(reports(
         "download_tests::empty_sha::sha256::default::not_validated::stream"
     ));
-    // Ranges carrying part checksums: a part's value is never the object's.
-    assert!(!reports(
+    // HEAD reports the object's value even when GETs carry only part values.
+    assert!(reports(
         "download_tests::composite_mpu::crc32::aligned::validated::stream"
     ));
     // Validation off.

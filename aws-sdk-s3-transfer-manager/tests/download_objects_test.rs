@@ -8,6 +8,7 @@ use aws_sdk_s3::{
     error::DisplayErrorContext,
     operation::{
         get_object::GetObjectOutput,
+        head_object::HeadObjectOutput,
         list_objects_v2::{ListObjectsV2Error, ListObjectsV2Output},
     },
     primitives::ByteStream,
@@ -65,6 +66,12 @@ impl MockObject {
         GetObjectOutput::builder()
             .body(ByteStream::from(self.contents.clone()))
             .content_length(self.contents.len() as i64)
+            .content_range(format!(
+                "bytes 0-{}/{}",
+                self.contents.len() - 1,
+                self.contents.len()
+            ))
+            .e_tag("my-etag")
             .build()
     }
 }
@@ -92,6 +99,20 @@ fn get_object_rule(mobj: &MockObject) -> Rule {
             })
             .then_output(move || mock_obj.get_object_output())
     }
+}
+
+/// HEAD reports metadata even when the subsequent GET is configured to fail.
+fn head_object_rule(mobj: &MockObject) -> Rule {
+    let key = mobj.object.key().unwrap().to_owned();
+    let len = mobj.contents.len() as i64;
+    mock!(aws_sdk_s3::Client::head_object)
+        .match_requests(move |r| r.key() == Some(key.as_str()))
+        .then_output(move || {
+            HeadObjectOutput::builder()
+                .content_length(len)
+                .e_tag("my-etag")
+                .build()
+        })
 }
 
 /// Mock bucket with the set of objects for testing transfer manager.
@@ -125,10 +146,15 @@ impl MockBucket {
         self.objects.iter().map(get_object_rule).collect()
     }
 
+    fn head_object_rules(&self) -> Vec<Rule> {
+        self.objects.iter().map(head_object_rule).collect()
+    }
+
     /// Return the mock rules representing this bucket. This includes
-    /// the `ListObjectsV2` call as well as all of the `GetObject` calls.
+    /// the listing, HEAD metadata and GET bodies.
     fn rules(&self) -> Vec<aws_smithy_mocks::Rule> {
         let mut rules = self.get_object_rules();
+        rules.extend(self.head_object_rules());
         rules.push(self.list_objects_rule());
         rules
     }
@@ -511,7 +537,9 @@ async fn test_abort_on_handle_should_terminate_tasks_gracefully() {
             }
         });
         let list = bucket.list_objects_rule();
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let mut rules = bucket.head_object_rules();
+        rules.extend([list, get]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
 
         let config = aws_sdk_s3_transfer_manager::Config::builder()
             .s3_config(test_common::s3_config_with_test_http(
@@ -676,7 +704,12 @@ async fn test_aborted_download_objects_error_source_is_failed_child_error() {
                 .build()
         });
         let mut rules = bucket.get_object_rules();
-        rules.extend([denied, list]);
+        rules.extend(bucket.head_object_rules());
+        rules.extend([
+            head_object_rule(&MockObject::new_with_error("denied")),
+            denied,
+            list,
+        ]);
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
 
         let config = aws_sdk_s3_transfer_manager::Config::builder()
@@ -751,7 +784,9 @@ async fn test_drop_download_objects_handle() {
             }
         });
         let list = bucket.list_objects_rule();
-        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[list, get]);
+        let mut rules = bucket.head_object_rules();
+        rules.extend([list, get]);
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, rules.as_slice());
 
         let config = aws_sdk_s3_transfer_manager::Config::builder()
             .s3_config(test_common::s3_config_with_test_http(
@@ -841,6 +876,15 @@ impl aws_smithy_runtime_api::client::http::HttpConnector for ParkedGetConnector 
         use aws_smithy_runtime_api::client::http::HttpConnectorFuture;
         use aws_smithy_runtime_api::client::result::ConnectorError;
 
+        if request.method() == "HEAD" {
+            let mut response = HttpResponse::new(
+                StatusCode::try_from(200).unwrap(),
+                aws_smithy_types::body::SdkBody::empty(),
+            );
+            response.headers_mut().insert("Content-Length", "1024");
+            response.headers_mut().insert("ETag", "my-etag");
+            return HttpConnectorFuture::ready(Ok(response));
+        }
         assert_eq!("GET", request.method());
         if request.uri().contains("list-type=2") {
             return HttpConnectorFuture::ready(Ok(HttpResponse::new(
@@ -918,4 +962,144 @@ async fn test_abort_stops_child_get_before_temp_file_cleanup() {
         *temp_existed_at_drop.lock().unwrap(),
         "child GetObject must be dropped before its temp file is removed"
     );
+}
+
+/// A listed object that fits in one range is downloaded with a single GET pinned to
+/// the listed ETag, without HeadObject. An object that changed since the listing
+/// (412), one listed larger than a range, an empty one, and a multipart one discover
+/// the object with HeadObject as any download does.
+#[tokio::test]
+async fn test_listed_object_that_fits_one_range_skips_head() {
+    const PART_SIZE: u64 = 8 * 1024 * 1024;
+    let listed = |key: &str, size: i64, e_tag: &str| {
+        aws_sdk_s3::types::Object::builder()
+            .key(key)
+            .size(size)
+            .e_tag(e_tag)
+            .build()
+    };
+    let get_output = |contents: &'static [u8], e_tag: &'static str| {
+        move || {
+            GetObjectOutput::builder()
+                .body(ByteStream::from_static(contents))
+                .content_length(contents.len() as i64)
+                .content_range(format!("bytes 0-{}/{}", contents.len() - 1, contents.len()))
+                .e_tag(e_tag)
+                .build()
+        }
+    };
+    let head_output = |len: i64, e_tag: &'static str| {
+        move || {
+            HeadObjectOutput::builder()
+                .content_length(len)
+                .e_tag(e_tag)
+                .build()
+        }
+    };
+    let head = |key: &'static str| {
+        mock!(aws_sdk_s3::Client::head_object).match_requests(move |r| r.key() == Some(key))
+    };
+    let get = |key: &'static str, if_match: &'static str| {
+        mock!(aws_sdk_s3::Client::get_object)
+            .match_requests(move |r| r.key() == Some(key) && r.if_match() == Some(if_match))
+    };
+
+    let list = mock!(aws_sdk_s3::Client::list_objects_v2).then_output(move || {
+        ListObjectsV2Output::builder()
+            .contents(listed("small", 11, "\"listed\""))
+            .contents(listed("changed", 11, "\"stale\""))
+            .contents(listed("large", PART_SIZE as i64 + 1, "\"listed-large\""))
+            .contents(listed("empty", 0, "\"empty\""))
+            .contents(listed("multipart", 11, "\"abc-2\""))
+            .build()
+    });
+    let small_get = mock!(aws_sdk_s3::Client::get_object)
+        .match_requests(|r| {
+            r.key() == Some("small")
+                && r.if_match() == Some("\"listed\"")
+                && r.range() == Some(format!("bytes=0-{}", PART_SIZE - 1).as_str())
+        })
+        .then_output(get_output(b"hello world", "\"listed\""));
+    let small_head = head("small").then_output(head_output(11, "\"listed\""));
+    let changed_stale_get = get("changed", "\"stale\"").then_http_response(|| {
+        HttpResponse::new(StatusCode::try_from(412).unwrap(), Bytes::new().into())
+    });
+    let changed_head = head("changed").then_output(head_output(12, "\"current\""));
+    let changed_get =
+        get("changed", "\"current\"").then_output(get_output(b"new contents", "\"current\""));
+    let large_head = head("large").then_output(head_output(11, "\"large\""));
+    let large_get = get("large", "\"large\"").then_output(get_output(b"hello world", "\"large\""));
+    let empty_head = head("empty").then_output(head_output(0, "\"empty\""));
+    let multipart_head = head("multipart").then_output(head_output(11, "\"abc-2\""));
+    let multipart_get =
+        get("multipart", "\"abc-2\"").then_output(get_output(b"hello world", "\"abc-2\""));
+
+    let client = mock_client!(
+        aws_sdk_s3,
+        RuleMode::MatchAny,
+        &[
+            &list,
+            &small_get,
+            &small_head,
+            &changed_stale_get,
+            &changed_head,
+            &changed_get,
+            &large_head,
+            &large_get,
+            &empty_head,
+            &multipart_head,
+            &multipart_get,
+        ]
+    );
+    let config = aws_sdk_s3_transfer_manager::Config::builder()
+        .s3_config(test_common::s3_config_with_test_http(
+            client.config().to_builder(),
+        ))
+        .build()
+        .expect("valid config");
+    let tm = aws_sdk_s3_transfer_manager::Client::new(config);
+    let dest = tempfile::tempdir().unwrap();
+
+    let output = tm
+        .download_objects()
+        .bucket("test-bucket")
+        .destination(dest.path())
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .unwrap();
+
+    assert_eq!(output.objects_downloaded(), 5);
+    assert_eq!(small_get.num_calls(), 1);
+    assert_eq!(
+        small_head.num_calls(),
+        0,
+        "a listed small object skips HEAD"
+    );
+    assert_eq!(changed_stale_get.num_calls(), 1);
+    assert_eq!(changed_head.num_calls(), 1, "a 412 falls back to HEAD");
+    assert_eq!(changed_get.num_calls(), 1);
+    assert_eq!(
+        large_head.num_calls(),
+        1,
+        "an object listed larger than a range uses HEAD"
+    );
+    assert_eq!(large_get.num_calls(), 1);
+    assert_eq!(empty_head.num_calls(), 1, "an empty object uses HEAD");
+    assert_eq!(
+        multipart_head.num_calls(),
+        1,
+        "a multipart object uses HEAD"
+    );
+    assert_eq!(multipart_get.num_calls(), 1);
+    assert_eq!(
+        std::fs::read(dest.path().join("small")).unwrap(),
+        b"hello world"
+    );
+    assert_eq!(
+        std::fs::read(dest.path().join("changed")).unwrap(),
+        b"new contents"
+    );
+    assert_eq!(std::fs::read(dest.path().join("empty")).unwrap(), b"");
 }

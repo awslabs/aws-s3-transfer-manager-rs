@@ -182,24 +182,37 @@ impl<'a> DownloadIoCtl<'a> {
 /// # Lifecycle
 ///
 /// **Handles should be kept until the transfer completes or is explicitly cancelled.**
-/// The recommended pattern is to consume the body and then call [`join`](Self::join):
+/// Whole-object CRC verification runs after all ranges are collected. Body
+/// bytes may reach the caller before that check finishes; [`join`](Self::join)
+/// reports its final result. Consume the body before calling `join()`.
 ///
-/// ```ignore
-/// let handle = tm.download()
+/// A successful `join()` does not guarantee checksum validation. Callers that
+/// require it must inspect the outcome before accepting the downloaded content:
+///
+/// ```no_run
+/// # async fn example(tm: &aws_sdk_s3_transfer_manager::Client) -> Result<(), Box<dyn std::error::Error>> {
+/// use aws_sdk_s3_transfer_manager::types::ChecksumValidation;
+///
+/// let mut handle = tm.download()
 ///     .bucket("my-bucket")
 ///     .key("my-key")
-///     .initiate()
-///     .await?;
+///     .initiate()?;
 ///
-/// // Consume the body
-/// let mut body = handle.body_mut();
-/// while let Some(chunk) = body.next().await {
+/// while let Some(chunk) = handle.body_mut().next().await {
 ///     let chunk = chunk?;
-///     // Process chunk...
+///     // Consume the chunk; accept the complete result only after join().
 /// }
 ///
-/// // Wait for completion and get final result
 /// let output = handle.join().await?;
+/// match output.integrity_checks().checksum_validation() {
+///     ChecksumValidation::Validated { .. } => {}
+///     ChecksumValidation::NotValidated { reason, .. } => {
+///         return Err(format!("download was not checksum-validated: {reason:?}").into());
+///     }
+///     _ => return Err("unrecognized checksum validation outcome".into()),
+/// }
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// # Cancellation
@@ -271,6 +284,10 @@ impl DownloadHandle {
     }
 
     /// Wait for the download to complete and return the result.
+    ///
+    /// Checksum mismatches return an error. Success may still report
+    /// [`ChecksumValidation::NotValidated`](crate::types::ChecksumValidation::NotValidated);
+    /// see the [`DownloadHandle`] example for checking the validation outcome.
     ///
     /// This is the authoritative source for transfer errors. Other methods
     /// (`body.next()`, `object_meta()`) return generic errors; call `join()`
@@ -408,6 +425,11 @@ impl ManagedDownloadHandle {
     /// On success, atomically renames the temporary file to the destination
     /// path. On failure or cancellation, deletes the temporary file. This does
     /// not add a filesystem durability barrier.
+    ///
+    /// Checksum mismatches return an error. Success may still report
+    /// [`ChecksumValidation::NotValidated`](crate::types::ChecksumValidation::NotValidated).
+    /// Check [`DownloadOutput::integrity_checks`] before accepting the contents;
+    /// a successful path download has already published its destination.
     pub async fn join(
         mut self,
     ) -> Result<crate::operation::download::output::DownloadOutput, error::Error> {

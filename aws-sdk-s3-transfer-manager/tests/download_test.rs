@@ -14,7 +14,11 @@ use test_util::retention::{
     assert_download_releases_destination, drop_and_await_shutdown, Destination, Ending,
     OpenFileProbe,
 };
-use test_util::{object_connector, object_connector_with_checksum_headers};
+use test_util::{
+    get_first_object_connector_with_checksum_headers, head_event, object_connector,
+    object_connector_with_checksum_headers,
+    object_connector_with_object_and_range_checksum_headers,
+};
 
 use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::types::ByteSize;
@@ -51,9 +55,8 @@ use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use test_common::drain;
 
-// NOTE: these tests are somewhat brittle as they assume particular paths through the codebase.
-// As an example we generally assume object discovery goes through `GetObject` with a ranged get
-// for the first part.
+// Replay fixtures use HEAD-first discovery for validated whole-object downloads.
+// Caller ranges and validation-off downloads use their respective discovery paths.
 
 fn rand_data(size: usize) -> Bytes {
     iter::repeat_with(fastrand::alphanumeric)
@@ -115,15 +118,16 @@ async fn test_download_ranges() {
 
     assert_eq!(data.len(), body.len());
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert_eq!(3, requests.len());
+    assert_eq!(4, requests.len());
+    assert_eq!(requests[0].method(), "HEAD");
 
-    assert_eq!(requests[0].headers().get("Range"), Some("bytes=0-5242879"));
+    assert_eq!(requests[1].headers().get("Range"), Some("bytes=0-5242879"));
     assert_eq!(
-        requests[1].headers().get("Range"),
+        requests[2].headers().get("Range"),
         Some("bytes=5242880-10485759")
     );
     assert_eq!(
-        requests[2].headers().get("Range"),
+        requests[3].headers().get("Range"),
         Some("bytes=10485760-12582911")
     );
 }
@@ -205,51 +209,67 @@ async fn test_object_meta_after_discovery_failure() {
 /// Connector modelling a ranged-GET object store for an object of `total`
 /// bytes.
 ///
-/// The first GET is answered with the requested range. Every later GET stays
-/// in flight until its future is dropped; each one adds a permit to
-/// `parked_started` when it begins.
+/// HEAD reports the object's metadata. The first GET to arrive, whichever range
+/// it requests, is answered with that range, its body taken from `first_range`.
+/// Every later GET stays in flight until its future is dropped; each one adds a
+/// permit to `parked_started` when it begins.
 #[derive(Debug)]
-struct ParkAfterDiscoveryConnector {
+struct ParkAfterFirstGetConnector {
     total: usize,
+    /// Bytes for the first GET's body, at least one part long, built before the
+    /// download so `call()` does no work.
+    first_range: Bytes,
     requests: Arc<AtomicUsize>,
     parked_started: Arc<Semaphore>,
 }
 
-impl ParkAfterDiscoveryConnector {
-    fn discovery_response(&self, request: &HttpRequest) -> HttpResponse {
+impl ParkAfterFirstGetConnector {
+    fn first_range_response(&self, request: &HttpRequest) -> HttpResponse {
+        let total = self.total;
         let range = request
             .headers()
             .get("Range")
-            .expect("discovery GET must be ranged");
+            .expect("range GET must be ranged");
         let (start, end) = range
             .strip_prefix("bytes=")
             .and_then(|r| r.split_once('-'))
             .map(|(s, e)| (s.parse::<usize>().unwrap(), e.parse::<usize>().unwrap()))
             .unwrap_or_else(|| panic!("unexpected Range header: {range}"));
-        let end = cmp::min(end, self.total - 1);
+        let end = cmp::min(end, total - 1);
         let len = end - start + 1;
+        // With two requests in flight, either of the first two ranges can arrive first.
+        assert!(
+            len <= self.first_range.len(),
+            "range longer than a part: {range}"
+        );
 
         let mut response = HttpResponse::new(
             StatusCode::try_from(206).unwrap(),
-            SdkBody::from(rand_data(len)),
+            SdkBody::from(self.first_range.slice(..len)),
         );
         let headers = response.headers_mut();
         headers.insert("Content-Length", len.to_string());
-        headers.insert(
-            "Content-Range",
-            format!("bytes {start}-{end}/{}", self.total),
-        );
+        headers.insert("Content-Range", format!("bytes {start}-{end}/{total}"));
         headers.insert("ETag", "my-etag");
         response
     }
 }
 
-impl HttpConnector for ParkAfterDiscoveryConnector {
+impl HttpConnector for ParkAfterFirstGetConnector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+        if request.method() == "HEAD" {
+            let mut response =
+                HttpResponse::new(StatusCode::try_from(200).unwrap(), SdkBody::empty());
+            response
+                .headers_mut()
+                .insert("Content-Length", self.total.to_string());
+            response.headers_mut().insert("ETag", "my-etag");
+            return HttpConnectorFuture::ready(Ok(response));
+        }
         assert_eq!("GET", request.method());
         let seq = self.requests.fetch_add(1, Ordering::SeqCst);
         if seq == 0 {
-            let response = self.discovery_response(&request);
+            let response = self.first_range_response(&request);
             return HttpConnectorFuture::ready(Ok(response));
         }
 
@@ -261,7 +281,7 @@ impl HttpConnector for ParkAfterDiscoveryConnector {
     }
 }
 
-/// `abort()` must return once ranged GETs following discovery are executing,
+/// `abort()` must return once ranged GETs following the first are executing,
 /// without waiting for those requests to complete on their own.
 ///
 /// The body is never consumed.
@@ -270,8 +290,10 @@ async fn abort_download_with_executing_gets(runtime_config: RuntimeConfig) {
     let part_size = ByteSize::mib(5).as_usize();
     let requests = Arc::new(AtomicUsize::new(0));
     let parked_started = Arc::new(Semaphore::new(0));
-    let connector = SharedHttpConnector::new(ParkAfterDiscoveryConnector {
+    let connector = SharedHttpConnector::new(ParkAfterFirstGetConnector {
         total,
+        // The body is never read, so its contents don't matter.
+        first_range: Bytes::from(vec![b'x'; part_size]),
         requests: requests.clone(),
         parked_started: parked_started.clone(),
     });
@@ -295,11 +317,15 @@ async fn abort_download_with_executing_gets(runtime_config: RuntimeConfig) {
 
     tokio::time::timeout(Duration::from_secs(5), parked_started.acquire())
         .await
-        .expect("no GET after discovery started")
+        .expect("no GET after the first started")
         .expect("start semaphore closed")
         .forget();
 
-    tokio::time::timeout(Duration::from_secs(1), handle.abort())
+    // The first range GET can still be collecting its body alongside the parked
+    // one, and the managed runtime's abort() waits for it. Under the thread
+    // sanitizer that collection alone can take more than a second.
+    let abort_limit = Duration::from_secs(if cfg!(s3_tm_tsan) { 10 } else { 1 });
+    tokio::time::timeout(abort_limit, handle.abort())
         .await
         .expect("abort hung while a ranged GET was executing");
 
@@ -374,6 +400,7 @@ async fn test_retry_failed_chunk() {
     let fail_after_byte = frame_size * 4;
 
     let http_client = StaticReplayClient::new(vec![
+        head_event(data.len(), None),
         ReplayEvent::new(
             dummy_expected_request(),
             http::Response::builder()
@@ -431,7 +458,7 @@ async fn test_retry_failed_chunk() {
 
     assert_eq!(data.len(), body.len());
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert_eq!(3, requests.len());
+    assert_eq!(4, requests.len());
 }
 
 const ERROR_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -450,6 +477,7 @@ async fn test_non_retryable_error() {
     let part_size = ByteSize::mib(8).as_usize();
 
     let http_client = StaticReplayClient::new(vec![
+        head_event(data.len(), None),
         ReplayEvent::new(
             dummy_expected_request(),
             http::Response::builder()
@@ -484,7 +512,7 @@ async fn test_non_retryable_error() {
     let _ = drain(&mut handle).await.unwrap_err();
 
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert_eq!(2, requests.len());
+    assert_eq!(3, requests.len());
 }
 
 /// Test max attempts exhausted reading a stream
@@ -516,18 +544,21 @@ async fn test_retry_max_attempts() {
     .take(3)
     .collect::<Vec<_>>();
 
-    let mut events = vec![ReplayEvent::new(
-        dummy_expected_request(),
-        http::Response::builder()
-            .status(200)
-            .header("Content-Length", format!("{}", part_size))
-            .header(
-                "Content-Range",
-                format!("bytes 0-{}/{}", part_size - 1, data.len()),
-            )
-            .body(SdkBody::from(data.slice(0..part_size)))
-            .unwrap(),
-    )];
+    let mut events = vec![
+        head_event(data.len(), None),
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http::Response::builder()
+                .status(200)
+                .header("Content-Length", format!("{}", part_size))
+                .header(
+                    "Content-Range",
+                    format!("bytes 0-{}/{}", part_size - 1, data.len()),
+                )
+                .body(SdkBody::from(data.slice(0..part_size)))
+                .unwrap(),
+        ),
+    ];
 
     events.append(&mut failures);
 
@@ -543,7 +574,7 @@ async fn test_retry_max_attempts() {
 
     let _ = drain(&mut handle).await.unwrap_err();
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert_eq!(4, requests.len());
+    assert_eq!(5, requests.len());
 }
 
 /// Test the if_match header was added correctly based on the response from server.
@@ -564,13 +595,15 @@ async fn test_download_if_match() {
     let _ = drain(&mut handle).await.unwrap();
 
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert_eq!(3, requests.len());
+    assert_eq!(4, requests.len());
+    assert_eq!(requests[0].method(), "HEAD");
 
     // The first request is to discover the object meta data and should not have any if-match
     assert_eq!(requests[0].headers().get("If-Match"), None);
     // All the following requests should have the if-match header
     assert_eq!(requests[1].headers().get("If-Match"), Some("my-etag"));
     assert_eq!(requests[2].headers().get("If-Match"), Some("my-etag"));
+    assert_eq!(requests[3].headers().get("If-Match"), Some("my-etag"));
 }
 
 const OBJECT_MODIFIED_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -593,10 +626,8 @@ async fn test_download_object_modified() {
     // Assumptions:
     //     1. First request for discovery, succeed with etag
     //     2. Followed requests fail to mock the object changed during download.
-    let events = data
-        .chunks(part_size)
-        .enumerate()
-        .map(|(idx, chunk)| {
+    let events = std::iter::once(head_event(data.len(), None))
+        .chain(data.chunks(part_size).enumerate().map(|(idx, chunk)| {
             let start = idx * part_size;
             let end = std::cmp::min(start + part_size, data.len()) - 1;
             let mut response = http::Response::builder()
@@ -622,7 +653,7 @@ async fn test_download_object_modified() {
                 dummy_expected_request(),
                 response,
             )
-        })
+        }))
         .collect();
 
     let http_client = StaticReplayClient::new(events);
@@ -791,7 +822,11 @@ async fn download_objects_releases_destination_files() {
             .unwrap(),
     );
     let config = aws_sdk_s3_transfer_manager::Config::builder()
-        .s3_config(common::s3_config(StaticReplayClient::new(vec![list, get])))
+        .s3_config(common::s3_config(StaticReplayClient::new(vec![
+            list,
+            head_event(data.len(), None),
+            get,
+        ])))
         .concurrency(ConcurrencyMode::Explicit(1))
         .build()
         .expect("valid config");
@@ -826,10 +861,18 @@ async fn write_to_path_drop_clients_then_unlink_releases_destination() {
         http::Response::builder()
             .status(200)
             .header("Content-Length", data.len().to_string())
+            .header(
+                "Content-Range",
+                format!("bytes 0-{}/{}", data.len() - 1, data.len()),
+            )
+            .header("ETag", "my-etag")
             .body(SdkBody::from(data.clone()))
             .unwrap(),
     );
-    let shared = common::shared_config(StaticReplayClient::new(vec![response]));
+    let shared = common::shared_config(StaticReplayClient::new(vec![
+        head_event(data.len(), None),
+        response,
+    ]));
     // Reproduce the reported drop sequence with both clients sharing SDK configuration.
     let s3 = aws_sdk_s3::Client::new(&shared);
     let tm = aws_sdk_s3_transfer_manager::Client::new(
@@ -941,6 +984,7 @@ async fn test_download_write_to_path_error_cleans_up() {
 
     // Discovery succeeds, second request fails with 412 PreconditionFailed.
     let http_client = StaticReplayClient::new(vec![
+        head_event(data.len(), None),
         ReplayEvent::new(
             dummy_expected_request(),
             http::Response::builder()
@@ -1033,8 +1077,7 @@ async fn test_download_write_to_file_rejects_append_mode() {
 /// the stored checksum and therefore stop validating downloads.
 #[tokio::test]
 async fn test_checksum_mode_enabled_by_default() {
-    // Multipart object so the assertion covers the discovery GET and every
-    // subsequent range-chunk GET.
+    // Multipart object so the assertion covers discovery HEAD and every range GET.
     let data = rand_data(ByteSize::mib(20).as_usize());
     let part_size = ByteSize::mib(8).as_usize();
     let (tm, http_client) = simple_test_tm(&data, part_size);
@@ -1053,7 +1096,7 @@ async fn test_checksum_mode_enabled_by_default() {
         assert_eq!(
             req.headers().get("x-amz-checksum-mode"),
             Some("ENABLED"),
-            "GET #{i} must carry x-amz-checksum-mode=ENABLED by default"
+            "request #{i} must carry x-amz-checksum-mode=ENABLED by default"
         );
     }
 }
@@ -1199,7 +1242,11 @@ async fn test_integrity_checks_default_mode_validates() {
 async fn test_integrity_checks_disabled_when_validation_when_required() {
     let data = Bytes::from_static(HELLO);
     let part_size = ByteSize::mib(5).as_usize();
-    let tm = when_required_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
+    let http_client =
+        get_first_object_connector_with_checksum_headers(&data, data.len(), |_, _| {
+            Some(("x-amz-checksum-crc32", HELLO_CRC32.to_owned()))
+        });
+    let tm = when_required_tm(http_client, part_size);
 
     let mut handle = tm
         .download()
@@ -1242,20 +1289,24 @@ async fn test_integrity_checks_part_level_only_reads_composite_checksum() {
     assert_not_validated(&validation, NotValidatedReason::CompositeChecksum);
 }
 
-/// The first chunk's response carries its CRC32 and the second's only a part-level
-/// checksum: some delivered bytes were validated, so the verdict is
-/// NotValidated{PartialCoverage}.
+/// HEAD reports a COMPOSITE checksum. The first chunk's response carries its CRC32
+/// and the second's only a part-level checksum. The verdict is NotValidated{PartialCoverage}.
 #[tokio::test]
 async fn test_integrity_checks_validated_and_part_level_read_partial_coverage() {
     let part_size = ByteSize::mib(5).as_usize();
     let data = rand_data(part_size + 1024);
-    let http_client = object_connector_with_checksum_headers(&data, part_size, |index, chunk| {
-        let value = match index {
-            0 => checksum_value(aws_smithy_checksums::ChecksumAlgorithm::Crc32, chunk),
-            _ => "AAAAAA==-2".to_owned(),
-        };
-        Some(("x-amz-checksum-crc32", value))
-    });
+    let http_client = object_connector_with_object_and_range_checksum_headers(
+        &data,
+        part_size,
+        Some(("x-amz-checksum-crc32", "AAAAAA==-2".to_owned())),
+        |index, chunk| {
+            let value = match index {
+                0 => checksum_value(aws_smithy_checksums::ChecksumAlgorithm::Crc32, chunk),
+                _ => "AAAAAA==-2".to_owned(),
+            };
+            Some(("x-amz-checksum-crc32", value))
+        },
+    );
     let tm = test_tm(http_client, part_size);
 
     let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
@@ -1341,7 +1392,7 @@ async fn test_integrity_checks_each_algorithm_validates() {
 
 /// Each algorithm the SDK validates: a response whose checksum does not match its
 /// body fails the body and `join` with IntegrityError, carrying the algorithm and
-/// both values, after a single request.
+/// both values, after one HEAD and one GET.
 #[tokio::test]
 async fn test_integrity_checks_each_algorithm_mismatch_is_integrity_error() {
     let data = Bytes::from_static(HELLO);
@@ -1372,7 +1423,7 @@ async fn test_integrity_checks_each_algorithm_mismatch_is_integrity_error() {
             assert_eq!(details.expected(), Some(expected.as_str()));
             assert_eq!(details.computed(), Some(computed.as_str()));
         }
-        assert_eq!(http_client.actual_requests().count(), 1, "{tm_algorithm:?}");
+        assert_eq!(http_client.actual_requests().count(), 2, "{tm_algorithm:?}");
     }
 }
 
@@ -1459,15 +1510,155 @@ async fn test_integrity_checks_surfaces_whole_object_checksum() {
     );
 }
 
-/// A one-part multipart object with a composite checksum fits in the discovery
-/// response. Its `-1` value is a checksum of part checksum. Neither integrity_checks
-/// and object_meta should reports it; both keep the checksum type.
+/// A server that ignores `Range` answers a GET for the whole object with `200 OK`,
+/// the complete object and no `Content-Range`. HEAD gave the object's length, so
+/// those are exactly the requested bytes.
+#[tokio::test]
+async fn test_whole_object_download_accepts_a_complete_response_without_content_range() {
+    let data = Bytes::from_static(HELLO);
+    let complete = http::Response::builder()
+        .status(200)
+        .header("Content-Length", data.len().to_string())
+        .header("ETag", "\"my-etag\"")
+        .body(SdkBody::from(data.clone()))
+        .unwrap();
+    let http_client = StaticReplayClient::new(vec![
+        head_with_headers(data.len(), "\"my-etag\"", &[]),
+        ReplayEvent::new(dummy_expected_request(), complete),
+    ]);
+    let tm = test_tm(http_client.clone(), ByteSize::mib(5).as_usize());
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    assert_eq!(drain(&mut handle).await.unwrap(), data);
+    handle.join().await.expect("download");
+    let methods: Vec<_> = http_client
+        .actual_requests()
+        .map(|request| request.method().to_owned())
+        .collect();
+    assert_eq!(methods, ["HEAD", "GET"]);
+}
+
+/// A server that ignores `Range` returns the complete object for a request of part of
+/// it. Those aren't the requested bytes, so the download fails with a service error
+/// that names the operation and the response's request id.
+#[tokio::test]
+async fn test_range_response_without_content_range_fails_with_service_error() {
+    let part_size = ByteSize::mib(5).as_usize();
+    let data = rand_data(part_size + 1024);
+    let complete = || {
+        http::Response::builder()
+            .status(200)
+            .header("Content-Length", data.len().to_string())
+            .header("ETag", "\"my-etag\"")
+            .header("x-amz-request-id", "range-ignoring-request")
+            .body(SdkBody::from(data.clone()))
+            .unwrap()
+    };
+    let http_client = StaticReplayClient::new(vec![
+        head_with_headers(data.len(), "\"my-etag\"", &[]),
+        ReplayEvent::new(dummy_expected_request(), complete()),
+        ReplayEvent::new(dummy_expected_request(), complete()),
+    ]);
+    let tm = test_tm(http_client, part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    let _ = drain(&mut handle).await;
+    let error = handle.join().await.unwrap_err();
+    assert_eq!(error.kind(), &ErrorKind::ServiceError, "{error:?}");
+    assert_eq!(error.operation_name(), Some("GetObject"));
+    assert_eq!(error.request_id(), Some("range-ignoring-request"));
+    assert_eq!(error.code(), None);
+}
+
+/// S3 answers a failed HEAD with its status and request ids only, with no body to
+/// carry the error code. A status that identifies a single S3 code reports that code;
+/// any other reports the code the SDK assigned, if any.
+#[tokio::test]
+async fn test_failed_head_reports_the_code_its_status_identifies() {
+    for (status, range, expected) in [
+        (412, None, Some("PreconditionFailed")),
+        (304, None, Some("NotModified")),
+        (416, Some("bytes=100-"), Some("InvalidRange")),
+        (404, None, Some("NotFound")),
+        (403, None, None),
+        (400, None, None),
+    ] {
+        let response = http::Response::builder()
+            .status(status)
+            .header("x-amz-request-id", "head-request")
+            .body(SdkBody::empty())
+            .unwrap();
+        let http_client =
+            StaticReplayClient::new(vec![ReplayEvent::new(dummy_expected_request(), response)]);
+        let tm = test_tm(http_client.clone(), ByteSize::mib(5).as_usize());
+
+        let mut request = tm
+            .download()
+            .bucket("test-bucket")
+            .key("test-object")
+            .if_match("\"stale-etag\"");
+        if let Some(range) = range {
+            request = request.range(range);
+        }
+        let mut handle = request.initiate().unwrap();
+        let _ = drain(&mut handle).await;
+        let error = handle.join().await.unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::ServiceError,
+            "{status}: {error:?}"
+        );
+        assert_eq!(error.operation_name(), Some("HeadObject"), "{status}");
+        assert_eq!(error.code(), expected, "{status}: {error:?}");
+        assert_eq!(error.request_id(), Some("head-request"), "{status}");
+        let methods: Vec<_> = http_client
+            .actual_requests()
+            .map(|request| request.method().to_owned())
+            .collect();
+        assert_eq!(methods, ["HEAD"], "{status}: no other request is sent");
+    }
+}
+
+/// A checksum-mode HEAD response for `len` bytes with `etag` and `headers`.
+fn head_with_headers(len: usize, etag: &str, headers: &[(&str, &str)]) -> ReplayEvent {
+    let mut response = http::Response::builder()
+        .status(200)
+        .header("Content-Length", len.to_string())
+        .header("ETag", etag);
+    for (name, value) in headers {
+        response = response.header(*name, *value);
+    }
+    ReplayEvent::new(
+        dummy_expected_request(),
+        response.body(SdkBody::empty()).unwrap(),
+    )
+}
+
+/// A one-part multipart object with a composite checksum: HEAD reports its `-1`
+/// value, a checksum of part checksums. Neither `integrity_checks()` nor
+/// `object_meta` reports the value; both keep the checksum type.
 #[tokio::test]
 async fn test_integrity_checks_one_part_composite_has_no_object_value() {
     use aws_sdk_s3_transfer_manager::types::ChecksumType;
 
     let data = Bytes::from_static(HELLO);
     let part_size = ByteSize::mib(5).as_usize();
+    let composite = [
+        ("x-amz-checksum-crc32", "AAAAAA==-1"),
+        ("x-amz-checksum-type", "COMPOSITE"),
+    ];
+    let head = head_with_headers(data.len(), "\"my-etag-1\"", &composite);
     let response = http::Response::builder()
         .status(200)
         .header("Content-Length", format!("{}", data.len()))
@@ -1480,8 +1671,10 @@ async fn test_integrity_checks_one_part_composite_has_no_object_value() {
         .header("x-amz-checksum-type", "COMPOSITE")
         .body(SdkBody::from(data.clone()))
         .unwrap();
-    let http_client =
-        StaticReplayClient::new(vec![ReplayEvent::new(dummy_expected_request(), response)]);
+    let http_client = StaticReplayClient::new(vec![
+        head,
+        ReplayEvent::new(dummy_expected_request(), response),
+    ]);
     let tm = test_tm(http_client, part_size);
 
     let mut handle = tm
@@ -1506,10 +1699,11 @@ async fn test_integrity_checks_one_part_composite_has_no_object_value() {
 }
 
 // ref: RUST-1676
-/// A validated multipart download with an Auto part size re-issues discovery as
-/// `partNumber=1`. That response carries part 1's checksum with a `FULL_OBJECT`
-/// type. It describes only the part, so neither `integrity_checks()` nor
-/// `object_meta()` reports it as the object's checksum.
+/// A validated download of a COMPOSITE multipart object with an Auto part size
+/// fetches stored part 1 by `partNumber=1` to learn the part size. That response
+/// carries part 1's checksum. It describes only the part, so neither
+/// `integrity_checks()` nor `object_meta()` reports it as the object's checksum;
+/// both report HEAD's COMPOSITE type and no value.
 #[tokio::test]
 async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
     use aws_sdk_s3_transfer_manager::types::ChecksumType;
@@ -1519,18 +1713,19 @@ async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
     let data = Bytes::from_static(b"helloworld");
     let response = |range: &str, body: &'static [u8]| {
         http::Response::builder()
-            .status(200)
+            .status(206)
             .header("Content-Length", format!("{}", body.len()))
             .header("Content-Range", format!("bytes {range}/{}", data.len()))
             .header("ETag", "\"my-etag-2\"")
     };
     let http_client = StaticReplayClient::new(vec![
-        // Ranged discovery: the whole object, with a two-part ETag.
-        ReplayEvent::new(
-            dummy_expected_request(),
-            response("0-9", b"helloworld")
-                .body(SdkBody::from(data.clone()))
-                .unwrap(),
+        head_with_headers(
+            data.len(),
+            "\"my-etag-2\"",
+            &[
+                ("x-amz-checksum-crc32", "AAAAAA==-2"),
+                ("x-amz-checksum-type", "COMPOSITE"),
+            ],
         ),
         // partNumber=1: part 1 with its own checksum.
         ReplayEvent::new(
@@ -1538,7 +1733,7 @@ async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
             response("0-4", b"hello")
                 .header("x-amz-mp-parts-count", "2")
                 .header("x-amz-checksum-crc32", PART1_CRC32)
-                .header("x-amz-checksum-type", "FULL_OBJECT")
+                .header("x-amz-checksum-type", "COMPOSITE")
                 .body(SdkBody::from(&b"hello"[..]))
                 .unwrap(),
         ),
@@ -1570,28 +1765,34 @@ async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
 
     let requests = http_client.actual_requests().collect::<Vec<_>>();
     assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method(), "HEAD");
     assert!(
         requests[1].uri().contains("partNumber=1"),
-        "discovery re-issued as partNumber=1: {}",
+        "discovery fetched stored part 1: {}",
         requests[1].uri()
     );
 
     assert_eq!(output.integrity_checks().checksum_crc32(), None);
+    assert_eq!(
+        output.integrity_checks().checksum_type(),
+        Some(&ChecksumType::Composite)
+    );
     for meta in [&object_meta, &output.object_meta] {
         assert_eq!(meta.checksum_crc32, None);
-        assert_eq!(meta.checksum_type, Some(ChecksumType::FullObject));
+        assert_eq!(meta.checksum_type, Some(ChecksumType::Composite));
+        // A plain HEAD reports no part count; the part-1 response supplies it.
         assert_eq!(meta.parts_count, Some(2));
     }
 }
 
 // ref: RUST-1676
-/// With an explicit part size equal to the stored part size, discovery is a ranged
-/// GET that covers exactly stored part 1, so no `partNumber` request is made and
-/// the response has no `x-amz-mp-parts-count`. A directory bucket answers a range
-/// that matches a stored part of a `FULL_OBJECT` multipart object with that part's
-/// checksum and the object's `FULL_OBJECT` type. The value describes 5 MiB of a
-/// 10 MiB object, so neither `integrity_checks()` nor `object_meta` may report it
-/// as the object's checksum.
+/// With an explicit part size equal to the stored part size, each ranged GET
+/// covers exactly one stored part, so no `partNumber` request is made. A
+/// directory bucket answers a range that matches a stored part of a
+/// `FULL_OBJECT` multipart object with that part's checksum and the object's
+/// `FULL_OBJECT` type. That value describes 5 MiB of a 10 MiB object, so
+/// `integrity_checks()` and `object_meta` report HEAD's object checksum, never
+/// the part's.
 #[tokio::test]
 async fn test_integrity_checks_part_aligned_range_checksum_is_not_an_object_value() {
     use aws_sdk_s3_transfer_manager::types::ChecksumType;
@@ -1614,7 +1815,16 @@ async fn test_integrity_checks_part_aligned_range_checksum_is_not_an_object_valu
             .body(SdkBody::from(data.slice(start..start + part_size)))
             .unwrap()
     };
+    let object_crc32 = checksum_value(aws_smithy_checksums::ChecksumAlgorithm::Crc32, &data);
     let http_client = StaticReplayClient::new(vec![
+        head_with_headers(
+            data.len(),
+            "\"my-etag-2\"",
+            &[
+                ("x-amz-checksum-crc32", &object_crc32),
+                ("x-amz-checksum-type", "FULL_OBJECT"),
+            ],
+        ),
         ReplayEvent::new(dummy_expected_request(), part(0)),
         ReplayEvent::new(dummy_expected_request(), part(part_size)),
     ]);
@@ -1631,28 +1841,40 @@ async fn test_integrity_checks_part_aligned_range_checksum_is_not_an_object_valu
     let output = handle.join().await.unwrap();
 
     let requests = http_client.actual_requests().collect::<Vec<_>>();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method(), "HEAD");
     assert!(
         requests.iter().all(|r| !r.uri().contains("partNumber")),
         "an explicit part size downloads by range only"
     );
-    assert_eq!(output.integrity_checks().checksum_crc32(), None);
+    assert_ne!(object_crc32, PART_CRC32);
+    assert_eq!(
+        output.integrity_checks().checksum_crc32(),
+        Some(object_crc32.as_str())
+    );
     for meta in [&object_meta, &output.object_meta] {
-        assert_eq!(meta.checksum_crc32, None);
+        assert_eq!(meta.checksum_crc32.as_deref(), Some(object_crc32.as_str()));
         assert_eq!(meta.checksum_type, Some(ChecksumType::FullObject));
+        // No request named a part number, so the part count is unknown.
         assert_eq!(meta.parts_count, None);
     }
 }
 
-/// Multipart object (data larger than part_size) → discovery chunk carries only
-/// part 1's checksum, which MUST NOT be surfaced as the object's checksum.
+/// Range-response checksums must not be surfaced as object values when HEAD
+/// has no stored checksum.
 #[tokio::test]
 async fn test_integrity_checks_multipart_does_not_surface_part_checksum() {
     let data = rand_data(ByteSize::mib(12).as_usize());
     let part_size = ByteSize::mib(5).as_usize();
-    // object_connector splits into parts and stamps no checksum header,
-    // but even if part 1 carried one, it must not be reported as the object value.
-    let (tm, _c) = simple_test_tm(&data, part_size);
+    let http_client = object_connector_with_checksum_headers(&data, part_size, |_, bytes| {
+        (bytes.len() <= part_size).then(|| {
+            (
+                "x-amz-checksum-crc32",
+                checksum_value(aws_smithy_checksums::ChecksumAlgorithm::Crc32, bytes),
+            )
+        })
+    });
+    let tm = test_tm(http_client, part_size);
 
     let mut handle = tm
         .download()

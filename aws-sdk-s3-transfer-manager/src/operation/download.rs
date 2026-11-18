@@ -15,6 +15,19 @@
 //! validated; use
 //! [`DownloadOutput::integrity_checks`](crate::operation::download::DownloadOutput::integrity_checks)
 //! for that result.
+//!
+//! Whole-object downloads with checksum validation enabled start with checksum-mode
+//! HEAD. A stored FULL_OBJECT CRC32, CRC32C or CRC64NVME checksum is verified by
+//! hashing accepted ranges and combining their CRCs in object-offset order.
+//! SDK response checks remain active. COMPOSITE objects use response checks;
+//! automatic part sizing resolves the first stored part before issuing later ranges.
+//! Caller ranges use response checks without whole-object CRC verification.
+//!
+//! Streamed bytes can arrive before the final whole-object check. Consume the body
+//! and await [`DownloadHandle::join`](crate::operation::download::DownloadHandle::join)
+//! before treating the download as successful.
+//! An integrity failure prevents a path destination from replacing the existing file;
+//! callers must discard bytes already received through a stream or caller-owned file.
 
 pub use crate::model::builders::DownloadInputBuilder;
 pub use crate::model::{ChunkMetadata, DownloadInput, ObjectMetadata};
@@ -97,6 +110,30 @@ pub(crate) fn temp_file_candidates(
 #[derive(Clone, Default, Debug)]
 pub(crate) struct Download;
 
+/// An object as a `download_objects` listing reported it.
+///
+/// Discovery of a child download uses it to skip HeadObject for an object that
+/// fits in one range: a single checksum-mode GET pinned to the listed ETag covers
+/// the whole object, and its response carries the object's checksum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ListedObject {
+    /// The listed size in bytes.
+    pub(crate) size: u64,
+    /// The listed ETag, sent as `If-Match`.
+    pub(crate) e_tag: String,
+}
+
+impl ListedObject {
+    /// The listing's size and ETag for `object`, or `None` when either is missing or
+    /// the size is negative.
+    pub(crate) fn from_listing(object: &crate::model::Object) -> Option<Self> {
+        Some(Self {
+            size: u64::try_from(object.size()?).ok()?,
+            e_tag: object.e_tag().filter(|e_tag| !e_tag.is_empty())?.to_owned(),
+        })
+    }
+}
+
 impl Download {
     /// Execute a single `Download` transfer operation
     pub(crate) fn orchestrate(
@@ -160,7 +197,7 @@ impl Download {
                 return Err(error::io_at("preparing temporary file for", &dest_path, e));
             }
         };
-        let inner = Self::orchestrate_with_sink(handle, input, sink, parent_id)?;
+        let inner = Self::orchestrate_with_sink(handle, input, sink, parent_id, None)?;
         Ok(ManagedDownloadHandle::new(inner, temp_path, dest_path))
     }
 
@@ -188,7 +225,7 @@ impl Download {
                 error::from_kind(error::ErrorKind::IOError)(e)
             }
         })?;
-        let inner = Self::orchestrate_with_sink(handle, input, sink, None)?;
+        let inner = Self::orchestrate_with_sink(handle, input, sink, None, None)?;
         // No temp/dest paths — caller manages the file lifecycle
         Ok(ManagedDownloadHandle::new_unmanaged(inner))
     }
@@ -203,6 +240,7 @@ impl Download {
         input: DownloadInput,
         sink: Box<dyn sink::SinkWrite>,
         parent_id: Option<u64>,
+        listed: Option<ListedObject>,
     ) -> Result<DownloadHandleInner, error::Error> {
         use crate::transfer::TransferContext;
 
@@ -229,7 +267,8 @@ impl Download {
                 .chain([AwsSdkFeature::S3FilePath]),
         );
         let ctx = ctx.with_features(features);
-        let transfer = DownloadTransfer::new(ctx.clone(), bucket_type, input, writer);
+        let transfer =
+            DownloadTransfer::new_listed(ctx.clone(), bucket_type, input, writer, listed);
         handle
             .scheduler
             .enqueue_transfer(Box::new(transfer.clone()));
@@ -287,8 +326,9 @@ mod tests {
     async fn part_number_download_to_sink_is_invalid_input() {
         let file = tempfile::tempfile().unwrap();
         let sink = FileSinkFactory.create(file, true).unwrap();
-        let err = Download::orchestrate_with_sink(mock_handle(), part_number_input(), sink, None)
-            .expect_err("a part-number download is rejected");
+        let err =
+            Download::orchestrate_with_sink(mock_handle(), part_number_input(), sink, None, None)
+                .expect_err("a part-number download is rejected");
         assert_eq!(err.kind(), &ErrorKind::InputInvalid);
     }
 

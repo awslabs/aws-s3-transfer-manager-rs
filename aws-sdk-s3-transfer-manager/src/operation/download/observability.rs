@@ -594,6 +594,7 @@ fn emit_terminal_lifecycle(report: &DownloadTerminalReport, outcome: DownloadTer
         expected_bytes = report.metrics.total_bytes,
         network_rx = report.metrics.network_rx,
         disk_write = report.metrics.disk_write,
+        checksum_validation = ?report.checksum_validation,
         "download transfer terminal",
     );
 }

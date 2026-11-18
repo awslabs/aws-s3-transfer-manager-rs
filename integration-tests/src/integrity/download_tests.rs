@@ -56,8 +56,8 @@ download_cases! {
                 corrupt_retry(later): [stream],
             }
         }
-        // The automatic part size: discovery fetches range 0, discards it, and realigns with a
-        // `partNumber=1` request. Faults stay off range 0, which is fetched twice.
+        // HEAD resolves the object metadata. A `partNumber=1` GET supplies the first body
+        // and the stored part size used for later ranges.
         download auto_part_size {
             options: Download::new();
             expect validated { [stream], truncate(later): [stream] }
@@ -82,7 +82,6 @@ download_cases! {
         download default {
             options: Download::new();
             // ref: RUST-1758
-            ignore: "not validated against the full-object checksum";
             expect validated {
                 [stream, path, file],
                 truncate(first): [stream],
@@ -99,7 +98,6 @@ download_cases! {
             options: Download::new().part_size(8 * MIB);
             hold: first_range;
             // ref: RUST-1758
-            ignore: "not validated against the full-object checksum";
             expect validated { [stream] }
             expect integrity_error { corrupt(later): [path] }
         }
@@ -107,7 +105,6 @@ download_cases! {
         download odd_part_size {
             options: Download::new().part_size(7 * MIB);
             // ref: RUST-1758
-            ignore: "not validated against the full-object checksum";
             expect validated { [path] }
             expect integrity_error { corrupt(later): [stream] }
         }
@@ -136,7 +133,6 @@ download_cases! {
             options: Download::new().part_size(5 * MIB).concurrency(2);
             hold: first_range;
             // ref: RUST-1758
-            ignore: "not validated against the full-object checksum";
             expect validated { [path] }
         }
     }
@@ -152,7 +148,6 @@ download_cases! {
         download default {
             options: Download::new();
             // ref: RUST-1758
-            ignore: "not validated against the full-object checksum";
             expect validated { [path, file] }
             expect integrity_error { corrupt(later): [path, file] }
         }
@@ -199,7 +194,6 @@ download_cases! {
         download default {
             options: Download::new();
             // ref: RUST-1758
-            ignore: "not validated against the full-object checksum";
             expect validated { [stream, path] }
         }
     }
@@ -216,5 +210,79 @@ download_cases! {
             options: Download::new();
             expect not_validated(Unavailable) { [stream, path] }
         }
+    }
+}
+
+/// HEAD-first discovery must retain the documented request costs and validation
+/// outcomes. COMPOSITE discovery keeps the layout response as the first body;
+/// caller ranges and validation-off downloads keep GET-first discovery.
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_request_counts_and_verdicts() {
+    use super::test_util::{table_case, vocab::CaseTarget};
+    use s3_mock_server::Operation::{GetObject, HeadObject};
+
+    for (suffix, expected_requests) in [
+        (
+            "download_tests::single_put::crc32::default::validated::stream",
+            &[HeadObject, GetObject][..],
+        ),
+        (
+            "algorithm_tests::full_object_mpu_small::extended::crc32::validated::stream",
+            &[HeadObject, GetObject][..],
+        ),
+        (
+            "download_tests::full_object_mpu::crc64nvme::default::validated::stream",
+            &[HeadObject, GetObject, GetObject, GetObject][..],
+        ),
+        (
+            "algorithm_tests::single_put_split::extended::crc32::validated::stream",
+            &[HeadObject, GetObject, GetObject][..],
+        ),
+        (
+            "algorithm_tests::single_put_split::extended::sha256::not_validated::stream",
+            &[HeadObject, GetObject, GetObject][..],
+        ),
+        (
+            "download_tests::composite_mpu::crc32::auto_part_size::validated::stream",
+            &[HeadObject, GetObject, GetObject, GetObject][..],
+        ),
+        (
+            "algorithm_tests::composite_realigned::extended::crc32::validated::stream",
+            &[HeadObject, GetObject, GetObject, GetObject][..],
+        ),
+        (
+            "download_tests::composite_mpu::crc32::aligned::validated::stream",
+            &[HeadObject, GetObject, GetObject, GetObject][..],
+        ),
+        (
+            "download_tests::empty_crc::crc64nvme::default::validated::stream",
+            &[HeadObject][..],
+        ),
+        (
+            "algorithm_tests::stored_without_checksum::extended::none::not_validated::stream",
+            &[HeadObject, GetObject, GetObject, GetObject][..],
+        ),
+        (
+            "download_tests::full_object_mpu::crc32::caller_range::not_validated::stream",
+            &[GetObject, GetObject][..],
+        ),
+        (
+            "download_tests::single_put::crc32::validation_off::not_validated::stream",
+            &[GetObject][..],
+        ),
+    ] {
+        let case = table_case(suffix);
+        let execution = case.execute(CaseTarget::MockGp).await;
+        case.check(&execution)
+            .unwrap_or_else(|error| panic!("{suffix}: {error}"));
+        let requests: Vec<_> = execution
+            .requests
+            .as_ref()
+            .expect("mock journal")
+            .iter()
+            .filter(|request| request.key.as_deref() == Some(execution.key.as_str()))
+            .map(|request| request.operation)
+            .collect();
+        assert_eq!(requests, expected_requests, "{suffix}");
     }
 }

@@ -15,22 +15,17 @@
 //! algorithm via `ChecksumStrategy` and the SDK computes the checksum while
 //! streaming. S3 verifies on receipt and stores the value.
 //!
-//! Download: the transfer manager downloads with ranged GETs. Validation of the
-//! delivered bytes is performed by the SDK's response body validator when a
-//! stored checksum covers exactly the bytes returned. A mismatch surfaces as an
-//! error from the body stream, which the transfer manager propagates as an `Err`
-//! from `join()`. A successful download therefore never carries unvalidated-but-
-//! corrupt bytes that a stored checksum could have caught.
+//! Download: the SDK validates checksums covering individual response bodies.
+//! The transfer manager also hashes accepted ranges and combines their CRCs to
+//! verify a stored full-object checksum before destination finalization. Mismatches
+//! are reported by `join()`; streamed bytes may arrive before the final check.
 //!
 //! `DownloadOutput::integrity_checks()` reports two things:
-//!   * the object's checksum value members and type, surfaced only when the whole
-//!     object is covered by a single returned checksum (single-part objects); for
-//!     a larger multipart object the discovery chunk carries only part 1's
-//!     checksum, which is not the object checksum and is not surfaced. A
-//!     composite value is never surfaced, even when the object fits in one chunk.
-//!     `DownloadOutput::object_meta` copies the discovery response's checksum
-//!     values and type, except that it clears composite values and values from a
-//!     part GET of a multipart object.
+//!   * the object's stored checksum values and type from checksum-mode HEAD for
+//!     validated whole-object downloads. Part metadata cannot replace them. A
+//!     composite value is never surfaced, only its type.
+//!     `DownloadOutput::object_meta` carries the same values, except that it
+//!     clears composite values and values from a response for part of the object.
 //!   * `ChecksumValidation`: `Validated{algorithm}` when the whole object was
 //!     validated, else `NotValidated{reason}`.
 //!
@@ -59,14 +54,14 @@
 //! ## Positive: a good download round-trips and reports an honest verdict
 //!
 //! | Object                       | Request mode | Client validation | Verdict asserted                                       | Backend     |
-//! |------------------------------|--------------|-------------------|--------------------------------------------------------|-------------|
+//! | ---------------------------- | ------------ | ----------------- | ------------------------------------------------------ | ----------- |
 //! | single-part                  | unset        | WhenSupported     | Validated{Crc32}                                       | mock + real |
 //! | single-part                  | unset        | WhenRequired      | NotValidated{Disabled}                                 | mock        |
 //! | single-part                  | ENABLED      | default           | object value surfaced; Validated{Crc32}                | mock + real |
-//! | multipart full-obj (GP)      | ENABLED      | default           | object value is NOT a part checksum; Unavailable       | mock + real |
-//! | multipart full-obj (Express) | ENABLED      | default           | object value is NOT a part checksum; Validated{Crc32}  | real        |
-//! | multipart composite          | ENABLED      | default           | object value is NOT a part checksum; Validated{Sha256} | mock + real |
-//! | multipart (Auto sz)          | ENABLED      | default           | round-trip (ranges auto-aligned)                       | mock + real |
+//! | multipart full-obj (GP)      | ENABLED      | default           | HEAD's object value, not a part's; Validated{Crc32}    | mock + real |
+//! | multipart full-obj (Express) | ENABLED      | default           | HEAD's object value, not a part's; Validated{Crc32}    | real        |
+//! | multipart composite          | ENABLED      | default           | COMPOSITE type, no value; Validated{Sha256}            | mock + real |
+//! | multipart (Auto sz)          | ENABLED      | default           | round-trip using configured ranges                     | mock + real |
 //! | composite MPU (Auto sz)      | ENABLED      | default           | Validated{Crc32}                                       | mock        |
 //! | single-part (file)           | ENABLED      | default           | round-trip on disk; Validated{Crc32}                   | mock + real |
 //! | composite MPU value          | ENABLED      | default           | object value == composite_checksum                     | real        |
@@ -79,33 +74,21 @@
 //! | single-part (file)  | ENABLED      | CorruptBody         | IntegrityError; temp cleaned, dest absent |
 //! | multipart (matched) | ENABLED      | WrongStoredChecksum | IntegrityError (explicit matched size)  |
 //! | multipart (Auto sz) | ENABLED      | WrongStoredChecksum | IntegrityError (auto-aligned, caught)   |
-//! | single-PUT split    | ENABLED      | CorruptBody         | #[ignore] intent: must IntegrityError — FAILS today (TODO) |
+//! | single-PUT split    | ENABLED      | CorruptBody         | IntegrityError |
 //!
 //! Tamper tests assert the specific `ErrorKind::IntegrityError` (the kind a
 //! checksum mismatch surfaces as), not merely `is_err()`, so an unrelated
 //! failure cannot pass them.
 //!
-//! When validating a multipart object with an Auto part size, the TM discovers
-//! the stored part size (a partNumber=1 GET reports part 1's exact length) and
-//! slices download ranges to it, so every range aligns to a stored part boundary
-//! (including the ragged tail). A download of a composite upload then validates
-//! every part. A full-object upload validates only in a directory bucket, which
-//! returns each part's checksum; a general purpose bucket returns none, so the
-//! download reads `NotValidated { reason: Unavailable }`. An explicit user part
-//! size is respected as-is (no auto-align), so a composite upload validates only
-//! when the user's part size matches the uploaded one.
+//! For COMPOSITE objects with automatic part sizing, a partNumber=1 GET discovers
+//! the stored part size. Aligned ranges carry part checksums that the SDK validates.
+//! An explicit download part size is respected, so misaligned ranges can lack those
+//! checksums. FULL_OBJECT CRCs use configured ranges and local combination, including
+//! general purpose buckets whose ranges carry no checksum.
 //!
-//! One `#[ignore]`d intent test states the remaining deferred goal (gated on wire
-//! checksum): `single_put_split_tamper_caught_mock_gp` — a large single-PUT
-//! object split into ranged GETs has no per-range checksum, so validating it needs
-//! a TM-computed whole-object hash. It verifiably FAILS today and is the executable
-//! statement of that goal.
-//!
-//! Algorithm is a pass-through axis for the transfer manager (it forwards the
-//! choice and reads back whatever S3 returns), so per-algorithm value
-//! correctness is covered at the unit and mock-server layers, not multiplied
-//! through this matrix. Representative algorithms are used: CRC32 for full
-//! object, SHA-256 for the composite case.
+//! `algorithm_tests` crosses object shapes with every supported upload algorithm;
+//! `download_tests` covers faults, destinations and download options. CRC calculation
+//! and combination are checked independently against direct SDK hashing.
 
 mod algorithm_tests;
 mod bulk_tests;
@@ -333,15 +316,28 @@ async fn multipart_full_object(target: Target) {
         .await
         .expect("download");
     assert_same_content(&data, &bytes);
-    // A part's checksum must not be surfaced as the object's checksum.
-    assert!(
-        output.integrity_checks().checksum_crc32().is_none(),
-        "must not surface a part checksum as the object checksum"
+    let stored = t
+        .s3_client()
+        .await
+        .head_object()
+        .bucket(t.bucket())
+        .key(t.key("obj"))
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await
+        .expect("stored object checksum");
+    assert!(stored.checksum_crc32().is_some());
+    assert_eq!(
+        output.integrity_checks().checksum_crc32(),
+        stored.checksum_crc32()
     );
-    assert!(
-        output.object_meta.checksum_crc32.is_none(),
-        "object metadata must not carry a part checksum as the object's"
+    assert_eq!(
+        output.object_meta.checksum_crc32.as_deref(),
+        stored.checksum_crc32(),
+        "object metadata must carry HEAD's object checksum, not a part's"
     );
+
+    assert_validated(&output, ChecksumAlgorithm::Crc32);
 
     // S3 returns the checksum of a part of a FULL_OBJECT multipart object only in directory
     // buckets; a general purpose bucket returns none.
@@ -352,7 +348,6 @@ async fn multipart_full_object(target: Target) {
                 part.checksum_crc32().is_none(),
                 "a general purpose bucket returns no checksum for a part of a FULL_OBJECT object"
             );
-            assert_not_validated(&output, NotValidatedReason::Unavailable);
         }
         BucketKind::Express => {
             assert!(
@@ -363,7 +358,6 @@ async fn multipart_full_object(target: Target) {
                 part.checksum_type(),
                 Some(&aws_sdk_s3::types::ChecksumType::FullObject)
             );
-            assert_validated(&output, ChecksumAlgorithm::Crc32);
         }
     }
 
@@ -402,9 +396,31 @@ async fn multipart_composite(target: Target) {
         .await
         .expect("download");
     assert_same_content(&data, &bytes);
-    assert!(
-        output.integrity_checks().checksum_sha256().is_none(),
-        "must not surface a part checksum as the object checksum"
+    let stored = t
+        .s3_client()
+        .await
+        .head_object()
+        .bucket(t.bucket())
+        .key(t.key("obj"))
+        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+        .send()
+        .await
+        .expect("stored object checksum");
+    // A COMPOSITE value is a checksum of part checksums, so only the type is reported.
+    assert!(stored.checksum_sha256().is_some());
+    assert_eq!(
+        stored.checksum_type(),
+        Some(&aws_sdk_s3::types::ChecksumType::Composite)
+    );
+    assert_eq!(output.integrity_checks().checksum_sha256(), None);
+    assert_eq!(
+        output.integrity_checks().checksum_type(),
+        Some(&aws_sdk_s3_transfer_manager::types::ChecksumType::Composite)
+    );
+    assert_eq!(output.object_meta.checksum_sha256, None);
+    assert_eq!(
+        output.object_meta.checksum_type,
+        Some(aws_sdk_s3_transfer_manager::types::ChecksumType::Composite)
     );
     assert_validated(&output, ChecksumAlgorithm::Sha256);
 
@@ -711,7 +727,15 @@ async fn file_download_round_trips_real_express() {
 
 /// Number of aligned parts for the multi-chunk file tests. 64 * 5 MiB = 320 MiB,
 /// enough to coalesce and flush across dozens of slots.
-const MANY_PARTS: usize = 64;
+///
+/// On 32-bit targets, 16 parts (80 MiB). The in-memory mock holds an upload's parts
+/// and then one contiguous copy of the object, which a 32-bit address space shared
+/// with the other tests can't reliably provide at 320 MiB.
+const MANY_PARTS: usize = if cfg!(target_pointer_width = "32") {
+    16
+} else {
+    64
+};
 
 fn many_part_len() -> usize {
     MANY_PARTS * ByteSize::mib(5).as_usize()
@@ -926,18 +950,10 @@ async fn tampered_multipart_errors_mock_gp() {
     tampered_multipart_errors(Target::mock_gp()).await;
 }
 
-// multipart download is aligned to the stored part size by default ---------------
-//
-// S3 returns a per-part checksum for a ranged GET only when the range matches a
-// stored part boundary. The TM downloads with ranged
-// GETs and, when validating a multipart object with an Auto part size, discovers
-// the stored part size (via a partNumber=1 GET) and slices download ranges to it
-// so every chunk aligns to a stored boundary (including the ragged tail). These
-// tests pin that aligned-by-default behavior.
+// multipart downloads with the default part size --------------------------------
 
-/// Default part size (Auto): a non-tampered multipart download round-trips. The
-/// TM aligns ranges to the stored part size; `multipart_full_object` asserts the
-/// verdict for this full-object upload.
+/// A full-object CRC upload round-trips with the configured download ranges.
+/// `multipart_full_object` also asserts the stored values and validation verdict.
 async fn multipart_aligned_round_trips(target: Target) {
     let t = target.connect().await;
     let data = multipart_data();
@@ -1032,26 +1048,13 @@ async fn multipart_default_tamper_caught_mock_gp() {
 }
 
 // large single-PUT object split for throughput ---------------------------------
-//
-// An object uploaded as a SINGLE PUT (below the multipart-upload threshold) but
-// larger than the download part size is split into parallel ranged GETs for
-// throughput. The split already happens today (the slicer cuts by byte range,
-// not by stored part count). S3 stores ONE full-object checksum and returns NO
-// checksum for any sub-range of a single-stored-part object, so the SDK cannot
-// validate the split chunks. Closing this needs the transfer manager to compute
-// a whole-object checksum over the delivered bytes itself (HeadObject for the
-// expected value + an ordered hash at the slot-buffer consume point), or a wire
-// checksum from S3 over arbitrary response bytes.
 
-/// INTENT (not yet implemented): a tampered chunk of a split single-PUT download
-/// MUST fail the download. Ignored until the transfer manager validates this path
-/// itself; it currently succeeds (the chunks carry no checksum), so this FAILS
-/// today. The test states the desired behavior; the ignore reason states why it
-/// is not running yet.
+/// A corrupted range of a split single-PUT download fails against the stored CRC,
+/// even though its individual responses carry no checksum for SDK validation.
 #[tokio::test]
-#[ignore = "TODO(vnext): wire checksums, or TM-computed whole-object checksum over the slot-buffer bytes, to validate split single-PUT downloads"]
+// ref: RUST-1758
 async fn single_put_split_tamper_caught_mock_gp() {
-    let t = Target::mock_gp().connect().await; // default part sizes; 12 MiB -> 3 ranged GETs
+    let t = Target::mock_gp().connect().await; // default part sizes
     let data = large_single_put();
     t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
         .await;

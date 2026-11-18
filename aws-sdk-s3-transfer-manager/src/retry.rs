@@ -297,12 +297,9 @@ pub(crate) fn classify_upload_part_retry(ge: &GuardError<Error>) -> RetryDecisio
 /// Whether a transfer error is an S3 throttle (a service error whose code denotes
 /// throttling).
 ///
-/// Matches on service error code only: the flattened [`Error`] carries the parsed
-/// code but not the raw HTTP status. A throttle that arrives as an HTTP status
-/// (429 or 503) without a recognized throttle code (e.g. some `HeadObject` 503
-/// responses) is not classified as a throttle here and falls through to the SDK's
-/// inner retry only. The set mirrors the scheduler's throttle classifier
-/// (`scheduler::concurrency`).
+/// Matches on service error code. The set mirrors the scheduler's throttle
+/// classifier (`scheduler::concurrency`). [`classify_discovery_retry`] also
+/// recognizes bodyless HEAD errors by HTTP status.
 fn is_throttle(e: &Error) -> bool {
     matches!(
         e.code(),
@@ -321,13 +318,21 @@ fn is_throttle(e: &Error) -> bool {
 /// Discovery is a single send (GetObject, HeadObject, or GetObject with
 /// partNumber) with no body read and no latency deadline. Retries a throttle
 /// with the hard throttle backoff and a transient transport error with the fast
-/// backoff. Everything else (including `InvalidRange`, `NotFound`, and other
-/// modeled service errors) is terminal.
+/// backoff. A HEAD response with HTTP 429 or 503 also uses throttle backoff:
+/// HEAD carries no error body from which the SDK could parse a throttle code.
+/// Everything else (including `InvalidRange`, `NotFound`, and precondition
+/// failures) is terminal.
 pub(crate) fn classify_discovery_retry(ge: &GuardError<Error>) -> RetryDecision {
     match ge {
         GuardError::DeadlineExceeded(_) => RetryDecision::NoRetry,
         GuardError::Inner(e) if e.is_transient_transport() => RetryDecision::Retry,
-        GuardError::Inner(e) if is_throttle(e) => RetryDecision::RetryThrottle,
+        GuardError::Inner(e)
+            if is_throttle(e)
+                || (e.operation_name() == Some("HeadObject")
+                    && matches!(e.http_status(), Some(429 | 503))) =>
+        {
+            RetryDecision::RetryThrottle
+        }
         GuardError::Inner(_) => RetryDecision::NoRetry,
     }
 }
@@ -851,6 +856,52 @@ mod tests {
         let err = Error::test_service_error("AccessDenied");
         assert_eq!(
             classify_body_retry(&GuardError::Inner(err)),
+            RetryDecision::NoRetry
+        );
+    }
+
+    #[test]
+    fn discovery_head_retry_uses_status_without_an_error_body() {
+        use aws_sdk_s3::operation::head_object::HeadObjectError;
+        use aws_smithy_runtime_api::{
+            client::orchestrator::HttpResponse, client::result::SdkError, http::StatusCode,
+        };
+        use aws_smithy_types::{body::SdkBody, error::ErrorMetadata};
+
+        for status in [429, 503, 400, 403, 404, 412, 500] {
+            let sdk = SdkError::service_error(
+                HeadObjectError::generic(ErrorMetadata::builder().build()),
+                HttpResponse::new(StatusCode::try_from(status).unwrap(), SdkBody::empty()),
+            );
+            let error = crate::error::service_error(sdk);
+            assert_eq!(error.code(), None);
+            assert_eq!(error.http_status(), Some(status));
+            assert_eq!(
+                classify_discovery_retry(&GuardError::Inner(error)),
+                if matches!(status, 429 | 503) {
+                    RetryDecision::RetryThrottle
+                } else {
+                    RetryDecision::NoRetry
+                },
+                "HEAD status {status}",
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_get_retry_does_not_treat_a_codeless_status_as_a_head_error() {
+        use aws_sdk_s3::operation::get_object::GetObjectError;
+        use aws_smithy_runtime_api::{
+            client::orchestrator::HttpResponse, client::result::SdkError, http::StatusCode,
+        };
+        use aws_smithy_types::{body::SdkBody, error::ErrorMetadata};
+
+        let sdk = SdkError::service_error(
+            GetObjectError::generic(ErrorMetadata::builder().build()),
+            HttpResponse::new(StatusCode::try_from(503).unwrap(), SdkBody::empty()),
+        );
+        assert_eq!(
+            classify_discovery_retry(&GuardError::Inner(crate::error::service_error(sdk))),
             RetryDecision::NoRetry
         );
     }

@@ -12,18 +12,10 @@
 //! check can't fail first. Where the condition can't be produced by a download, the test changes
 //! the recorded execution instead.
 
-use super::table_cases;
-use super::test_util::runner::Execution;
+use super::test_util::runner::{Execution, HOLD_DEADLINE};
+use super::test_util::table_case;
 use super::test_util::vocab::*;
 use s3_mock_server::FaultType;
-
-/// The case in the tables whose path ends with `suffix`.
-fn table_case(suffix: &str) -> &'static Case {
-    table_cases()
-        .into_iter()
-        .find(|c| c.path.ends_with(suffix))
-        .unwrap_or_else(|| panic!("no case ends with {suffix}"))
-}
 
 /// Executes the table case whose path ends with `suffix` on `mock_gp`.
 async fn execute(suffix: &str) -> (&'static Case, Execution) {
@@ -63,6 +55,8 @@ const PER_PART: &str = "download_tests::composite_mpu::crc32::aligned::validated
 const PER_PART_TRUNCATED: &str =
     "download_tests::composite_mpu::crc32::aligned::validated::truncate::later::stream";
 const HELD: &str = "download_tests::composite_mpu::crc32::out_of_order::validated::stream";
+const HELD_CORRUPT: &str =
+    "download_tests::composite_mpu::crc32::out_of_order::integrity_error::corrupt::later::path";
 const PER_PART_CORRUPT: &str =
     "download_tests::composite_mpu::crc32::aligned::integrity_error::corrupt::later::path";
 
@@ -364,6 +358,62 @@ async fn hold_requires_the_held_body_to_end_last() {
     );
 }
 
+/// A held `integrity_error` case passes when the download failed before the GET covering byte 0
+/// reached the mock: the corrupted GET was still sent while the first range was outstanding.
+#[tokio::test(flavor = "multi_thread")]
+async fn held_integrity_error_passes_without_the_first_range_get() {
+    let (case, mut run) = execute(HELD_CORRUPT).await;
+    check_journal(case, &run).expect("the held case passes as executed");
+    let requests = run.requests.as_mut().expect("a mock execution");
+    requests.retain(|r| !matches!(r.fault, Some(FaultType::HoldBody { .. })));
+    check_journal(case, &run).expect("the case passes without the held GET");
+}
+
+/// A held `integrity_error` case fails when the held body ended before the corrupted GET's.
+#[tokio::test(flavor = "multi_thread")]
+async fn held_integrity_error_requires_the_corrupted_get_first() {
+    let (case, mut run) = execute(HELD_CORRUPT).await;
+    let requests = run.requests.as_mut().expect("a mock execution");
+    // Make the held body the second-to-last to end and the corrupted body the last, whatever
+    // order the run produced; the corrupted body can be the first to end.
+    let last = requests
+        .iter()
+        .filter_map(|r| r.body.map(|b| b.order))
+        .max()
+        .expect("a body ended");
+    let corrupted = requests
+        .iter()
+        .position(|r| matches!(r.fault, Some(FaultType::CorruptByte { .. })))
+        .expect("a corrupted GET");
+    let mut corrupted_body = requests[corrupted].body.expect("the corrupted body ended");
+    corrupted_body.order = last + 2;
+    requests[corrupted].body = Some(corrupted_body);
+    let mut held = requests
+        .iter()
+        .find(|r| matches!(r.fault, Some(FaultType::HoldBody { .. })))
+        .cloned()
+        .unwrap_or_else(|| {
+            // The run can fail before the held GET reaches the mock; stand one in.
+            let mut held = requests[corrupted].clone();
+            held.fault = Some(FaultType::HoldBody {
+                others: 0,
+                deadline: HOLD_DEADLINE,
+            });
+            held.flipped = None;
+            held.hold = None;
+            held
+        });
+    let mut body = held.body.unwrap_or(corrupted_body);
+    body.order = last + 1;
+    held.body = Some(body);
+    requests.retain(|r| !matches!(r.fault, Some(FaultType::HoldBody { .. })));
+    requests.push(held);
+    assert_fails(
+        check_journal(case, &run),
+        "the corrupted GET must be sent while the held body is held",
+    );
+}
+
 /// `via: per_part` fails a download whose GET carried the object's checksum, not a part's.
 #[tokio::test(flavor = "multi_thread")]
 async fn per_part_requires_part_checksums() {
@@ -386,7 +436,13 @@ async fn whole_response_requires_the_object_checksum() {
 /// `via: full_object` fails a download that sent no HeadObject reporting a full-object checksum.
 #[tokio::test(flavor = "multi_thread")]
 async fn full_object_requires_a_head_object() {
-    let (case, run) = execute(INTACT).await;
+    let (case, mut run) = execute(INTACT).await;
+    case.check(&run)
+        .expect("intact execution must satisfy its original case");
+    run.requests
+        .as_mut()
+        .expect("mock journal")
+        .retain(|request| request.operation != s3_mock_server::Operation::HeadObject);
     let case = changed(case, |c| c.mechanism = Mechanism::FullObject);
     assert_fails(check_journal(&case, &run), "no HeadObject reported");
 }
@@ -410,4 +466,20 @@ fn fault_positions_resolve_to_object_bytes() {
         table_case("download_tests::full_object_mpu::crc32::odd_part_size::validated::path");
     assert_eq!(explicit.byte(At::Later), 7 * MIB);
     assert_eq!(explicit.ranges(), 3);
+}
+
+/// A later GET of the same range cannot excuse an earlier fully sent response
+/// that lacked a part checksum.
+#[tokio::test(flavor = "multi_thread")]
+async fn per_part_checks_every_fully_sent_response() {
+    let (case, mut run) = execute(PER_PART).await;
+    let requests = run.requests.as_mut().expect("mock journal");
+    let first = requests
+        .iter()
+        .position(|request| request.operation == s3_mock_server::Operation::GetObject)
+        .expect("first GET");
+    let mut unchecked = requests[first].clone();
+    unchecked.checksum = None;
+    requests.insert(first, unchecked);
+    assert_fails(check_journal(case, &run), "without a part checksum");
 }
