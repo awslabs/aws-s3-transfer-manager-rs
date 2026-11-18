@@ -64,7 +64,9 @@ impl ChecksumStrategy {
     /// whole object in the strategy's algorithm.
     ///
     /// S3 rejects the upload unless the object matches `value`. The transfer manager sends `value`
-    /// as given and does not check it.
+    /// as given and does not check it. A single-request upload sends it in place of a checksum
+    /// calculated from the body; a multipart upload still calculates each part's checksum and
+    /// sends `value` with `CompleteMultipartUpload`.
     ///
     /// A composite strategy with an expected value is valid only for a single-request upload.
     /// `initiate` fails with [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid),
@@ -115,9 +117,17 @@ impl Default for ChecksumStrategy {
 }
 
 fn unsupported(algorithm: &ChecksumAlgorithm) -> Error {
-    invalid_input(format!(
-        "the transfer manager cannot calculate `{algorithm}` checksums"
-    ))
+    if ChecksumAlgorithm::values().contains(&algorithm.as_str()) {
+        invalid_input(format!(
+            "the transfer manager cannot calculate `{algorithm}` checksums"
+        ))
+    } else {
+        // `ChecksumAlgorithm::from` matches exact names, so `"crc32"` arrives here as unknown.
+        invalid_input(format!(
+            "unknown checksum algorithm `{algorithm}`; supported algorithms are `CRC64NVME`, \
+             `CRC32`, `CRC32C`, `SHA1` and `SHA256`"
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -125,7 +135,8 @@ mod tests {
     use super::*;
     use crate::error::ErrorKind;
 
-    const UNSUPPORTED: [&str; 6] = ["MD5", "SHA512", "XXHASH64", "XXHASH3", "XXHASH128", "NEW"];
+    const UNSUPPORTED: [&str; 5] = ["MD5", "SHA512", "XXHASH64", "XXHASH3", "XXHASH128"];
+    const UNKNOWN: [&str; 2] = ["NEW", "crc32"];
 
     fn assert_input_invalid(result: Result<ChecksumStrategy, Error>, message: &str) {
         let error = result.expect_err("the algorithm must be rejected");
@@ -205,6 +216,24 @@ mod tests {
     fn both_constructors_reject_algorithms_the_transfer_manager_cannot_calculate() {
         for name in UNSUPPORTED {
             let message = format!("the transfer manager cannot calculate `{name}` checksums");
+            assert_input_invalid(
+                ChecksumStrategy::full_object(ChecksumAlgorithm::from(name)),
+                &message,
+            );
+            assert_input_invalid(
+                ChecksumStrategy::composite(ChecksumAlgorithm::from(name)),
+                &message,
+            );
+        }
+    }
+
+    #[test]
+    fn both_constructors_reject_unknown_algorithm_names() {
+        for name in UNKNOWN {
+            let message = format!(
+                "unknown checksum algorithm `{name}`; supported algorithms are `CRC64NVME`, \
+                 `CRC32`, `CRC32C`, `SHA1` and `SHA256`"
+            );
             assert_input_invalid(
                 ChecksumStrategy::full_object(ChecksumAlgorithm::from(name)),
                 &message,

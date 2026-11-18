@@ -1185,31 +1185,35 @@ async fn test_put_object_content_md5_is_sent() {
     assert_eq!(put_object.num_calls(), 1);
 }
 
-#[tokio::test]
-async fn test_put_object_composite_expected_value_is_sent() {
-    // A single-request upload's checksum is a full object checksum, so a composite strategy's
-    // expected value is sent in its algorithm's PutObject header in place of a calculated one.
+/// Asserts that a single-request upload with a composite `algorithm` strategy and an expected
+/// value sends that value in the algorithm's PutObject header, in place of a calculated one: a
+/// single-request upload's checksum is a full object checksum.
+async fn assert_put_object_sends_composite_expected_value(algorithm: ChecksumAlgorithm) {
     let body = Bytes::from("abcdefghijklm".as_bytes());
-    let expected_value = calculate_checksum(&ChecksumAlgorithm::Sha256, &body);
+    let expected_value = calculate_checksum(&algorithm, &body);
 
     let put_object = mock!(aws_sdk_s3::Client::put_object)
         .match_requests({
-            let expected_value = expected_value.clone();
+            let (algorithm, expected_value) = (algorithm.clone(), expected_value.clone());
             move |input| {
                 input.checksum_algorithm().is_none()
                     && get_checksum_value!(input)
-                        == Some((ChecksumAlgorithm::Sha256, expected_value.clone()))
+                        == Some((algorithm.clone(), expected_value.clone()))
             }
         })
         .then_output({
-            let etag = calculate_etag(&body);
+            let (algorithm, etag) = (algorithm.clone(), calculate_etag(&body));
             let expected_value = expected_value.clone();
             move || {
-                PutObjectOutput::builder()
+                let output = PutObjectOutput::builder()
                     .e_tag(&etag)
-                    .checksum_sha256(&expected_value)
-                    .checksum_type(aws_sdk_s3::types::ChecksumType::FullObject)
-                    .build()
+                    .checksum_type(aws_sdk_s3::types::ChecksumType::FullObject);
+                match &algorithm {
+                    ChecksumAlgorithm::Sha1 => output.checksum_sha1(&expected_value),
+                    ChecksumAlgorithm::Sha256 => output.checksum_sha256(&expected_value),
+                    other => unreachable!("not a SHA algorithm: {other}"),
+                }
+                .build()
             }
         });
     let tm = helper_create_transfer_manager(
@@ -1221,7 +1225,7 @@ async fn test_put_object_composite_expected_value_is_sent() {
         .bucket("test-bucket")
         .key("test-key")
         .checksum_strategy(
-            ChecksumStrategy::composite(ChecksumAlgorithm::Sha256)
+            ChecksumStrategy::composite(algorithm.clone())
                 .unwrap()
                 .with_expected_value(&expected_value),
         )
@@ -1233,7 +1237,21 @@ async fn test_put_object_composite_expected_value_is_sent() {
         .expect("a single-request upload sends a composite strategy's expected value");
 
     assert_eq!(put_object.num_calls(), 1);
-    assert_eq!(output.checksum_sha256(), Some(expected_value.as_str()));
+    let stored = match algorithm {
+        ChecksumAlgorithm::Sha1 => output.checksum_sha1(),
+        _ => output.checksum_sha256(),
+    };
+    assert_eq!(stored, Some(expected_value.as_str()));
+}
+
+#[tokio::test]
+async fn test_put_object_composite_expected_value_is_sent() {
+    assert_put_object_sends_composite_expected_value(ChecksumAlgorithm::Sha256).await;
+}
+
+#[tokio::test]
+async fn test_put_object_composite_sha1_expected_value_is_sent() {
+    assert_put_object_sends_composite_expected_value(ChecksumAlgorithm::Sha1).await;
 }
 
 /// A `PartStream` whose size has no upper bound and that yields no parts.
@@ -1256,7 +1274,11 @@ impl PartStream for UnboundedEmptyStream {
 
 /// Asserts that uploading `body`, which is sent as a multipart upload, with a composite strategy
 /// that has an expected value fails at `initiate` with an input error and sends no request.
-fn assert_composite_expected_value_rejected(body: InputStream) {
+fn assert_composite_expected_value_rejected(
+    algorithm: ChecksumAlgorithm,
+    body: InputStream,
+    message: &str,
+) {
     let put_object =
         mock!(aws_sdk_s3::Client::put_object).then_output(|| PutObjectOutput::builder().build());
     let create = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
@@ -1278,7 +1300,7 @@ fn assert_composite_expected_value_rejected(body: InputStream) {
         .bucket("test-bucket")
         .key("test-key")
         .checksum_strategy(
-            ChecksumStrategy::composite(ChecksumAlgorithm::Sha256)
+            ChecksumStrategy::composite(algorithm)
                 .unwrap()
                 .with_expected_value("ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0="),
         )
@@ -1286,23 +1308,36 @@ fn assert_composite_expected_value_rejected(body: InputStream) {
         .initiate()
         .expect_err("a composite expected value on a multipart upload must fail the upload");
 
-    assert_input_invalid(
-        &error,
-        "a composite ChecksumStrategy with an expected value is not supported for multipart uploads",
-    );
+    assert_input_invalid(&error, message);
     assert!(
         rules.iter().all(|rule| rule.num_calls() == 0),
         "no request may be sent"
     );
 }
 
+/// The message for a SHA expected value on a multipart upload: only a single-request upload can
+/// send it.
+const SHA256_MULTIPART: &str = "a `SHA256` expected value can only be sent by a single-request \
+     upload, and this upload is sent as a multipart upload; a single-request upload needs a body \
+     of known size below the multipart threshold that is not a PartStream";
+
 #[tokio::test]
 async fn test_mpu_composite_expected_value_is_rejected_at_threshold() {
-    // An in-memory body one byte over the multipart threshold.
-    assert_composite_expected_value_rejected(InputStream::from(Bytes::from(vec![
-        b'a';
-        PART_SIZE + 1
-    ])));
+    // An in-memory body exactly at the multipart threshold is sent as a multipart upload.
+    assert_composite_expected_value_rejected(
+        ChecksumAlgorithm::Sha256,
+        InputStream::from(Bytes::from(vec![b'a'; PART_SIZE])),
+        SHA256_MULTIPART,
+    );
+}
+
+#[tokio::test]
+async fn test_mpu_composite_expected_value_is_rejected_above_threshold() {
+    assert_composite_expected_value_rejected(
+        ChecksumAlgorithm::Sha256,
+        InputStream::from(Bytes::from(vec![b'a'; PART_SIZE + 1])),
+        SHA256_MULTIPART,
+    );
 }
 
 #[tokio::test]
@@ -1310,13 +1345,31 @@ async fn test_mpu_composite_expected_value_is_rejected_for_part_stream() {
     // A `PartStream` is always sent as a multipart upload, even with an exact size below the
     // multipart threshold.
     let parts = vec![Bytes::from("abcdefghijklm".as_bytes())];
-    assert_composite_expected_value_rejected(InputStream::from_part_stream(TestStream::new(
-        parts, None, false, false,
-    )));
+    assert_composite_expected_value_rejected(
+        ChecksumAlgorithm::Sha256,
+        InputStream::from_part_stream(TestStream::new(parts, None, false, false)),
+        SHA256_MULTIPART,
+    );
 }
 
 #[tokio::test]
 async fn test_mpu_composite_expected_value_is_rejected_without_upper_bound() {
     // Only a `PartStream` can declare a size with no upper bound.
-    assert_composite_expected_value_rejected(InputStream::from_part_stream(UnboundedEmptyStream));
+    assert_composite_expected_value_rejected(
+        ChecksumAlgorithm::Sha256,
+        InputStream::from_part_stream(UnboundedEmptyStream),
+        SHA256_MULTIPART,
+    );
+}
+
+#[tokio::test]
+async fn test_mpu_composite_crc_expected_value_suggests_full_object() {
+    // A CRC32 or CRC32C expected value can be sent by a multipart upload with a full object
+    // strategy, so the error says so.
+    assert_composite_expected_value_rejected(
+        ChecksumAlgorithm::Crc32,
+        InputStream::from(Bytes::from(vec![b'a'; PART_SIZE + 1])),
+        "a composite `CRC32` ChecksumStrategy's expected value cannot be sent by a multipart \
+         upload; use `ChecksumStrategy::full_object` with the same expected value",
+    );
 }

@@ -13,7 +13,7 @@ use smallvec::SmallVec;
 
 use crate::io::part_reader::{NextPartFuture, PartReader};
 use crate::io::{InputStream, PartData, SizeHint};
-use crate::model::ChecksumType;
+use crate::model::{ChecksumAlgorithm, ChecksumType};
 #[cfg(test)]
 use crate::operation::upload::observability::MultipartTransferSummary;
 use crate::operation::upload::observability::{
@@ -307,7 +307,7 @@ pub(crate) enum UploadChecksumViolation {
     /// The request's `ChecksumStrategy` is composite, carries an expected value, and is sent as a
     /// multipart upload. The value covers the whole object, and no composite multipart request
     /// carries it.
-    CompositeExpectedValueWithMultipart,
+    CompositeExpectedValueWithMultipart { algorithm: ChecksumAlgorithm },
     /// A part carries a checksum, but the upload has no `ChecksumStrategy` to name its algorithm.
     PartChecksumWithoutStrategy { part_number: u64 },
 }
@@ -321,12 +321,20 @@ impl fmt::Display for UploadChecksumViolation {
                  ChecksumStrategy to verify the upload, or keep the object below the multipart \
                  threshold"
             ),
-            Self::CompositeExpectedValueWithMultipart => write!(
-                formatter,
-                "a composite ChecksumStrategy with an expected value is not supported for \
-                 multipart uploads; use a full object ChecksumStrategy, or keep the object below \
-                 the multipart threshold"
-            ),
+            Self::CompositeExpectedValueWithMultipart { algorithm } => match algorithm {
+                ChecksumAlgorithm::Crc32 | ChecksumAlgorithm::Crc32C => write!(
+                    formatter,
+                    "a composite `{algorithm}` ChecksumStrategy's expected value cannot be sent \
+                     by a multipart upload; use `ChecksumStrategy::full_object` with the same \
+                     expected value"
+                ),
+                _ => write!(
+                    formatter,
+                    "a `{algorithm}` expected value can only be sent by a single-request upload, \
+                     and this upload is sent as a multipart upload; a single-request upload needs \
+                     a body of known size below the multipart threshold that is not a PartStream"
+                ),
+            },
             Self::PartChecksumWithoutStrategy { part_number } => write!(
                 formatter,
                 "upload stream supplied a checksum for part {part_number}, but the upload has no \
@@ -358,7 +366,11 @@ pub(crate) fn validate_composite_expected_value_for_multipart(
         if strategy.multipart_checksum_type() == &ChecksumType::Composite
             && strategy.expected_value().is_some()
         {
-            return Err(UploadChecksumViolation::CompositeExpectedValueWithMultipart);
+            return Err(
+                UploadChecksumViolation::CompositeExpectedValueWithMultipart {
+                    algorithm: strategy.algorithm().clone(),
+                },
+            );
         }
     }
     Ok(())

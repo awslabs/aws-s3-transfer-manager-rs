@@ -14,10 +14,13 @@ A strategy answers three questions:
      checksum of the same algorithm.
 3. **Do you know the expected checksum?**
    [`with_expected_value`](ChecksumStrategy::with_expected_value) gives S3 the value to check the
-   uploaded object against; S3 rejects the upload if it doesn't match. This checks the uploaded
-   object against its source: the checksums the transfer manager calculates cover only the bytes
-   it sends. For a full object strategy, a [`PartStream`](crate::io::PartStream) can instead
-   return the value from
+   uploaded object against; S3 rejects the upload if it doesn't match. A single-request upload
+   sends the value in place of a checksum calculated from the body. A multipart upload still
+   calculates each part's checksum and also sends the value with `CompleteMultipartUpload`.
+   Supply one to check the stored object against its source: the checksums the transfer manager
+   calculates cover only the bytes it sends, so they don't detect a source that changed or was
+   read incorrectly. For a full object strategy, a [`PartStream`](crate::io::PartStream) can
+   instead return the value from
    [`PartStream::full_object_checksum`](crate::io::PartStream::full_object_checksum) after its
    final part.
 
