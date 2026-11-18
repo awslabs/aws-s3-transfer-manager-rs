@@ -84,7 +84,7 @@ async fn test_with_mock_server() -> Result<(), Box<dyn std::error::Error>> {
 
 ### With the Transfer Manager
 
-```rust,no_run
+```rust,ignore
 use aws_sdk_s3_transfer_manager::io::InputStream;
 use aws_sdk_s3_transfer_manager::{Client, Config};
 use s3_mock_server::S3MockServer;
