@@ -12,6 +12,11 @@ concurrency:
 env:
   RUSTFLAGS: -Dwarnings
   RUST_BACKTRACE: 1
+  # Retry crates.io downloads more than cargo's default 3 times, and use
+  # HTTP/1.1: jobs have failed fetching the index with curl's "[16] Error in
+  # the HTTP2 framing layer".
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_MULTIPLEXING: false
   # FIXME: Remove nightly `-Adeprecated` overrides when MSRV reaches 1.95 and
   # Atomic*::fetch_update can be replaced by try_update.
   # Change to specific Rust release to pin
@@ -383,6 +388,8 @@ jobs:
             --workdir /workspace \
             --env RUSTFLAGS \
             --env RUST_BACKTRACE \
+            --env CARGO_NET_RETRY \
+            --env CARGO_HTTP_MULTIPLEXING \
             --env CARGO_HOME=/tmp/cargo \
             --env CARGO_TARGET_DIR=/tmp/target \
             "rust:${rust_min}-alpine" \
