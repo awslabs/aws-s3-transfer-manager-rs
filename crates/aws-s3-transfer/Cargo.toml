@@ -141,11 +141,11 @@ jemallocator = "0.5.4"
 # The `cp` example adopts a runtime it builds. Path-only so publishing drops it (the extension
 # crate depends on this crate). Excluded on wasm, where `__unstable_ext` does not compile.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-aws-sdk-s3-transfer-manager-ext = { path = "../crates/aws-sdk-s3-transfer-manager-ext" }
+aws-sdk-s3-transfer-manager-ext = { path = "../aws-s3-transfer-ext" }
 
 # The `cp` example's dial9 tracing: build with RUSTFLAGS="--cfg s3_tm_dial9 ...".
 [target.'cfg(s3_tm_dial9)'.dev-dependencies]
-aws-sdk-s3-transfer-manager-ext = { path = "../crates/aws-sdk-s3-transfer-manager-ext", features = ["dial9"] }
+aws-sdk-s3-transfer-manager-ext = { path = "../aws-s3-transfer-ext", features = ["dial9"] }
 dial9 = { version = "0.5", features = ["tokio", "cpu-profiling"] }
 
 [lints.rust]

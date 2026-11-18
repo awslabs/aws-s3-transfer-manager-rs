@@ -9,7 +9,7 @@ one call.
 
 | Package | Description |
 | --- | --- |
-| [`aws-sdk-s3-transfer-manager`](aws-sdk-s3-transfer-manager/) | The transfer manager. [Getting started](aws-sdk-s3-transfer-manager/README.md), [API reference](https://docs.rs/aws-sdk-s3-transfer-manager). |
+| [`aws-sdk-s3-transfer-manager`](crates/aws-s3-transfer/) | The transfer manager. [Getting started](crates/aws-s3-transfer/README.md), [API reference](https://docs.rs/aws-sdk-s3-transfer-manager). |
 | [Runtime components](crates/README.md) | Hardware topology, managed execution and HTTP transport, versioned independently. |
 
 ## Getting help

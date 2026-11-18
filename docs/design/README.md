@@ -11,7 +11,7 @@ Each design document states a subsystem's requirements, architecture, and correc
 | [retry.md](retry.md) | The outer retry loop, failure classification, and throttle recovery | `retry.rs` |
 | [hedging.md](hedging.md) | Speculative re-issue, the adaptive deadline, and the hedge budget | `retry.rs` |
 
-Code paths are relative to `aws-sdk-s3-transfer-manager/src/`.
+Code paths are relative to `crates/aws-s3-transfer/src/`.
 
 ## Invariant index
 

@@ -9,7 +9,7 @@ description = "Runtime tests for aws-sdk-s3-transfer-manager on wasm32-wasip2 an
 
 # The binary only reports an error on other targets, so native workspace builds compile none of these.
 [target.'cfg(target_os = "wasi")'.dependencies]
-aws-sdk-s3-transfer-manager = { path = "../aws-sdk-s3-transfer-manager" }
+aws-sdk-s3-transfer-manager = { path = "../crates/aws-s3-transfer" }
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest"] }
 aws-smithy-async = { workspace = true, features = ["rt-tokio"] }
 aws-smithy-runtime-api = { workspace = true, features = ["client", "http-1x"] }

@@ -10,8 +10,8 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TM = "aws-sdk-s3-transfer-manager"
-ADAPTER = "crates/aws-sdk-s3-transfer-manager-ext"
+TM = "crates/aws-s3-transfer"
+ADAPTER = "crates/aws-s3-transfer-ext"
 
 
 def check(package, config, *features):
