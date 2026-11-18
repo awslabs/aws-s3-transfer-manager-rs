@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   independently downloaded ranges, including empty objects. Successful verification reports
   `ChecksumValidation::Validated`; a mismatch returns `ErrorKind::IntegrityError` from `join()`
   before destination finalization. Streamed bytes may arrive before the final check.
+- `IntegrityChecks` reports stored SHA-512, MD5, XXHASH64, XXHASH3 and XXHASH128 values through
+  `checksum_sha512`, `checksum_md5`, `checksum_xxhash64`, `checksum_xxhash3` and
+  `checksum_xxhash128`. Validation of these algorithms is unchanged.
 - `UploadObjectsInput::builder`, matching the other operation inputs.
 - `set_failure_policy` on `UploadObjectsInputBuilder`, `DownloadObjectsInputBuilder`,
   `UploadObjectsFluentBuilder`, and `DownloadObjectsFluentBuilder`. `None` selects the default,

@@ -249,6 +249,11 @@ pub struct IntegrityChecks {
     checksum_crc64_nvme: Option<String>,
     checksum_sha1: Option<String>,
     checksum_sha256: Option<String>,
+    checksum_sha512: Option<String>,
+    checksum_md5: Option<String>,
+    checksum_xxhash64: Option<String>,
+    checksum_xxhash3: Option<String>,
+    checksum_xxhash128: Option<String>,
     checksum_type: Option<crate::model::ChecksumType>,
     checksum_validation: ChecksumValidation,
 }
@@ -282,6 +287,31 @@ impl IntegrityChecks {
     /// The base64-encoded SHA-256 checksum reported by S3, if present.
     pub fn checksum_sha256(&self) -> Option<&str> {
         self.checksum_sha256.as_deref()
+    }
+
+    /// The base64-encoded SHA-512 checksum reported by S3, if present.
+    pub fn checksum_sha512(&self) -> Option<&str> {
+        self.checksum_sha512.as_deref()
+    }
+
+    /// The base64-encoded MD5 checksum reported by S3, if present.
+    pub fn checksum_md5(&self) -> Option<&str> {
+        self.checksum_md5.as_deref()
+    }
+
+    /// The base64-encoded XXHASH64 checksum reported by S3, if present.
+    pub fn checksum_xxhash64(&self) -> Option<&str> {
+        self.checksum_xxhash64.as_deref()
+    }
+
+    /// The base64-encoded XXHASH3 checksum reported by S3, if present.
+    pub fn checksum_xxhash3(&self) -> Option<&str> {
+        self.checksum_xxhash3.as_deref()
+    }
+
+    /// The base64-encoded XXHASH128 checksum reported by S3, if present.
+    pub fn checksum_xxhash128(&self) -> Option<&str> {
+        self.checksum_xxhash128.as_deref()
     }
 
     /// The object's checksum type (full-object vs composite), if reported.
@@ -345,22 +375,27 @@ pub enum NotValidatedReason {
 }
 
 impl IntegrityChecks {
-    /// Build from the object's reported checksum fields and a resolved verdict.
+    /// Build from the checksum values of `values`, the object's reported checksum
+    /// type and a resolved verdict. `None` reports no checksum values.
     pub(crate) fn new(
-        checksum_crc32: Option<String>,
-        checksum_crc32c: Option<String>,
-        checksum_crc64_nvme: Option<String>,
-        checksum_sha1: Option<String>,
-        checksum_sha256: Option<String>,
+        values: Option<&crate::model::ObjectMetadata>,
         checksum_type: Option<crate::model::ChecksumType>,
         checksum_validation: ChecksumValidation,
     ) -> Self {
+        let value = |f: fn(&crate::model::ObjectMetadata) -> &Option<String>| {
+            values.and_then(|m| f(m).clone())
+        };
         Self {
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_crc64_nvme,
-            checksum_sha1,
-            checksum_sha256,
+            checksum_crc32: value(|m| &m.checksum_crc32),
+            checksum_crc32c: value(|m| &m.checksum_crc32_c),
+            checksum_crc64_nvme: value(|m| &m.checksum_crc64_nvme),
+            checksum_sha1: value(|m| &m.checksum_sha1),
+            checksum_sha256: value(|m| &m.checksum_sha256),
+            checksum_sha512: value(|m| &m.checksum_sha512),
+            checksum_md5: value(|m| &m.checksum_md5),
+            checksum_xxhash64: value(|m| &m.checksum_xxhash64),
+            checksum_xxhash3: value(|m| &m.checksum_xxhash3),
+            checksum_xxhash128: value(|m| &m.checksum_xxhash128),
             checksum_type,
             checksum_validation,
         }

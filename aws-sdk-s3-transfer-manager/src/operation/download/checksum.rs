@@ -388,11 +388,7 @@ impl DownloadIntegrity {
         let meta = self.whole_object_meta.as_ref();
         let values = meta.filter(|m| m.checksum_type != Some(ChecksumType::Composite));
         IntegrityChecks::new(
-            values.and_then(|m| m.checksum_crc32.clone()),
-            values.and_then(|m| m.checksum_crc32_c.clone()),
-            values.and_then(|m| m.checksum_crc64_nvme.clone()),
-            values.and_then(|m| m.checksum_sha1.clone()),
-            values.and_then(|m| m.checksum_sha256.clone()),
+            values,
             meta.and_then(|m| m.checksum_type.clone()),
             validation,
         )
@@ -655,6 +651,7 @@ mod tests {
         meta.checksum_crc32_c = Some("yZRlqg==-1".to_owned());
         meta.checksum_sha1 = Some("Kq5sNclPz7QV2+lfQIuc6R7oRu0=-1".to_owned());
         meta.checksum_sha256 = Some("uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=-1".to_owned());
+        meta.checksum_md5 = Some("1B2M2Y8AsgTpgAmY7PhCfg==-1".to_owned());
         meta.checksum_type = Some(ChecksumType::Composite);
 
         let checks = DownloadIntegrity::new(ValidationPlan::PerResponse, Some(meta))
@@ -665,7 +662,31 @@ mod tests {
         assert_eq!(checks.checksum_crc64_nvme(), None);
         assert_eq!(checks.checksum_sha1(), None);
         assert_eq!(checks.checksum_sha256(), None);
+        assert_eq!(checks.checksum_md5(), None);
         assert_eq!(checks.checksum_type(), Some(&ChecksumType::Composite));
+    }
+
+    #[test]
+    fn integrity_checks_report_every_stored_full_object_value() {
+        // Values whose algorithms the transfer manager does not validate are still
+        // reported, while the verdict says why they were not checked.
+        let mut meta = ObjectMetadata::default();
+        meta.checksum_sha512 = Some("sha512".to_owned());
+        meta.checksum_md5 = Some("md5".to_owned());
+        meta.checksum_xxhash64 = Some("xxhash64".to_owned());
+        meta.checksum_xxhash3 = Some("xxhash3".to_owned());
+        meta.checksum_xxhash128 = Some("xxhash128".to_owned());
+        meta.checksum_type = Some(ChecksumType::FullObject);
+
+        let checks = DownloadIntegrity::new(ValidationPlan::PerResponse, Some(meta))
+            .finish()
+            .unwrap();
+        assert_eq!(checks.checksum_sha512(), Some("sha512"));
+        assert_eq!(checks.checksum_md5(), Some("md5"));
+        assert_eq!(checks.checksum_xxhash64(), Some("xxhash64"));
+        assert_eq!(checks.checksum_xxhash3(), Some("xxhash3"));
+        assert_eq!(checks.checksum_xxhash128(), Some("xxhash128"));
+        assert_eq!(checks.checksum_type(), Some(&ChecksumType::FullObject));
     }
 
     #[test]
