@@ -1,0 +1,21 @@
+# nextest configuration. `cargo nextest run` without `--profile` uses the
+# default profile, which this file leaves unchanged.
+
+[test-groups]
+mock-server = { max-threads = 2 }
+
+# The default-target CI jobs: `cargo nextest run --profile ci`.
+[profile.ci]
+# A test stuck for 5 minutes fails, by name, before the job's time limit.
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.ci.overrides]]
+# Many concurrent mock-server tests exhaust the socket buffers of macOS runners.
+platform = 'cfg(target_os = "macos")'
+filter = 'package(integration-tests)'
+test-group = 'mock-server'
+
+# The sanitizer CI jobs: `cargo nextest run --profile sanitizer`.
+[profile.sanitizer]
+# Sanitizers slow tests down; a test stuck for 10 minutes fails by name.
+slow-timeout = { period = "120s", terminate-after = 5 }
