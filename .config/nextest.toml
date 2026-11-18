@@ -3,14 +3,22 @@
 
 [test-groups]
 mock-server = { max-threads = 2 }
+mock-server-serial = { max-threads = 1 }
 
 # The default-target CI jobs: `cargo nextest run --profile ci`.
 [profile.ci]
 # A test stuck for 5 minutes fails, by name, before the job's time limit.
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# Concurrent mock-server tests exhaust the socket buffers of macOS runners, and
+# connections then break mid-request. Intel runners break with two at a time, so
+# they run one at a time. The first matching override applies.
 [[profile.ci.overrides]]
-# Many concurrent mock-server tests exhaust the socket buffers of macOS runners.
+platform = 'cfg(all(target_os = "macos", target_arch = "x86_64"))'
+filter = 'package(integration-tests)'
+test-group = 'mock-server-serial'
+
+[[profile.ci.overrides]]
 platform = 'cfg(target_os = "macos")'
 filter = 'package(integration-tests)'
 test-group = 'mock-server'
