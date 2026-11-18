@@ -940,7 +940,7 @@ jobs:
       - name: Check semver
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
-          manifest-path: aws-sdk-s3-transfer-manager/Cargo.toml
+          manifest-path: crates/aws-s3-transfer/Cargo.toml
           package: aws-sdk-s3-transfer-manager
           feature-group: all-features
           rust-toolchain: ${{ env.rust_min }}

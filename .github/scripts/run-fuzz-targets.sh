@@ -58,7 +58,7 @@ esac
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 fuzz_dir="$repo_root/fuzz"
-curated_root="$repo_root/aws-sdk-s3-transfer-manager/src/runtime/buffer_pool/tests/corpus"
+curated_root="$repo_root/crates/aws-s3-transfer/src/runtime/buffer_pool/tests/corpus"
 target_triple=${FUZZ_TARGET_TRIPLE:-x86_64-unknown-linux-gnu}
 
 require_positive_integer() {

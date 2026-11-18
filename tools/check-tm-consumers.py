@@ -11,6 +11,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 TM = "aws-sdk-s3-transfer-manager"
+TM_PATH = "crates/aws-s3-transfer"
 
 
 def cargo(directory, *arguments, check=True, capture=False):
@@ -32,7 +33,7 @@ def cargo(directory, *arguments, check=True, capture=False):
 def write_consumer(directory, name, extension):
     (directory / "src").mkdir(parents=True)
     dependencies = {
-        TM: {"path": str(ROOT / TM), "default-features": False},
+        TM: {"path": str(ROOT / TM_PATH), "default-features": False},
     }
     source = """use aws_sdk_s3_transfer_manager::config::{Managed, RuntimeConfig};
 
@@ -43,7 +44,7 @@ fn main() {
     if extension:
         dependencies.update({
             "aws-sdk-s3-transfer-manager-ext": {
-                "path": str(ROOT / "crates/aws-sdk-s3-transfer-manager-ext"),
+                "path": str(ROOT / "crates/aws-s3-transfer-ext"),
             },
             "aws-smithy-execution": {
                 "path": str(ROOT / "crates/aws-smithy-execution"),

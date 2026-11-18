@@ -8,10 +8,10 @@ publish = false
 description = "Integration tests for aws-sdk-s3-transfer-manager using s3-mock-server"
 
 [dependencies]
-aws-sdk-s3-transfer-manager = { path = "../aws-sdk-s3-transfer-manager", features = ["sdk-v1"] }
+aws-sdk-s3-transfer-manager = { path = "../crates/aws-s3-transfer", features = ["sdk-v1"] }
 aws-sdk-s3 = { workspace = true, features = ["default-https-client", "rt-tokio", "sigv4a"] }
 aws-config = { workspace = true, features = ["default"] }
-s3-mock-server = { path = "../s3-mock-server" }
+s3-mock-server = { path = "../crates/s3-mock-server" }
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -26,7 +26,7 @@ aws-smithy-http-client = { workspace = true, features = ["rustls-aws-lc"] }
 bytes = "1"
 aws-smithy-execution = { workspace = true }
 aws-smithy-managed-http = { workspace = true, features = ["client"] }
-aws-sdk-s3-transfer-manager-ext = { path = "../crates/aws-sdk-s3-transfer-manager-ext" }
+aws-sdk-s3-transfer-manager-ext = { path = "../crates/aws-s3-transfer-ext" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(e2e_test)', 'cfg(s3_tm_tsan)'] }

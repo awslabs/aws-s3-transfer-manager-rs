@@ -45,7 +45,7 @@ mkdir -p corpus/buffer-pool-operations
 RUSTFLAGS="-Dwarnings --cfg s3_tm_fuzz" \
     cargo +nightly-2026-09-10 fuzz run buffer-pool-operations \
     corpus/buffer-pool-operations \
-    ../aws-sdk-s3-transfer-manager/src/runtime/buffer_pool/tests/corpus/buffer-pool-operations \
+    ../crates/aws-s3-transfer/src/runtime/buffer_pool/tests/corpus/buffer-pool-operations \
     -- -max_len=1024 -timeout=10
 ```
 
@@ -58,7 +58,7 @@ mkdir -p corpus/buffer-pool-placement
 RUSTFLAGS="-Dwarnings --cfg s3_tm_fuzz" \
     cargo +nightly-2026-09-10 fuzz run buffer-pool-placement \
     corpus/buffer-pool-placement \
-    ../aws-sdk-s3-transfer-manager/src/runtime/buffer_pool/tests/corpus/buffer-pool-placement \
+    ../crates/aws-s3-transfer/src/runtime/buffer_pool/tests/corpus/buffer-pool-placement \
     -- -max_len=1024 -timeout=10
 ```
 

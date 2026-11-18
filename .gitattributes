@@ -1,1 +1,1 @@
-aws-sdk-s3-transfer-manager/src/runtime/buffer_pool/tests/corpus/** binary
+crates/aws-s3-transfer/src/runtime/buffer_pool/tests/corpus/** binary

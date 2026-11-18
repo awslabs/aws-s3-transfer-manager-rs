@@ -134,7 +134,7 @@ worker 0..N in the trace.
 
 ## End-to-end tests
 
-`aws-sdk-s3-transfer-manager/tests/e2e_transfer_test.rs` validates transfers against Amazon S3. To run
+`crates/aws-s3-transfer/tests/e2e_transfer_test.rs` validates transfers against Amazon S3. To run
 these tests:
 
 1. Enable them with `RUSTFLAGS="--cfg e2e_test"`.
