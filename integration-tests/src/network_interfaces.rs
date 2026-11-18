@@ -16,9 +16,9 @@
 
 use std::time::Duration;
 
-use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
-use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize};
-use aws_sdk_s3_transfer_manager::types::ByteSize;
+use aws_s3_transfer::config::RuntimeConfig;
+use aws_s3_transfer::config::{ConcurrencyMode, PartSize};
+use aws_s3_transfer::types::ByteSize;
 use aws_smithy_execution::{ManagedRuntime, ManagedRuntimeHandle};
 use aws_smithy_http_client::pool::{ConnectionPool, DriverSpawner, Partition, PartitionId};
 use aws_smithy_managed_http::client::ManagedHttpPool;
@@ -39,7 +39,7 @@ async fn setup(interfaces: &[&str]) -> MockTm {
         .expect("build managed runtime");
     let http_client = interface_bound_http_client(runtime.handle(), interfaces);
     mock_tm_with_s3_config(
-        RuntimeConfig::managed(aws_sdk_s3_transfer_manager_ext::managed(runtime)),
+        RuntimeConfig::managed(aws_s3_transfer_ext::managed(runtime)),
         |shared| shared.http_client(http_client),
         |b| {
             b.part_size(PartSize::Target(ByteSize::mib(5)))
@@ -73,10 +73,7 @@ fn interface_bound_http_client(
         .into_shared()
 }
 
-async fn download(
-    m: &MockTm,
-    key: &str,
-) -> Result<Vec<u8>, aws_sdk_s3_transfer_manager::error::Error> {
+async fn download(m: &MockTm, key: &str) -> Result<Vec<u8>, aws_s3_transfer::error::Error> {
     let mut handle = m
         .client
         .download()

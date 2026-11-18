@@ -1,0 +1,435 @@
+/*
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+use crate::error::{self, Error};
+use crate::io::fs::{open_without_blocking, restore_blocking};
+use crate::io::stream::{InputStream, RawInputStream};
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+
+/// Input stream designed to wrap file based input.
+#[derive(Debug)]
+pub(super) struct PathBody {
+    // The path to the file
+    pub(super) path: PathBuf,
+    // The total number of bytes to read
+    pub(super) length: u64,
+    // The byte-offset to start reading from
+    pub(super) offset: u64,
+}
+
+impl PathBody {
+    /// Checks, from the path's metadata and without opening it, that the path
+    /// names a regular file.
+    ///
+    /// The path can name a different file by the time it is opened, so this
+    /// does not replace the check in [`open`](Self::open). On Windows the
+    /// metadata cannot tell a pipe or a device from a file; `open` rejects them.
+    ///
+    /// Returns [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid)
+    /// when the path does not name a regular file, and
+    /// [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) when its
+    /// metadata cannot be read.
+    pub(super) fn check_file_type(&self) -> Result<(), Error> {
+        let path = &self.path;
+        let metadata =
+            fs::metadata(path).map_err(|e| error::io_at("reading metadata of", path, e))?;
+        if !metadata.is_file() {
+            return Err(not_regular_file(path));
+        }
+        Ok(())
+    }
+
+    /// Opens the file this body reads.
+    ///
+    /// The file type is read from the opened handle, so a path that names a
+    /// different file by the time it is opened is checked as that file. On
+    /// Unix the open does not wait for a FIFO writer.
+    ///
+    /// Returns [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid)
+    /// when the opened handle is not a regular file, and
+    /// [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) when the path
+    /// cannot be opened or its metadata cannot be read.
+    pub(super) fn open(&self) -> Result<File, Error> {
+        let path = &self.path;
+        let file = open_without_blocking(path).map_err(|e| error::io_at("opening", path, e))?;
+        // On Windows, `is_file` holds for pipes, and reading the metadata of a
+        // character device such as `NUL` fails. The handle type is checked first
+        // so both report `InputInvalid`.
+        #[cfg(windows)]
+        if !crate::io::fs::is_disk_file(&file) {
+            return Err(not_regular_file(path));
+        }
+        let metadata = file
+            .metadata()
+            .map_err(|e| error::io_at("reading metadata of", path, e))?;
+        if !metadata.is_file() {
+            return Err(not_regular_file(path));
+        }
+        restore_blocking(&file).map_err(|e| error::io_at("opening", path, e))?;
+        Ok(file)
+    }
+}
+
+/// The error for a file input whose path does not name a regular file.
+fn not_regular_file(path: &Path) -> Error {
+    error::invalid_input(format!("{} is not a regular file", path.display()))
+}
+
+/// Builder for creating [`InputStream`] from a file/path.
+///
+/// ```no_run
+/// # {
+/// use aws_s3_transfer::io::InputStream;
+/// use std::path::Path;
+///
+/// async fn input_stream_from_file() -> InputStream {
+///     let stream = InputStream::read_from()
+///         .path("docs/some-large-file.csv")
+///         // Specify the length of the file used (skips an additional call to retrieve the size)
+///         .length(123_456)
+///         .build()
+///         .expect("valid path");
+///     stream
+/// }
+/// # }
+/// ```
+#[derive(Debug, Default)]
+pub struct PathBodyBuilder {
+    path: Option<PathBuf>,
+    length: Option<u64>,
+    offset: Option<u64>,
+    metadata: Option<fs::Metadata>,
+}
+
+impl PathBodyBuilder {
+    /// Create a new [`PathBodyBuilder`].
+    ///
+    /// You must call [`path`](PathBodyBuilder::path) to specify what to read from.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the path to read from.
+    pub fn path(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        self.path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Specify the offset to start reading from (in bytes)
+    ///
+    /// When used in conjunction with [`length`](PathBodyBuilder::length), allows for reading a single "chunk" of a file.
+    pub fn offset(mut self, offset: u64) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    /// Specify the length to read (in bytes).
+    ///
+    /// By pre-specifying the length, this API skips an additional call to retrieve the size from file-system metadata.
+    ///
+    /// When used in conjunction with [`offset`](PathBodyBuilder::offset), allows for reading a single "chunk" of a file.
+    ///
+    /// <div class="warning">
+    /// Setting the length manually will trigger no validation related to any offset provided or the actual size of
+    /// the file. This is an advanced setting mainly used to avoid an additional syscall if you know the
+    /// size of the file already.
+    /// </div>
+    pub fn length(mut self, length: u64) -> Self {
+        self.length = Some(length);
+        self
+    }
+
+    /// Provide `metadata` for `self.path`, potentially reducing system calls during `build` if pre-set.
+    pub(crate) fn metadata(mut self, metadata: fs::Metadata) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    /// Returns an [`InputStream`] that reads the configured byte range of the file.
+    ///
+    /// Without an explicit [`length`](PathBodyBuilder::length), the file's size
+    /// is read from filesystem metadata and the stream covers the bytes from
+    /// the offset to the end of the file.
+    ///
+    /// The path must name a regular file, directly or through symbolic links.
+    /// Upload pipes and devices with [`InputStream::from_part_stream`] and
+    /// [`TokioIo`](crate::io::adapters::TokioIo).
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid) when
+    ///   no [`path`](PathBodyBuilder::path) was set, or when no length was set
+    ///   and the path does not name a regular file or the offset is greater
+    ///   than the file's size.
+    /// - [`ErrorKind::IOError`](crate::error::ErrorKind::IOError) when no length
+    ///   was set and the file's metadata cannot be read, for example because the
+    ///   file does not exist.
+    pub fn build(self) -> Result<InputStream, Error> {
+        let path = self
+            .path
+            .ok_or_else(|| error::invalid_input("a path is required to read a file"))?;
+        let offset = self.offset.unwrap_or_default();
+
+        let length = match self.length {
+            None => {
+                // TODO(aws-sdk-rust#1159, design) - evaluate if we want build() to be async and to use tokio for stat() call (bytestream FsBuilder::build() is async)
+                let metadata = match self.metadata {
+                    Some(metadata) => metadata,
+                    None => fs::metadata(&path)
+                        .map_err(|e| error::io_at("reading metadata of", &path, e))?,
+                };
+                if !metadata.is_file() {
+                    return Err(not_regular_file(&path));
+                }
+                let file_size = metadata.len();
+
+                if offset > file_size {
+                    return Err(error::invalid_input(format!(
+                        "offset {offset} is greater than the size of {} ({file_size} bytes)",
+                        path.display()
+                    )));
+                }
+
+                file_size - offset
+            }
+            Some(explicit) => explicit,
+        };
+
+        let body = PathBody {
+            path,
+            length,
+            offset,
+        };
+
+        let stream = InputStream {
+            inner: RawInputStream::Fs(body),
+        };
+
+        Ok(stream)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    use crate::error::ErrorKind;
+    use crate::io::{path_body::PathBodyBuilder, InputStream};
+
+    use super::PathBody;
+
+    fn path_body(stream: &InputStream) -> &PathBody {
+        match &stream.inner {
+            crate::io::stream::RawInputStream::Buf(_) => panic!("unexpected inner body"),
+            crate::io::stream::RawInputStream::Dyn(_) => panic!("unexpected inner body"),
+            crate::io::stream::RawInputStream::Fs(path_body) => path_body,
+        }
+    }
+
+    #[test]
+    fn test_from_path() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let content = "hello path body";
+        tmp.write_all(content.as_bytes()).unwrap();
+
+        let stream = PathBodyBuilder::new().path(tmp.path()).build().unwrap();
+        let body = path_body(&stream);
+        assert_eq!(0, body.offset);
+        assert_eq!(content.len() as u64, body.length);
+    }
+
+    #[test]
+    fn test_explicit_content_length() {
+        let tmp = NamedTempFile::new().unwrap();
+
+        let stream = PathBodyBuilder::new()
+            .path(tmp.path())
+            .length(64)
+            .build()
+            .unwrap();
+
+        let body = path_body(&stream);
+        assert_eq!(0, body.offset);
+        // we don't validate this
+        assert_eq!(64, body.length);
+    }
+
+    #[test]
+    fn test_length_with_offset() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let content = "hello path body";
+        tmp.write_all(content.as_bytes()).unwrap();
+        let offset = 5;
+
+        let stream = PathBodyBuilder::new()
+            .path(tmp.path())
+            .offset(offset)
+            .build()
+            .unwrap();
+
+        let body = path_body(&stream);
+        assert_eq!(offset, body.offset);
+        assert_eq!(content.len() as u64 - offset, body.length);
+    }
+
+    #[test]
+    fn test_explicit_content_length_and_offset() {
+        let tmp = NamedTempFile::new().unwrap();
+
+        let stream = PathBodyBuilder::new()
+            .path(tmp.path())
+            .length(64)
+            .offset(12)
+            .build()
+            .unwrap();
+
+        let body = path_body(&stream);
+        assert_eq!(12, body.offset);
+        assert_eq!(64, body.length);
+    }
+
+    /// Asserts that building from `path` fails with an I/O error naming a
+    /// non-regular file.
+    #[cfg(unix)]
+    fn assert_build_rejects_non_regular_file(path: &std::path::Path) {
+        use aws_smithy_types::error::display::DisplayErrorContext;
+
+        let error = PathBodyBuilder::new().path(path).build().unwrap_err();
+        assert_eq!(error.kind(), &crate::error::ErrorKind::InputInvalid);
+        let message = DisplayErrorContext(&error).to_string();
+        assert!(
+            message.contains("is not a regular file"),
+            "{}: {message}",
+            path.display()
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    #[cfg(unix)]
+    fn test_rejects_non_regular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        for path in [std::path::Path::new("/dev/zero"), directory.path()] {
+            assert_build_rejects_non_regular_file(path);
+        }
+    }
+
+    /// Android's app sandbox denies creating the FIFO.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    #[cfg(all(unix, not(target_os = "android")))]
+    fn test_rejects_fifo() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        assert_build_rejects_non_regular_file(&fifo);
+    }
+
+    /// The open reads the type from the opened handle, so a device or FIFO
+    /// fails even when an explicit length skipped `build`'s metadata check.
+    /// The FIFO has no writer, so an open that waited for one would never
+    /// return: the open runs on its own thread, and the test fails if it has
+    /// not returned in time. Android's app sandbox denies creating the FIFO.
+    ///
+    /// ref: RUST-1674
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    #[cfg(all(unix, not(target_os = "android")))]
+    fn test_open_rejects_a_device_or_fifo_without_waiting_for_a_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        for path in [std::path::PathBuf::from("/dev/zero"), fifo] {
+            let body = PathBody {
+                path: path.clone(),
+                length: 16,
+                offset: 0,
+            };
+            let (opened, result) = std::sync::mpsc::channel();
+            std::thread::spawn(move || opened.send(body.open().map(drop)));
+            let error = result
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("opening {} did not return", path.display()))
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &crate::error::ErrorKind::InputInvalid,
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn test_invalid_offset() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let content = "hello path body";
+        tmp.write_all(content.as_bytes()).unwrap();
+
+        // One byte past the end of the file is the first rejected offset.
+        let err = PathBodyBuilder::new()
+            .path(tmp.path())
+            .offset(content.len() as u64 + 1)
+            .build()
+            .unwrap_err();
+        assert_eq!(err.kind(), &ErrorKind::InputInvalid);
+    }
+
+    #[test]
+    fn test_offset_at_end_of_file_is_empty() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let content = "hello path body";
+        tmp.write_all(content.as_bytes()).unwrap();
+
+        let stream = PathBodyBuilder::new()
+            .path(tmp.path())
+            .offset(content.len() as u64)
+            .build()
+            .unwrap();
+        assert_eq!(0, path_body(&stream).length);
+    }
+
+    #[test]
+    fn test_missing_path_is_invalid_input() {
+        let err = PathBodyBuilder::new().build().unwrap_err();
+        assert_eq!(err.kind(), &ErrorKind::InputInvalid);
+    }
+
+    #[test]
+    fn test_missing_file_is_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = PathBodyBuilder::new()
+            .path(dir.path().join("missing"))
+            .build()
+            .unwrap_err();
+        assert_eq!(err.kind(), &ErrorKind::IOError);
+        let source = std::error::Error::source(&err)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("the filesystem error is the source");
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_supplied_metadata_skips_stat() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let content = "hello path body";
+        tmp.write_all(content.as_bytes()).unwrap();
+        let metadata = std::fs::metadata(tmp.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Statting the missing path would fail, so success shows the supplied
+        // metadata was used in its place.
+        let stream = PathBodyBuilder::new()
+            .path(dir.path().join("missing"))
+            .metadata(metadata)
+            .build()
+            .unwrap();
+        let body = path_body(&stream);
+        assert_eq!(0, body.offset);
+        assert_eq!(content.len() as u64, body.length);
+    }
+}

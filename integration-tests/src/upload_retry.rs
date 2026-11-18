@@ -22,10 +22,10 @@
 //! to-first-byte deadline); these pin the recovery that is in place and document
 //! the response-wait gap that remains.
 
-use aws_sdk_s3_transfer_manager::config::PartSize;
-use aws_sdk_s3_transfer_manager::io::InputStream;
-use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
-use aws_sdk_s3_transfer_manager::types::ByteSize;
+use aws_s3_transfer::config::PartSize;
+use aws_s3_transfer::io::InputStream;
+use aws_s3_transfer::types::ByteSize;
+use aws_s3_transfer::types::{checksum::Crc32, ChecksumStrategy};
 use s3_mock_server::S3MockServer;
 
 mod fault_connector;
@@ -54,7 +54,7 @@ async fn setup_with_fault(
     fail: FailCount,
 ) -> (
     s3_mock_server::ServerHandle,
-    aws_sdk_s3_transfer_manager::Client,
+    aws_s3_transfer::Client,
     fault_connector::InjectionTally,
 ) {
     crate::harness::init_test_logs();
@@ -77,14 +77,12 @@ async fn setup_with_fault(
         .http_client(http_client)
         .build();
 
-    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
-        .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
-            &shared_config,
-        ))
+    let tm_config = aws_s3_transfer::Config::builder()
+        .s3_config(aws_s3_transfer::config::S3ClientConfig::new(&shared_config))
         .part_size(PartSize::Target(ByteSize::new(PART_SIZE)))
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
+    let tm = aws_s3_transfer::Client::new(tm_config);
     (handle, tm, tally)
 }
 
@@ -101,7 +99,7 @@ async fn upload_part_single_dispatch_io_error_recovers() {
         .upload()
         .bucket("test-bucket")
         .key("obj")
-        .checksum_strategy(ChecksumStrategy::with_calculated_crc32())
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32))
         .body(InputStream::from(bytes::Bytes::from(body)))
         .initiate()
         .expect("initiate upload")
@@ -134,7 +132,7 @@ async fn upload_part_correlated_burst_dispatch_io_error() {
         .upload()
         .bucket("test-bucket")
         .key("obj")
-        .checksum_strategy(ChecksumStrategy::with_calculated_crc32())
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32))
         .body(InputStream::from(bytes::Bytes::from(body)))
         .initiate()
         .expect("initiate upload")
@@ -165,7 +163,7 @@ async fn upload_part_persistent_dispatch_io_error_fails() {
         .upload()
         .bucket("test-bucket")
         .key("obj")
-        .checksum_strategy(ChecksumStrategy::with_calculated_crc32())
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32))
         .body(InputStream::from(bytes::Bytes::from(body)))
         .initiate()
         .expect("initiate upload")
@@ -185,10 +183,10 @@ async fn upload_part_persistent_dispatch_io_error_fails() {
 mod server_faults {
     use std::time::Duration;
 
-    use aws_sdk_s3_transfer_manager::config::PartSize;
-    use aws_sdk_s3_transfer_manager::io::InputStream;
-    use aws_sdk_s3_transfer_manager::types::ByteSize;
-    use aws_sdk_s3_transfer_manager::Client as TmClient;
+    use aws_s3_transfer::config::PartSize;
+    use aws_s3_transfer::io::InputStream;
+    use aws_s3_transfer::types::ByteSize;
+    use aws_s3_transfer::Client as TmClient;
     use s3_mock_server::{FaultType, Occurrence, S3MockServer};
 
     /// 5 MiB parts (the S3 multipart minimum).
@@ -237,8 +235,8 @@ mod server_faults {
             Path::PutObject => PartSize::Target(ByteSize::new(64 * 1024 * 1024)),
         };
         let tm = TmClient::new(
-            aws_sdk_s3_transfer_manager::Config::builder()
-                .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+            aws_s3_transfer::Config::builder()
+                .s3_config(aws_s3_transfer::config::S3ClientConfig::new(
                     &handle.shared_config().await,
                 ))
                 .part_size(PART_SIZE)
@@ -253,10 +251,8 @@ mod server_faults {
         tm: &TmClient,
         key: &str,
         data: Vec<u8>,
-    ) -> Result<
-        aws_sdk_s3_transfer_manager::operation::upload::UploadOutput,
-        aws_sdk_s3_transfer_manager::error::Error,
-    > {
+    ) -> Result<aws_s3_transfer::operation::upload::UploadOutput, aws_s3_transfer::error::Error>
+    {
         tm.upload()
             .bucket("test-bucket")
             .key(key)

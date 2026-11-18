@@ -10,7 +10,8 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TM = "aws-sdk-s3-transfer-manager"
+TM = "aws-s3-transfer"
+TM_PATH = "crates/aws-s3-transfer"
 
 
 def cargo(directory, *arguments, check=True, capture=False):
@@ -32,9 +33,9 @@ def cargo(directory, *arguments, check=True, capture=False):
 def write_consumer(directory, name, extension):
     (directory / "src").mkdir(parents=True)
     dependencies = {
-        TM: {"path": str(ROOT / TM), "default-features": False},
+        TM: {"path": str(ROOT / TM_PATH), "default-features": False},
     }
-    source = """use aws_sdk_s3_transfer_manager::config::{Managed, RuntimeConfig};
+    source = """use aws_s3_transfer::config::{Managed, RuntimeConfig};
 
 fn main() {
     let _ = RuntimeConfig::managed(Managed::default());
@@ -42,8 +43,8 @@ fn main() {
 """
     if extension:
         dependencies.update({
-            "aws-sdk-s3-transfer-manager-ext": {
-                "path": str(ROOT / "crates/aws-sdk-s3-transfer-manager-ext"),
+            "aws-s3-transfer-ext": {
+                "path": str(ROOT / "crates/aws-s3-transfer-ext"),
             },
             "aws-smithy-execution": {
                 "path": str(ROOT / "crates/aws-smithy-execution"),
@@ -53,8 +54,8 @@ fn main() {
                 "features": ["client"],
             },
         })
-        source = """use aws_sdk_s3_transfer_manager as tm;
-use aws_sdk_s3_transfer_manager_ext as tm_ext;
+        source = """use aws_s3_transfer as tm;
+use aws_s3_transfer_ext as tm_ext;
 use aws_smithy_execution::{topology::Topology, ManagedRuntime};
 use aws_smithy_managed_http::client::{pool, ManagedHttpPool};
 
@@ -117,7 +118,7 @@ def main():
         source = ordinary / "src/main.rs"
         try:
             source.write_text(
-                "fn main() { let _ = aws_sdk_s3_transfer_manager::unstable::managed; }\n"
+                "fn main() { let _ = aws_s3_transfer::unstable::managed; }\n"
             )
             result = cargo(ordinary, "check", "--locked", check=False, capture=True)
             if result.returncode == 0 or "could not find `unstable`" not in result.stderr:

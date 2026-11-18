@@ -2,8 +2,8 @@
  * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-use aws_sdk_s3_transfer_manager::error::Error;
-use aws_sdk_s3_transfer_manager::operation::download::{Body, DownloadHandle};
+use aws_s3_transfer::error::Error;
+use aws_s3_transfer::operation::download::{Body, DownloadHandle};
 use bytes::Bytes;
 use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use s3_mock_server::S3MockServer;
@@ -42,7 +42,7 @@ async fn setup_test(
 ) -> (
     S3MockServer,
     s3_mock_server::ServerHandle,
-    aws_sdk_s3_transfer_manager::Client,
+    aws_s3_transfer::Client,
 ) {
     let mock_server = S3MockServer::builder()
         .with_in_memory_store()
@@ -58,13 +58,11 @@ async fn setup_test(
     let handle = mock_server.start().await.unwrap();
     let shared_config = handle.shared_config().await;
 
-    let tm_config = aws_sdk_s3_transfer_manager::Config::builder()
-        .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
-            &shared_config,
-        ))
+    let tm_config = aws_s3_transfer::Config::builder()
+        .s3_config(aws_s3_transfer::config::S3ClientConfig::new(&shared_config))
         .build()
         .expect("valid config");
-    let tm = aws_sdk_s3_transfer_manager::Client::new(tm_config);
+    let tm = aws_s3_transfer::Client::new(tm_config);
 
     (mock_server, handle, tm)
 }

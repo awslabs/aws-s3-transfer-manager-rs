@@ -1,0 +1,2413 @@
+/*
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+use std::cmp;
+use std::sync::{Arc, Mutex};
+use std::task::ready;
+use std::{task::Poll, time::Duration};
+
+use aws_s3_transfer::config::{MemoryBudgetConfig, MemoryConfig};
+use aws_s3_transfer::error::{Error, ErrorKind};
+use aws_s3_transfer::io::{InputStream, PartBuffer, PartData, PartStream, SizeHint, StreamContext};
+use aws_s3_transfer::memory::{BufferPool, SegmentedBytes};
+use aws_s3_transfer::types::ByteSize;
+use aws_s3_transfer::types::FailedMultipartUploadPolicy;
+use aws_s3_transfer::types::{checksum::Crc32, ChecksumStrategy};
+use aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput;
+use aws_sdk_s3::operation::complete_multipart_upload::{
+    CompleteMultipartUploadError, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
+};
+use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
+use aws_sdk_s3::operation::put_object::{PutObjectError, PutObjectOutput};
+use aws_sdk_s3::operation::upload_part::UploadPartOutput;
+use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
+use aws_smithy_runtime::test_util::capture_test_logs::capture_test_logs;
+use aws_smithy_runtime_api::client::http::{
+    http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector,
+};
+use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
+use aws_smithy_runtime_api::client::result::SdkError;
+use aws_smithy_runtime_api::http::StatusCode;
+use aws_smithy_types::body::SdkBody;
+use bytes::Bytes;
+use pin_project_lite::pin_project;
+
+use tokio::sync::{mpsc, Semaphore};
+
+/// number of simultaneous uploads to create
+const MANY_ASYNC_UPLOADS_CNT: usize = 200;
+/// number of bytes to upload per transfer
+const MANY_ASYNC_UPLOADS_OBJECT_SIZE: usize = 100;
+/// bytes per write
+const MANY_ASYNC_UPLOADS_BYTES_PER_WRITE: usize = 10;
+/// how long to spend before assuming we're deadlocked
+const SEND_DATA_TIMEOUT_S: u64 = 10;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+pin_project! {
+    /// The TestStream that emits each `Bytes` as the next sequential part, numbering parts from 1.
+    /// Closing the sender ends the stream.
+    ///
+    /// - `size_hint` is returned verbatim from `size_hint()`
+    /// - `full_object_checksum` is the optional checksum taken, when set, returned from `full_object_checksum()`.
+    /// - `observed_part_size` records the most recent `StreamContext::part_size()` seen in
+    ///   `poll_part`, so a test can read back the runtime-chosen part size.
+    #[derive(Debug)]
+    struct TestStream {
+        next_part_num: u64,
+        rx: mpsc::Receiver<Bytes>,
+        size_hint: SizeHint,
+        full_object_checksum: Option<String>,
+        observed_part_size: Arc<AtomicUsize>,
+    }
+}
+
+impl TestStream {
+    /// The general constructor. Other constructor builds on this one.
+    ///
+    /// - `size_hint` defaults to `SizeHint::default()` when `None`.
+    fn new(
+        rx: mpsc::Receiver<Bytes>,
+        size_hint: Option<SizeHint>,
+        full_object_checksum: Option<String>,
+    ) -> Self {
+        Self {
+            next_part_num: 1,
+            rx,
+            size_hint: size_hint.unwrap_or_default(),
+            full_object_checksum,
+            observed_part_size: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn with_size_hint(rx: mpsc::Receiver<Bytes>, size_hint: SizeHint) -> Self {
+        Self::new(rx, Some(size_hint), None)
+    }
+
+    /// Declares an exact size of `size` bytes, driving the known-length path.
+    fn exact(rx: mpsc::Receiver<Bytes>, size: u64) -> Self {
+        Self::new(rx, Some(SizeHint::exact(size)), None)
+    }
+
+    /// Reports no upper bound, driving the unknown-length path.
+    fn unknown_length(rx: mpsc::Receiver<Bytes>) -> Self {
+        Self::new(rx, None, None)
+    }
+
+    /// Unknown length with `full_object_checksum`.
+    fn unknown_length_with_checksum(
+        rx: mpsc::Receiver<Bytes>,
+        full_object_checksum: String,
+    ) -> Self {
+        Self::new(rx, None, Some(full_object_checksum))
+    }
+
+    /// Returns the handle holding the latest `part_size()` recorded by `poll_part`.
+    fn observed_part_size(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.observed_part_size)
+    }
+}
+
+impl PartStream for TestStream {
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        let this = self.project();
+        this.observed_part_size
+            .store(stream_cx.part_size(), Ordering::Relaxed);
+        let data = ready!(this.rx.poll_recv(cx));
+        let part = data.map(|b| {
+            let part_num = *this.next_part_num;
+            *this.next_part_num += 1;
+            Ok(PartData::new(part_num, b))
+        });
+        Poll::Ready(part)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.size_hint
+    }
+
+    fn full_object_checksum(&self) -> Option<String> {
+        self.full_object_checksum.clone()
+    }
+}
+
+pin_project! {
+    /// Collects caller writes into one complete part while preserving source backpressure.
+    #[derive(Debug)]
+    struct AccumulatingPartStream {
+        rx: mpsc::Receiver<Bytes>,
+        expected_len: usize,
+        buffered: Vec<u8>,
+        emitted: bool,
+    }
+}
+
+impl AccumulatingPartStream {
+    fn new(rx: mpsc::Receiver<Bytes>, expected_len: usize) -> Self {
+        Self {
+            rx,
+            expected_len,
+            buffered: Vec::with_capacity(expected_len),
+            emitted: false,
+        }
+    }
+}
+
+impl PartStream for AccumulatingPartStream {
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        _stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        let this = self.project();
+        if *this.emitted {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            match this.rx.poll_recv(cx) {
+                Poll::Ready(Some(bytes)) => {
+                    this.buffered.extend_from_slice(&bytes);
+                    if this.buffered.len() > *this.expected_len {
+                        return Poll::Ready(Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "test stream received more bytes than declared",
+                        ))));
+                    }
+                    if this.buffered.len() == *this.expected_len {
+                        *this.emitted = true;
+                        return Poll::Ready(Some(Ok(PartData::new(
+                            1,
+                            std::mem::take(this.buffered),
+                        ))));
+                    }
+                }
+                Poll::Ready(None) => {
+                    return Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "test stream ended before the complete part arrived",
+                    ))));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::exact(self.expected_len as u64)
+    }
+}
+
+#[derive(Debug)]
+struct WakeBeforePendingStream {
+    polls: Arc<AtomicUsize>,
+}
+
+impl PartStream for WakeBeforePendingStream {
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        _stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        match self.polls.fetch_add(1, Ordering::Relaxed) {
+            0 => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            1 => Poll::Ready(Some(Ok(PartData::new(1, Bytes::from_static(b"ready"))))),
+            2 => Poll::Ready(None),
+            _ => panic!("single-part stream was polled after end-of-stream"),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::exact(5)
+    }
+}
+
+/// The producer a [`ScriptedPartStream`] drives: each call yields the next poll result, given the
+/// [`StreamContext`] so a script can size a part to the runtime-chosen `part_size()`.
+type PartScript =
+    Box<dyn FnMut(&StreamContext) -> Poll<Option<std::io::Result<PartData>>> + Send + Sync>;
+
+/// A PartStream with a part-producing script
+struct ScriptedPartStream {
+    script: PartScript,
+    size_hint: SizeHint,
+}
+
+impl std::fmt::Debug for ScriptedPartStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptedPartStream")
+            .field("size_hint", &self.size_hint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ScriptedPartStream {
+    fn new(
+        size_hint: SizeHint,
+        script: impl FnMut(&StreamContext) -> Poll<Option<std::io::Result<PartData>>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self {
+            script: Box::new(script),
+            size_hint,
+        }
+    }
+
+    /// Yields `part` once, then end-of-stream. Declares `size` exactly.
+    fn segmented(part: PartData, size: u64) -> Self {
+        let mut part = Some(part);
+        Self::new(SizeHint::exact(size), move |_stream_cx| {
+            Poll::Ready(part.take().map(Ok))
+        })
+    }
+
+    /// Yields one part per entry in `part_numbers`, the part at position `i` holding `i + 1` bytes,
+    /// then end-of-stream. The body length identifies which scripted part a recorded UploadPart
+    /// carried.
+    fn numbered(part_numbers: &[u64]) -> Self {
+        let mut remaining: std::collections::VecDeque<u64> = part_numbers.iter().copied().collect();
+        let mut yielded = 0usize;
+        Self::new(SizeHint::default(), move |_stream_cx| {
+            let Some(part_number) = remaining.pop_front() else {
+                return Poll::Ready(None);
+            };
+            yielded += 1;
+            Poll::Ready(Some(Ok(PartData::new(part_number, vec![0u8; yielded]))))
+        })
+    }
+
+    /// Yields one-byte parts numbered from `next_part_num` up to and including `total`, then
+    /// end-of-stream.
+    fn counting(mut next_part_num: u64, total: u64) -> Self {
+        Self::new(SizeHint::default(), move |_stream_cx| {
+            if next_part_num > total {
+                return Poll::Ready(None);
+            }
+            let part_number = next_part_num;
+            next_part_num += 1;
+            Poll::Ready(Some(Ok(PartData::new(
+                part_number,
+                Bytes::from_static(b"x"),
+            ))))
+        })
+    }
+
+    /// Yields one part sized to the context's `part_size()`, then a reader error.
+    fn failing_after_one_part() -> Self {
+        let mut yielded = false;
+        Self::new(SizeHint::default(), move |stream_cx| {
+            if yielded {
+                return Poll::Ready(Some(Err(std::io::Error::other("simulated reader failure"))));
+            }
+            yielded = true;
+            let data = vec![0u8; stream_cx.part_size()];
+            Poll::Ready(Some(Ok(PartData::new(1, data))))
+        })
+    }
+}
+
+impl PartStream for ScriptedPartStream {
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        (self.get_mut().script)(stream_cx)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.size_hint
+    }
+}
+
+/// Copies `data` into one part built in `pool`, which the caller shares with the client.
+#[derive(Debug)]
+struct PooledPartStream {
+    pool: BufferPool,
+    data: Option<Bytes>,
+    buffer: Option<PartBuffer>,
+}
+
+impl PartStream for PooledPartStream {
+    fn poll_part(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        let Some(data_len) = self.data.as_ref().map(Bytes::len) else {
+            return Poll::Ready(None);
+        };
+        let this = &mut *self;
+        let buffer = this
+            .buffer
+            .get_or_insert_with(|| PartBuffer::new(&this.pool, stream_cx.part_size()));
+        match buffer.poll_acquire(cx, data_len) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Some(Err(error))),
+            Poll::Ready(Ok(())) => {}
+        }
+
+        let data = self.data.take().expect("pooled stream data disappeared");
+        let copied = self
+            .buffer
+            .as_mut()
+            .expect("pooled stream buffer disappeared")
+            .fill_from_slice(&data);
+        assert_eq!(
+            copied,
+            data.len(),
+            "admitted envelope did not hold the part"
+        );
+        let data = self
+            .buffer
+            .take()
+            .expect("pooled stream buffer disappeared")
+            .freeze();
+        Poll::Ready(Some(Ok(PartData::from_segmented(1, data))))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::exact(self.data.as_ref().map_or(0, |data| data.len() as u64))
+    }
+}
+
+/// Builds a transfer manager with default config that sends its S3 requests to `client`.
+fn tm_with(client: aws_sdk_s3::Client) -> aws_s3_transfer::Client {
+    aws_s3_transfer::Client::new(
+        aws_s3_transfer::Config::builder()
+            .s3_config(test_common::s3_config_with_test_http(
+                client.config().to_builder(),
+            ))
+            .build()
+            .expect("valid config"),
+    )
+}
+
+/// The upload ID a [`MultipartMock`]'s CreateMultipartUpload returns.
+const MOCK_UPLOAD_ID: &str = "test-upload-id";
+
+/// The multipart requests a [`MultipartMock`]'s default rules answered, in arrival order.
+///
+/// A request answered by an override rule is not recorded; that rule's `num_calls` counts it.
+#[derive(Debug, Default)]
+struct MultipartRecord {
+    /// `(part number, content length)` of each UploadPart.
+    upload_parts: Mutex<Vec<(i32, i64)>>,
+    /// Each CompleteMultipartUpload request, as received.
+    completions: Mutex<Vec<CompleteMultipartUploadInput>>,
+    /// How many AbortMultipartUpload requests were answered.
+    aborts: AtomicUsize,
+}
+
+impl MultipartRecord {
+    /// `(part number, content length)` of each recorded UploadPart.
+    fn upload_parts(&self) -> Vec<(i32, i64)> {
+        self.upload_parts.lock().unwrap().clone()
+    }
+
+    /// How many UploadPart requests were recorded.
+    fn upload_part_calls(&self) -> usize {
+        self.upload_parts.lock().unwrap().len()
+    }
+
+    /// Each recorded CompleteMultipartUpload request.
+    fn completions(&self) -> Vec<CompleteMultipartUploadInput> {
+        self.completions.lock().unwrap().clone()
+    }
+
+    /// How many CompleteMultipartUpload requests were recorded.
+    fn complete_calls(&self) -> usize {
+        self.completions.lock().unwrap().len()
+    }
+
+    /// How many AbortMultipartUpload requests were recorded.
+    fn abort_calls(&self) -> usize {
+        self.aborts.load(Ordering::SeqCst)
+    }
+
+    /// The part numbers each recorded CompleteMultipartUpload listed, in the order it listed them.
+    fn completed_part_numbers(&self) -> Vec<Vec<i32>> {
+        self.completions()
+            .iter()
+            .map(|complete| {
+                complete
+                    .multipart_upload()
+                    .map(|upload| {
+                        upload
+                            .parts()
+                            .iter()
+                            .filter_map(|part| part.part_number())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// The `MpuObjectSize` each recorded CompleteMultipartUpload carried.
+    fn mpu_object_sizes(&self) -> Vec<Option<i64>> {
+        self.completions()
+            .iter()
+            .map(CompleteMultipartUploadInput::mpu_object_size)
+            .collect()
+    }
+}
+
+/// A mock multipart service. CreateMultipartUpload, UploadPart, CompleteMultipartUpload and
+/// AbortMultipartUpload succeed and are recorded in a [`MultipartRecord`], unless a test overrides
+/// one with its own rule. A failed upload sends AbortMultipartUpload.
+///
+/// CreateMultipartUpload returns [`MOCK_UPLOAD_ID`]. The default UploadPart,
+/// CompleteMultipartUpload and AbortMultipartUpload rules match only requests carrying that upload
+/// ID, so a request carrying
+/// any other ID matches no rule and the mock panics. The default UploadPart answer carries the ETag
+/// `etag-{part number}`.
+struct MultipartMock {
+    record: Arc<MultipartRecord>,
+    /// Consulted in the order they were added, before the default rules.
+    overrides: Vec<Rule>,
+}
+
+impl MultipartMock {
+    /// A mock with no override rules and an empty record.
+    fn new() -> Self {
+        Self {
+            record: Arc::default(),
+            overrides: Vec::new(),
+        }
+    }
+
+    /// Answers the requests `rule` matches with `rule` instead of the default rules.
+    ///
+    /// `rule` applies to the operation its `mock!` names. The requests it answers are not recorded;
+    /// `rule.num_calls()` counts them.
+    fn with_override(mut self, rule: &Rule) -> Self {
+        self.overrides.push(rule.clone());
+        self
+    }
+
+    /// Builds a client that answers with the override rules, then the default rules.
+    ///
+    /// `RuleMode::MatchAny` answers a request with the first rule, in list order, that matches it,
+    /// which is what lets an override take precedence.
+    fn client(&self) -> aws_sdk_s3::Client {
+        let create_mpu = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+            CreateMultipartUploadOutput::builder()
+                .upload_id(MOCK_UPLOAD_ID)
+                .build()
+        });
+        let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+            .match_requests(|req| req.upload_id() == Some(MOCK_UPLOAD_ID))
+            .then_compute_output({
+                let record = Arc::clone(&self.record);
+                move |req| {
+                    let part_number = req.part_number().expect("UploadPart carries a part number");
+                    let content_length = req
+                        .content_length()
+                        .expect("UploadPart carries a content length");
+                    record
+                        .upload_parts
+                        .lock()
+                        .unwrap()
+                        .push((part_number, content_length));
+                    UploadPartOutput::builder()
+                        .e_tag(format!("etag-{part_number}"))
+                        .build()
+                }
+            });
+        let complete_mpu = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+            .match_requests(|req| req.upload_id() == Some(MOCK_UPLOAD_ID))
+            .then_compute_output({
+                let record = Arc::clone(&self.record);
+                move |req| {
+                    record.completions.lock().unwrap().push(req.clone());
+                    CompleteMultipartUploadOutput::builder().build()
+                }
+            });
+
+        let abort_mpu = mock!(aws_sdk_s3::Client::abort_multipart_upload)
+            .match_requests(|req| req.upload_id() == Some(MOCK_UPLOAD_ID))
+            .then_compute_output({
+                let record = Arc::clone(&self.record);
+                move |_| {
+                    record.aborts.fetch_add(1, Ordering::SeqCst);
+                    AbortMultipartUploadOutput::builder().build()
+                }
+            });
+
+        let rules: Vec<Rule> = self
+            .overrides
+            .iter()
+            .cloned()
+            .chain([create_mpu, upload_part, complete_mpu, abort_mpu])
+            .collect();
+        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &rules)
+    }
+
+    /// Builds a transfer manager with default config over [`Self::client`].
+    fn tm(&self) -> aws_s3_transfer::Client {
+        tm_with(self.client())
+    }
+
+    /// The requests the default rules have answered so far.
+    fn record(&self) -> &MultipartRecord {
+        &self.record
+    }
+}
+
+/// Uploads a numbered scripted stream for `part_numbers` and returns the outcome with the mock it
+/// ran against.
+async fn upload_numbered_parts(part_numbers: &[u64]) -> (Result<(), Error>, MultipartMock) {
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
+    let result = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(ScriptedPartStream::numbered(
+            part_numbers,
+        )))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .map(|_| ());
+    (result, mock)
+}
+
+/// Runs one valid zero-byte multipart source and verifies that the transfer sends exactly one empty
+/// part before completing a zero-byte object.
+async fn assert_single_empty_multipart_upload(stream: InputStream) {
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
+
+    tm.upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(stream)
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect("a valid empty stream must complete as a zero-byte object");
+
+    assert_eq!(
+        vec![(1, 0)],
+        mock.record().upload_parts(),
+        "an empty multipart source must upload exactly one empty part"
+    );
+    assert_eq!(vec![Some(0)], mock.record().mpu_object_sizes());
+}
+
+/// Runs one nonexact size declaration and verifies that CompleteMPU receives the validated bytes
+/// emitted by the source rather than either declared bound.
+async fn assert_ranged_mpu_object_size(size_hint: SizeHint, actual: usize) {
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
+
+    let (tx, rx) = mpsc::channel(1);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::with_size_hint(
+            rx, size_hint,
+        )))
+        .initiate()
+        .unwrap();
+    tx.send(Bytes::from(vec![0u8; actual])).await.unwrap();
+    drop(tx);
+
+    handle
+        .join()
+        .await
+        .expect("source output within its declared bounds must upload");
+    assert_eq!(vec![Some(actual as i64)], mock.record().mpu_object_sizes());
+}
+
+#[tokio::test]
+async fn test_custom_stream_uploads_segmented_part_data() {
+    let mut data = SegmentedBytes::from(Bytes::from_static(b"left"));
+    data.append(SegmentedBytes::from(Bytes::from_static(b"-right")));
+    let size = data.len() as u64;
+    let stream = ScriptedPartStream::segmented(PartData::from_segmented(1, data), size);
+    let tm = MultipartMock::new().tm();
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("segmented-part")
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+
+    handle.join().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_custom_stream_resumes_after_part_buffer_admission() {
+    const CAPACITY: usize = 1024 * 1024;
+
+    let pool = BufferPool::builder()
+        .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(CAPACITY as u64)))
+        .build()
+        .unwrap();
+    // A second buffer admitted for the whole budget makes the stream's admission wait.
+    let mut holder = PartBuffer::new(&pool, CAPACITY);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        holder.poll_acquire(&mut cx, CAPACITY),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(holder.writable(), CAPACITY);
+
+    let config = aws_s3_transfer::Config::builder()
+        .s3_config(test_common::s3_config_with_test_http(
+            MultipartMock::new().client().config().to_builder(),
+        ))
+        .memory(MemoryConfig::Explicit(pool.clone()))
+        .build()
+        .expect("valid config");
+    let tm = aws_s3_transfer::Client::new(config);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("pooled-part")
+        .body(InputStream::from_part_stream(PooledPartStream {
+            pool: pool.clone(),
+            data: Some(Bytes::from_static(b"pooled payload")),
+            buffer: None,
+        }))
+        .initiate()
+        .unwrap();
+    let join = tokio::spawn(async move { handle.join().await });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.metrics().waiting_requests() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("custom stream did not wait for pool admission");
+
+    drop(holder);
+
+    tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("custom stream did not resume after pool admission")
+        .expect("upload task panicked")
+        .unwrap();
+    assert_eq!(pool.metrics().in_use_bytes(), 0);
+}
+
+#[tokio::test]
+async fn test_source_wake_before_read_parking_is_retained() {
+    let tm = MultipartMock::new().tm();
+    let polls = Arc::new(AtomicUsize::new(0));
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("wake-before-park")
+        .body(InputStream::from_part_stream(WakeBeforePendingStream {
+            polls: Arc::clone(&polls),
+        }))
+        .initiate()
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), handle.join())
+        .await
+        .expect("source wake was lost before the retained read was parked")
+        .unwrap();
+    assert_eq!(polls.load(Ordering::Relaxed), 3);
+}
+
+// Regression test for deadlock discovered by a user of Mountpoint
+// The user opens MANY files at once. The user wrote data to some of the later files they opened,
+// and waited for those writes to complete.
+//
+// If we wait on data from the first few files then both sides
+// are waiting on each other causing deadlock.
+//
+// This test starts N uploads then only processes them starting from the last one created.
+// If the test times out, then we suffer from deadlock.
+//
+// See https://github.com/awslabs/aws-c-s3/blob/5d8d4205e7de4e152bf26bb27d86f3acf8cd5d2/tests/s3_many_async_uploads_without_data_test.c
+// Each source retains one in-progress part while its channel is empty. A pending source read must
+// release its scheduler slot so reverse-order writers can wake and complete.
+#[tokio::test]
+async fn test_many_uploads_no_deadlock() {
+    let (_guard, _rx) = capture_test_logs();
+    let tm = MultipartMock::new().tm();
+
+    let mut transfers = Vec::with_capacity(MANY_ASYNC_UPLOADS_CNT);
+    for i in 0..MANY_ASYNC_UPLOADS_CNT {
+        let (tx, rx) = mpsc::channel(1);
+        let stream = AccumulatingPartStream::new(rx, MANY_ASYNC_UPLOADS_OBJECT_SIZE);
+
+        let handle = tm
+            .upload()
+            .bucket("test-bucket")
+            .key(format!("many-async-uploads-{}.txt", i))
+            .body(InputStream::from_part_stream(stream))
+            .initiate()
+            .unwrap();
+
+        transfers.push((handle, tx));
+    }
+
+    let mut handles = Vec::with_capacity(MANY_ASYNC_UPLOADS_CNT);
+
+    // process transfers in reverse order
+    while let Some((handle, tx)) = transfers.pop() {
+        let mut bytes_written = 0;
+        let mut eof = false;
+        while !eof {
+            let wc = cmp::min(
+                MANY_ASYNC_UPLOADS_BYTES_PER_WRITE,
+                MANY_ASYNC_UPLOADS_OBJECT_SIZE - bytes_written,
+            );
+            eof = (bytes_written + wc) == MANY_ASYNC_UPLOADS_OBJECT_SIZE;
+
+            let data = vec![b'z'; wc];
+            let buf = Bytes::from(data);
+            match tx
+                .send_timeout(buf, Duration::from_secs(SEND_DATA_TIMEOUT_S))
+                .await
+            {
+                Ok(_) => {}
+                Err(err) => panic!("failed to send due to timeout or closed channel: {}", err),
+            }
+            bytes_written += wc;
+        }
+
+        drop(tx);
+        handles.push(handle);
+    }
+
+    // wait for everything to finish
+    while let Some(handle) = handles.pop() {
+        handle.join().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_large_upload_part_size_bump() {
+    let tm = MultipartMock::new().tm();
+
+    let (tx, rx) = mpsc::channel(1);
+    let size_hint = ByteSize::gib(100).as_u64();
+    let stream = TestStream::with_size_hint(rx, SizeHint::default().with_upper(Some(size_hint)));
+    let observed_part_size = stream.observed_part_size();
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-large-upload-part-size".to_string())
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+
+    // actual object is empty, but we will bump the part_size based on size_hint
+    drop(tx);
+    handle.join().await.unwrap();
+    // part_size must be bumped using size_hint.div_ceil(MAX_PARTS) to fit the MAX_PARTS limit.
+    let expected_part_size = 10737419;
+    assert_eq!(
+        observed_part_size.load(Ordering::Relaxed),
+        expected_part_size
+    );
+}
+
+/// CompleteMultipartUpload must carry `MpuObjectSize` set to the full content
+/// length so S3 rejects the request if the object it assembled is a different
+/// size (a dropped or duplicated part). Required by SEP step 7.
+#[tokio::test]
+async fn test_complete_mpu_sends_mpu_object_size() {
+    let part_size = ByteSize::mib(5).as_usize();
+    // Two full parts plus a partial one, so the total is not a part-size multiple
+    // and a stale part-count-derived value would not match.
+    let content_length = 2 * part_size + 1024;
+
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
+
+    let (tx, rx) = mpsc::channel(3);
+    let stream = TestStream::exact(rx, content_length as u64);
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-mpu-object-size")
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    tx.send(Bytes::from(vec![0u8; 1024])).await.unwrap();
+    drop(tx);
+    handle.join().await.expect("upload should succeed");
+    assert_eq!(
+        vec![Some(content_length as i64)],
+        mock.record().mpu_object_sizes(),
+        "CompleteMPU must carry MpuObjectSize = content length"
+    );
+}
+
+// --- Unknown content length --------------------------------------------------
+//
+// An unknown-length source is always a `PartStream`, which is `is_mpu_only`, so
+// these all exercise the multipart path. Termination comes from the reader
+// reporting end-of-stream rather than from a part count.
+
+/// An empty stream with no declared bounds must complete as a normal 0-byte object.
+///
+/// S3 rejects a CompleteMultipartUpload that lists no parts, so "no bytes" cannot
+/// mean "no parts": the transfer synthesizes a single empty part 1. The mock
+/// asserts exactly that shape — one UploadPart, part number 1, zero bytes.
+#[tokio::test]
+async fn test_unknown_length_empty_stream() {
+    let (tx, rx) = mpsc::channel(1);
+    drop(tx);
+    assert_single_empty_multipart_upload(InputStream::from_part_stream(
+        TestStream::unknown_length(rx),
+    ))
+    .await;
+}
+
+/// A zero-byte source satisfies an upper-only declaration because its lower bound remains zero.
+#[tokio::test]
+async fn test_upper_only_hint_allows_empty_stream() {
+    let (tx, rx) = mpsc::channel(1);
+    drop(tx);
+    let stream =
+        TestStream::with_size_hint(rx, SizeHint::default().with_upper(Some(5 * 1024 * 1024)));
+    assert_single_empty_multipart_upload(InputStream::from_part_stream(stream)).await;
+}
+
+/// An exact zero-byte declaration is valid and still requires one empty MPU part.
+#[tokio::test]
+async fn test_exact_zero_hint_allows_empty_stream() {
+    let (tx, rx) = mpsc::channel(1);
+    drop(tx);
+    assert_single_empty_multipart_upload(InputStream::from_part_stream(TestStream::exact(rx, 0)))
+        .await;
+}
+
+/// An explicitly yielded zero-byte part is the empty object; the transfer must not synthesize a
+/// duplicate after observing EOF.
+#[tokio::test]
+async fn test_explicit_zero_byte_part_is_not_duplicated() {
+    let stream = ScriptedPartStream::segmented(PartData::new(1, Bytes::new()), 0);
+    assert_single_empty_multipart_upload(InputStream::from_part_stream(stream)).await;
+}
+
+/// `MpuObjectSize` for an unknown-length upload is the sum of the bytes actually
+/// uploaded. With no declared length there is no independent witness, but the
+/// value must still be sent so S3 can reject a mismatched assembly.
+#[tokio::test]
+async fn test_unknown_length_mpu_object_size_is_running_sum() {
+    let part_size = ByteSize::mib(5).as_usize();
+    // Deliberately not a part-size multiple, so a part-count-derived value wouldn't match.
+    let total = 2 * part_size + 1024;
+
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
+
+    let (tx, rx) = mpsc::channel(2);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::unknown_length(
+            rx,
+        )))
+        .initiate()
+        .unwrap();
+
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    tx.send(Bytes::from(vec![0u8; 1024])).await.unwrap();
+    drop(tx);
+
+    handle.join().await.expect("upload should succeed");
+    assert_eq!(
+        vec![Some(total as i64)],
+        mock.record().mpu_object_sizes(),
+        "CompleteMPU must carry MpuObjectSize equal to the summed bytes of an unknown-length stream"
+    );
+}
+
+/// An upper bound sizes the transfer but does not become the completed object size.
+///
+/// The stream declares at most two full parts and ends after one full part plus a tail.
+/// `MpuObjectSize` must carry the validated bytes actually emitted, not the planning bound.
+#[tokio::test]
+async fn test_bounded_length_sends_validated_actual_size() {
+    let part_size = ByteSize::mib(5).as_usize();
+    let upper = 2 * part_size;
+    let actual = part_size + 1024;
+
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
+
+    let (tx, rx) = mpsc::channel(1);
+    let stream = TestStream::with_size_hint(rx, SizeHint::default().with_upper(Some(upper as u64)));
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+    tx.send(Bytes::from(vec![0u8; actual])).await.unwrap();
+    drop(tx);
+
+    handle.join().await.expect("upload should succeed");
+    assert_eq!(
+        vec![Some(actual as i64)],
+        mock.record().mpu_object_sizes(),
+        "a bounded upload must send its validated actual size as MpuObjectSize"
+    );
+}
+
+/// Lower-only and two-sided bounds constrain the source without becoming an exact object size.
+#[tokio::test]
+async fn test_ranged_hints_send_validated_actual_mpu_object_size() {
+    assert_ranged_mpu_object_size(SizeHint::default().with_lower(5), 7).await;
+    assert_ranged_mpu_object_size(SizeHint::default().with_lower(5).with_upper(Some(10)), 7).await;
+}
+
+/// An exact size hint is a contract, not only a planning input.
+#[tokio::test]
+async fn test_exact_length_rejects_early_end_of_stream() {
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
+
+    let (tx, rx) = mpsc::channel(1);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::exact(rx, 10)))
+        .initiate()
+        .unwrap();
+    tx.send(Bytes::from_static(b"short")).await.unwrap();
+    drop(tx);
+
+    let error = handle
+        .join()
+        .await
+        .expect_err("an exact stream ending below its size must fail");
+    assert_eq!(*error.kind(), ErrorKind::InputInvalid);
+    assert_eq!(mock.record().upload_part_calls(), 1);
+    assert_eq!(mock.record().complete_calls(), 0);
+}
+
+/// The upper bound is enforced before an oversized part is sent to S3.
+#[tokio::test]
+async fn test_exact_length_rejects_overflow_before_upload_part() {
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
+
+    let (tx, rx) = mpsc::channel(1);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::exact(rx, 5)))
+        .initiate()
+        .unwrap();
+    tx.send(Bytes::from_static(b"excess")).await.unwrap();
+    drop(tx);
+
+    let error = handle
+        .join()
+        .await
+        .expect_err("a stream exceeding its exact size must fail");
+    assert_eq!(*error.kind(), ErrorKind::InputInvalid);
+    assert_eq!(mock.record().upload_part_calls(), 0);
+    assert_eq!(mock.record().complete_calls(), 0);
+}
+
+/// A bounded stream must satisfy its lower bound when EOF closes dispatch.
+#[tokio::test]
+async fn test_bounded_length_rejects_below_lower_bound() {
+    let tm = MultipartMock::new().tm();
+    let (tx, rx) = mpsc::channel(1);
+    let hint = SizeHint::default().with_lower(5).with_upper(Some(10));
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::with_size_hint(
+            rx, hint,
+        )))
+        .initiate()
+        .unwrap();
+    tx.send(Bytes::from_static(b"four")).await.unwrap();
+    drop(tx);
+
+    let error = handle
+        .join()
+        .await
+        .expect_err("a bounded stream ending below its lower bound must fail");
+    assert_eq!(*error.kind(), ErrorKind::InputInvalid);
+}
+
+/// Contradictory bounds are rejected before any upload work is scheduled.
+#[test]
+fn test_stream_rejects_lower_bound_above_upper_bound() {
+    let (_tx, rx) = mpsc::channel(1);
+    let hint = SizeHint::default().with_lower(11).with_upper(Some(10));
+    let tm = tm_with(mock_client!(aws_sdk_s3, []));
+
+    let error = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::with_size_hint(
+            rx, hint,
+        )))
+        .initiate()
+        .expect_err("contradictory stream bounds must be rejected");
+    assert_eq!(*error.kind(), ErrorKind::InputInvalid);
+}
+
+/// Uploads `produced` bytes, as one part, from a stream with no size bounds, on a request that
+/// declares `content_length`. Returns the outcome with the mock it ran against.
+async fn upload_with_content_length(
+    content_length: i64,
+    produced: usize,
+) -> (Result<(), Error>, MultipartMock) {
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
+
+    let (tx, rx) = mpsc::channel(1);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .content_length(content_length)
+        .body(InputStream::from_part_stream(TestStream::with_size_hint(
+            rx,
+            SizeHint::default(),
+        )))
+        .initiate()
+        .unwrap();
+    tx.send(Bytes::from(vec![0u8; produced])).await.unwrap();
+    drop(tx);
+    let result = handle.join().await.map(|_| ());
+    (result, mock)
+}
+
+/// A stream with no size bounds that ends short of the declared `content_length` fails before
+/// CompleteMultipartUpload, rather than storing the short object.
+#[tokio::test]
+async fn test_content_length_rejects_short_stream_before_completion() {
+    let (result, mock) = upload_with_content_length(10, 5).await;
+    let error = result.expect_err("a stream ending below its content_length must fail");
+    assert_eq!(ErrorKind::InputInvalid, *error.kind());
+    assert!(mock.record().completions().is_empty());
+}
+
+/// A stream with no size bounds that runs past the declared `content_length` fails before the part
+/// that exceeds it is sent.
+#[tokio::test]
+async fn test_content_length_rejects_long_stream_before_upload_part() {
+    let (result, mock) = upload_with_content_length(10, 11).await;
+    let error = result.expect_err("a stream running past its content_length must fail");
+    assert_eq!(ErrorKind::InputInvalid, *error.kind());
+    assert_eq!(0, mock.record().upload_part_calls());
+    assert!(mock.record().completions().is_empty());
+}
+
+/// A stream that produces exactly the declared `content_length` uploads, and CompleteMultipartUpload
+/// carries the declaration as `MpuObjectSize`.
+#[tokio::test]
+async fn test_content_length_matching_stream_uploads() {
+    let (result, mock) = upload_with_content_length(10, 10).await;
+    result.expect("a stream producing exactly its content_length must upload");
+    assert_eq!(vec![Some(10)], mock.record().mpu_object_sizes());
+}
+
+/// A `content_length` that is negative or contradicts the body's own size fails at `initiate()`.
+#[tokio::test]
+async fn test_content_length_contradicting_body_fails_at_initiate() {
+    let tm = tm_with(mock_client!(aws_sdk_s3, []));
+    let initiate = |content_length: i64, body: InputStream| {
+        tm.upload()
+            .bucket("test-bucket")
+            .key("test-key")
+            .content_length(content_length)
+            .body(body)
+            .initiate()
+            .map(|_| ())
+    };
+
+    let (_tx, rx) = mpsc::channel(1);
+    let exact_stream = InputStream::from_part_stream(TestStream::exact(rx, 5));
+    let error = initiate(10, exact_stream).expect_err("content_length above an exact hint");
+    assert_eq!(ErrorKind::InputInvalid, *error.kind());
+
+    let error = initiate(5, InputStream::from_static(b"abc"))
+        .expect_err("content_length above an in-memory body's length");
+    assert_eq!(ErrorKind::InputInvalid, *error.kind());
+
+    let error =
+        initiate(-1, InputStream::from_static(b"abc")).expect_err("negative content_length");
+    assert_eq!(ErrorKind::InputInvalid, *error.kind());
+}
+
+/// A stream that yields data must never *also* send an empty part 1.
+///
+/// The empty-part rule only applies when the stream turned out to be empty. Parts
+/// are dispatched speculatively, so the dispatch that reads end-of-stream can run
+/// while the first data part is still in flight; if "has anything been emitted" is
+/// recorded only once that send completes, the end-of-stream dispatch sees "nothing
+/// emitted" and synthesizes a *second* part 1. CompleteMultipartUpload would then
+/// list part 1 twice — and whichever write S3 kept last could truncate the object.
+#[tokio::test]
+async fn test_unknown_length_with_data_never_sends_empty_part() {
+    let part_size = ByteSize::mib(5).as_usize();
+
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
+
+    let (tx, rx) = mpsc::channel(1);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::unknown_length(
+            rx,
+        )))
+        .initiate()
+        .unwrap();
+
+    // Exactly one data part, then end-of-stream.
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    drop(tx);
+
+    handle.join().await.expect("upload should succeed");
+
+    // Split the recorded parts by body size so the empty ones' count is the assertion.
+    let (empty_parts, data_parts): (Vec<_>, Vec<_>) = mock
+        .record()
+        .upload_parts()
+        .into_iter()
+        .partition(|&(_, content_length)| content_length == 0);
+    assert_eq!(
+        1,
+        data_parts.len(),
+        "the single data part must be uploaded once"
+    );
+    assert_eq!(
+        0,
+        empty_parts.len(),
+        "a stream that yielded data must not also send an empty part 1"
+    );
+}
+
+/// A full-object checksum supplied by the stream must reach CompleteMultipartUpload even
+/// though the length was never declared.
+///
+/// The checksum is a property of the stream, not of any part, so it is orthogonal to the
+/// unknown-length machinery — this pins that, since the value is only produced after the
+/// final part and the transfer decides "final" from end-of-stream rather than a count.
+#[tokio::test]
+async fn test_unknown_length_forwards_full_object_checksum() {
+    let part_size = ByteSize::mib(5).as_usize();
+    // Base64 of a CRC32 value; the test only checks that it is forwarded verbatim.
+    let expected_checksum = "AAAAAA==";
+
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
+
+    let (tx, rx) = mpsc::channel(1);
+    let stream = TestStream::unknown_length_with_checksum(rx, expected_checksum.to_owned());
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32))
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    drop(tx);
+
+    handle.join().await.expect("upload should succeed");
+    let completions = mock.record().completions();
+    let checksums: Vec<_> = completions
+        .iter()
+        .map(CompleteMultipartUploadInput::checksum_crc32)
+        .collect();
+    assert_eq!(
+        vec![Some(expected_checksum)],
+        checksums,
+        "a stream-supplied full-object checksum must be sent on CompleteMPU"
+    );
+}
+
+/// An unknown-length transfer cannot report a total while in flight, but its final
+/// metrics must report the true size.
+///
+/// `total_bytes` is seeded from the size hint, which is absent here, so it is set once
+/// end-of-stream makes the summed size exact. Without that, a completed streaming upload
+/// would report `total_bytes: None` forever.
+#[tokio::test]
+async fn test_unknown_length_reports_total_bytes_after_completion() {
+    let part_size = ByteSize::mib(5).as_usize();
+    let tail = 512;
+    let expected = (part_size + tail) as u64;
+
+    let tm = MultipartMock::new().tm();
+
+    let (tx, rx) = mpsc::channel(2);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::unknown_length(
+            rx,
+        )))
+        .initiate()
+        .unwrap();
+
+    // No declared length, so nothing to report yet.
+    assert_eq!(
+        None,
+        handle.metrics().total_bytes,
+        "an unknown-length transfer must not invent a total while in flight"
+    );
+
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    tx.send(Bytes::from(vec![0u8; tail])).await.unwrap();
+    drop(tx);
+
+    let output = handle.join().await.expect("upload should succeed");
+
+    assert_eq!(
+        Some(expected),
+        output.metrics.total_bytes,
+        "final metrics must report the streamed size once end-of-stream makes it exact"
+    );
+    assert_eq!(
+        expected, output.metrics.network_tx,
+        "every streamed byte must be accounted for on the wire"
+    );
+}
+
+/// A reader error part-way through an unknown-length stream fails the transfer rather
+/// than being mistaken for end-of-stream.
+///
+/// `Ok(None)` means "done" and `Err` means "broken"; conflating them would silently
+/// complete a truncated object, which is the worst possible outcome for an upload.
+#[tokio::test]
+async fn test_unknown_length_reader_error_fails_transfer() {
+    let tm = MultipartMock::new().tm();
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(
+            ScriptedPartStream::failing_after_one_part(),
+        ))
+        .initiate()
+        .unwrap();
+
+    let err = handle
+        .join()
+        .await
+        .expect_err("a reader error must fail the upload, not complete it");
+    assert!(
+        matches!(err.kind(), ErrorKind::IOError),
+        "expected an IO error, got {:?}",
+        err.kind()
+    );
+}
+
+/// A stream that yields more parts than the unknown-length default capacity must still
+/// complete with every part accounted for.
+///
+/// With no declared length there is no part count to size `completed_parts` by, so it
+/// starts at a small default (32) and grows. This walks past that boundary so a
+/// mis-sized or truncated part list would show up as a wrong `MpuObjectSize`.
+#[tokio::test]
+async fn test_unknown_length_many_parts_grows_part_list() {
+    // Smallest permitted part size keeps the test cheap; 40 parts crosses the 32 default.
+    let part_size = ByteSize::mib(5).as_usize();
+    let num_parts = 40usize;
+    let expected_total = (part_size * num_parts) as i64;
+
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
+
+    let (tx, rx) = mpsc::channel(4);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::unknown_length(
+            rx,
+        )))
+        .initiate()
+        .unwrap();
+
+    tokio::spawn(async move {
+        for _ in 0..num_parts {
+            if tx.send(Bytes::from(vec![0u8; part_size])).await.is_err() {
+                return;
+            }
+        }
+        drop(tx);
+    });
+
+    handle
+        .join()
+        .await
+        .expect("an unknown-length stream must handle more parts than the default capacity");
+
+    assert_eq!(
+        vec![Some(expected_total)],
+        mock.record().mpu_object_sizes(),
+        "MpuObjectSize must count every part"
+    );
+    assert_eq!(
+        num_parts,
+        mock.record().upload_part_calls(),
+        "every part must be uploaded exactly once"
+    );
+}
+
+/// A stream exceeding the S3 part limit fails with a message naming the remedy.
+///
+/// The guard keys on parts the reader actually yielded, so an exactly-`MAX_PARTS` stream must still
+/// succeed — only the part past the limit trips it. Driving this through the public API is what pins
+/// the trip point; the part size is irrelevant to the count, so one byte per part suffices.
+#[tokio::test]
+async fn test_unknown_length_exceeding_part_limit_fails() {
+    const MAX_PARTS: u64 = 10_000;
+
+    let tm = MultipartMock::new().tm();
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(ScriptedPartStream::counting(
+            1,
+            MAX_PARTS + 1,
+        )))
+        .initiate()
+        .unwrap();
+
+    let err = handle
+        .join()
+        .await
+        .expect_err("a stream past the part limit must fail");
+
+    assert_eq!(ErrorKind::InputInvalid, *err.kind());
+    let msg = format!(
+        "{}",
+        aws_smithy_types::error::display::DisplayErrorContext(&err)
+    );
+    assert!(
+        msg.contains("maximum of 10000 parts"),
+        "error must name the part limit and the remedy, got: {msg}"
+    );
+}
+
+/// A stream of exactly `MAX_PARTS` must upload, not trip the limit.
+///
+/// End-of-stream on a custom stream is only observed on the dispatch after the last part, so a guard
+/// keyed on dispatches rather than parts actually yielded would reject this legitimate object.
+#[tokio::test]
+async fn test_unknown_length_exactly_max_parts_succeeds() {
+    const MAX_PARTS: u64 = 10_000;
+
+    let tm = MultipartMock::new().tm();
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(ScriptedPartStream::counting(
+            1, MAX_PARTS,
+        )))
+        .initiate()
+        .unwrap();
+
+    handle
+        .join()
+        .await
+        .expect("a stream of exactly the maximum part count must upload");
+}
+
+/// Returns the error a failed numbered-part upload reported, as a message.
+fn part_number_failure_message(error: &Error) -> String {
+    assert_eq!(ErrorKind::InputInvalid, *error.kind());
+    format!(
+        "{}",
+        aws_smithy_types::error::display::DisplayErrorContext(error)
+    )
+}
+
+/// A part number outside S3's range fails the upload before that part is sent.
+///
+/// 0 and 10,001 are outside the range. 2^32 + 1 is too, and narrowing it to 32 bits would place
+/// the part at position 1.
+#[tokio::test]
+async fn test_part_numbers_outside_range_fail_before_upload_part() {
+    for rejected in [0u64, 10_001, (1 << 32) + 1] {
+        let (result, mock) = upload_numbered_parts(&[rejected]).await;
+
+        let error = result.expect_err("an unusable part number must fail the upload");
+        let message = part_number_failure_message(&error);
+        assert!(
+            message.contains(&format!("part number {rejected}")),
+            "error must name the rejected part number, got: {message}"
+        );
+        assert!(
+            mock.record().upload_parts().is_empty(),
+            "part number {rejected} must not be sent"
+        );
+        assert!(
+            mock.record().completions().is_empty(),
+            "part number {rejected} must not complete the upload"
+        );
+    }
+}
+
+/// A part number used twice fails the upload before CompleteMultipartUpload.
+///
+/// Two parts at one position would describe an object neither produced. The repeat is found when
+/// the part list is assembled, so both parts reach UploadPart; what must not happen is completing
+/// the upload over that list.
+#[tokio::test]
+async fn test_repeated_part_numbers_fail_before_completing_the_upload() {
+    let (result, mock) = upload_numbered_parts(&[1, 1]).await;
+
+    let error = result.expect_err("a repeated part number must fail the upload");
+    let message = part_number_failure_message(&error);
+    assert!(
+        message.contains("part number 1 more than once"),
+        "error must name the repeated part number, got: {message}"
+    );
+    assert!(
+        mock.record().completions().is_empty(),
+        "a repeated part number must not complete the upload"
+    );
+}
+
+/// Part numbers within S3's range reach UploadPart and CompleteMultipartUpload unchanged, with each
+/// part's data, whatever order the stream yields them in.
+#[tokio::test]
+async fn test_part_numbers_in_range_reach_the_wire_in_any_order() {
+    for part_numbers in [&[1, 2, 3][..], &[2, 1]] {
+        let (result, mock) = upload_numbered_parts(part_numbers).await;
+        result.expect("unique part numbers within range must upload");
+
+        let mut expected: Vec<(i32, i64)> = part_numbers
+            .iter()
+            .enumerate()
+            .map(|(position, &part_number)| (part_number as i32, position as i64 + 1))
+            .collect();
+        expected.sort_unstable();
+        let mut upload_parts = mock.record().upload_parts();
+        upload_parts.sort_unstable();
+        assert_eq!(expected, upload_parts, "part numbers {part_numbers:?}");
+
+        let mut listed: Vec<i32> = part_numbers.iter().map(|&n| n as i32).collect();
+        listed.sort_unstable();
+        assert_eq!(
+            vec![listed],
+            mock.record().completed_part_numbers(),
+            "CompleteMultipartUpload must list every part in part-number order"
+        );
+    }
+}
+
+/// A positive lower bound rejects an empty source without synthesizing a part.
+///
+/// Empty-part synthesis is based on whether zero satisfies the declared bounds, not merely whether
+/// a size hint exists.
+#[tokio::test]
+async fn test_positive_lower_bound_never_synthesizes_empty_part() {
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
+
+    // Declare a positive exact size and then reach EOF without yielding a part.
+    let (tx, rx) = mpsc::channel(1);
+    let declared = ByteSize::mib(5).as_u64();
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::exact(
+            rx, declared,
+        )))
+        .initiate()
+        .unwrap();
+
+    drop(tx);
+    let error = handle
+        .join()
+        .await
+        .expect_err("an empty stream below its declared lower bound must fail");
+
+    assert_eq!(*error.kind(), ErrorKind::InputInvalid);
+    // Split the recorded parts by body size so the empty ones' count is the assertion.
+    let (empty_parts, data_parts): (Vec<_>, Vec<_>) = mock
+        .record()
+        .upload_parts()
+        .into_iter()
+        .partition(|&(_, content_length)| content_length == 0);
+    assert_eq!(
+        0,
+        empty_parts.len(),
+        "a positive lower bound must prevent empty-part synthesis"
+    );
+    assert_eq!(0, data_parts.len());
+    assert_eq!(0, mock.record().complete_calls());
+}
+
+// --- UploadPart responses ----------------------------------------------------
+
+/// Uploads parts 1 to 3, where `part_two`, a rule matching only part 2's UploadPart, answers it
+/// without a usable ETag. Checks that the upload fails with a `ServiceError` reporting no ETag
+/// for part 2, without re-sending part 2 or completing, and returns the upload's error.
+async fn upload_failing_on_part_two(part_two: Rule) -> Error {
+    let mock = MultipartMock::new().with_override(&part_two);
+    let tm = mock.tm();
+
+    let error = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(ScriptedPartStream::numbered(
+            &[1, 2, 3],
+        )))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect_err("a part without an ETag must fail the upload");
+
+    assert_eq!(ErrorKind::ServiceError, *error.kind());
+    let message = format!(
+        "{}",
+        aws_smithy_types::error::display::DisplayErrorContext(&error)
+    );
+    assert!(
+        message.contains("UploadPart returned no ETag for part 2"),
+        "error must name the operation and part, got: {message}"
+    );
+    assert_eq!(1, part_two.num_calls(), "part 2 must not be re-sent");
+    assert_eq!(0, mock.record().complete_calls());
+    assert_eq!(
+        1,
+        mock.record().abort_calls(),
+        "the failed upload must be aborted"
+    );
+    error
+}
+
+/// Uploads parts 1 to 3, where the UploadPart response for part 2 carries `part_two_e_tag`, and
+/// checks that the upload fails without re-sending part 2 or completing.
+async fn assert_upload_fails_on_part_two_e_tag(part_two_e_tag: Option<&'static str>) {
+    let part_two = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.part_number() == Some(2))
+        .then_output(move || {
+            UploadPartOutput::builder()
+                .set_e_tag(part_two_e_tag.map(str::to_owned))
+                .build()
+        });
+    upload_failing_on_part_two(part_two).await;
+}
+
+/// A successful UploadPart response without an ETag fails the upload before
+/// CompleteMultipartUpload, which could not list the part.
+#[tokio::test]
+async fn test_upload_part_without_e_tag_fails_upload() {
+    assert_upload_fails_on_part_two_e_tag(None).await;
+}
+
+/// An empty ETag identifies no part, and is treated as a missing one.
+#[tokio::test]
+async fn test_upload_part_with_empty_e_tag_fails_upload() {
+    assert_upload_fails_on_part_two_e_tag(Some("")).await;
+}
+
+/// The error for an UploadPart response without an ETag carries the operation name and the
+/// response's request ids, as an error from a failed UploadPart does.
+#[tokio::test]
+async fn test_upload_part_without_e_tag_error_carries_request_ids() {
+    const REQUEST_ID: &str = "upload-part-request-id";
+    const EXTENDED_REQUEST_ID: &str = "upload-part-extended-request-id";
+    // The output builder cannot set request ids, so part 2 is answered with a raw 200 response
+    // that carries them and no ETag.
+    let part_two = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.part_number() == Some(2))
+        .then_http_response(|| {
+            let mut response =
+                HttpResponse::new(StatusCode::try_from(200).unwrap(), SdkBody::empty());
+            response
+                .headers_mut()
+                .insert("x-amz-request-id", REQUEST_ID);
+            response
+                .headers_mut()
+                .insert("x-amz-id-2", EXTENDED_REQUEST_ID);
+            response
+        });
+
+    let error = upload_failing_on_part_two(part_two).await;
+
+    assert_eq!(Some("UploadPart"), error.operation_name());
+    assert_eq!(Some(REQUEST_ID), error.request_id());
+    assert_eq!(Some(EXTENDED_REQUEST_ID), error.extended_request_id());
+    let display = error.to_string();
+    assert!(
+        display.contains(REQUEST_ID),
+        "Display must include the request id, got: {display}"
+    );
+}
+
+// --- Multipart upload left open ------------------------------------------------
+
+/// Uploads parts 1 to 3 against `mock`, where UploadPart for part 2 fails with a non-retryable
+/// `AccessDenied`, under `policy`, and returns the error `join()` reports.
+async fn join_error_after_part_two_fails(
+    mock: MultipartMock,
+    policy: Option<FailedMultipartUploadPolicy>,
+) -> (Error, MultipartMock) {
+    let part_two = mock!(aws_sdk_s3::Client::upload_part)
+        .match_requests(|req| req.part_number() == Some(2))
+        .then_http_response(|| {
+            HttpResponse::new(
+                StatusCode::try_from(403).unwrap(),
+                SdkBody::from("<Error><Code>AccessDenied</Code></Error>"),
+            )
+        });
+    let mock = mock.with_override(&part_two);
+    let error = mock
+        .tm()
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(ScriptedPartStream::numbered(
+            &[1, 2, 3],
+        )))
+        .set_failed_multipart_upload_policy(policy)
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect_err("a failed part must fail the upload");
+    assert_eq!(Some("UploadPart"), error.operation_name());
+    (error, mock)
+}
+
+// ref: RUST-1693
+/// Under `FailedMultipartUploadPolicy::Retain`, a failed upload leaves its multipart upload open,
+/// sends no AbortMultipartUpload, and the error carries the upload ID.
+#[tokio::test]
+async fn test_retained_failed_upload_error_carries_upload_id() {
+    let (error, mock) = join_error_after_part_two_fails(
+        MultipartMock::new(),
+        Some(FailedMultipartUploadPolicy::Retain),
+    )
+    .await;
+
+    assert_eq!(0, mock.record().abort_calls());
+    assert_eq!(Some(MOCK_UPLOAD_ID), error.upload_id());
+}
+
+// ref: RUST-1693
+/// When the AbortMultipartUpload a failure sends also fails, the multipart upload is still open,
+/// and the error carries its upload ID.
+#[tokio::test]
+async fn test_failed_abort_error_carries_upload_id() {
+    let abort_mpu = mock!(aws_sdk_s3::Client::abort_multipart_upload).then_http_response(|| {
+        HttpResponse::new(
+            StatusCode::try_from(403).unwrap(),
+            SdkBody::from("<Error><Code>AccessDenied</Code></Error>"),
+        )
+    });
+    let (error, _mock) =
+        join_error_after_part_two_fails(MultipartMock::new().with_override(&abort_mpu), None).await;
+
+    assert_eq!(1, abort_mpu.num_calls());
+    assert_eq!(Some(MOCK_UPLOAD_ID), error.upload_id());
+}
+
+// ref: RUST-1693
+/// When the AbortMultipartUpload a failure sends succeeds, no multipart upload is left open, and
+/// the error carries no upload ID.
+#[tokio::test]
+async fn test_aborted_failed_upload_error_has_no_upload_id() {
+    let (error, mock) = join_error_after_part_two_fails(MultipartMock::new(), None).await;
+
+    assert_eq!(1, mock.record().abort_calls());
+    assert_eq!(None, error.upload_id());
+}
+
+// ref: RUST-1693
+/// A panic in the caller's `PartStream` after CreateMultipartUpload fails the upload with
+/// `RuntimeError` from outside its state machine, which sends no AbortMultipartUpload. The
+/// multipart upload is left open, and the error carries its upload ID.
+#[tokio::test]
+async fn test_part_stream_panic_error_carries_upload_id() {
+    let mock = MultipartMock::new();
+    // An unknown size selects a multipart upload, whose parts are read only once
+    // CreateMultipartUpload has returned the upload ID.
+    let stream = ScriptedPartStream::new(SizeHint::default(), |_stream_cx| {
+        panic!("PartStream panicked")
+    });
+    let error = mock
+        .tm()
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect_err("a PartStream panic must fail the upload");
+
+    assert_eq!(&ErrorKind::RuntimeError, error.kind());
+    assert_eq!(0, mock.record().abort_calls());
+    assert_eq!(Some(MOCK_UPLOAD_ID), error.upload_id());
+}
+
+// --- Local file errors -------------------------------------------------------
+
+/// Asserts that `error` is an `IOError` whose message is `I/O error {action} "{path}"` and whose
+/// source is a `NotFound` operating system error.
+fn assert_missing_file_error(error: &Error, action: &str, path: &std::path::Path) {
+    assert_file_io_error(error, action, path, std::io::ErrorKind::NotFound);
+}
+
+/// Asserts that `error` is an `IOError` whose message is `I/O error {action} "{path}"` and whose
+/// source is an operating system error of kind `source_kind`.
+fn assert_file_io_error(
+    error: &Error,
+    action: &str,
+    path: &std::path::Path,
+    source_kind: std::io::ErrorKind,
+) {
+    assert_eq!(ErrorKind::IOError, *error.kind());
+    assert_eq!(
+        format!("I/O error {action} \"{}\"", path.display()),
+        error.to_string()
+    );
+    let io_error = std::error::Error::source(error)
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .expect("the source is the operating system's error");
+    assert_eq!(source_kind, io_error.kind());
+}
+
+// ref: RUST-1202
+/// Reading the size of a missing source file fails with an error naming the action and path.
+#[test]
+fn test_from_path_missing_file_error_names_action_and_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing.bin");
+
+    let error = InputStream::from_path(&path).expect_err("a missing file has no size");
+    assert_missing_file_error(&error, "reading metadata of", &path);
+}
+
+/// Uploads a body read from `path`, which cannot be read, with an explicit `length` so the stream
+/// builds without reading the file, and returns the error `join()` reports.
+async fn upload_unreadable_file(path: &std::path::Path, length: u64) -> Error {
+    let mock = MultipartMock::new();
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+    let tm = mock.with_override(&put_object).tm();
+    let stream = InputStream::read_from()
+        .path(path)
+        .length(length)
+        .build()
+        .expect("an explicit length skips reading the file");
+    let error = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(stream)
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect_err("an unreadable source file must fail the upload");
+    assert_eq!(0, put_object.num_calls(), "no PutObject is sent");
+    error
+}
+
+// ref: RUST-1202
+/// A single-request upload whose source file cannot be opened fails with an error naming the
+/// action and path.
+#[tokio::test]
+async fn test_put_object_upload_missing_file_error_names_action_and_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing.bin");
+
+    let error = upload_unreadable_file(&path, 16).await;
+    assert_missing_file_error(&error, "opening", &path);
+}
+
+// ref: RUST-1202
+/// A multipart upload whose source file is missing fails with an error naming the action and
+/// path. The file's metadata is read before CreateMultipartUpload is sent, so that read is the
+/// action that fails.
+#[tokio::test]
+async fn test_multipart_upload_missing_file_error_names_action_and_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing.bin");
+
+    let error = upload_unreadable_file(&path, ByteSize::mib(32).as_u64()).await;
+    assert_missing_file_error(&error, "reading metadata of", &path);
+}
+
+// ref: RUST-1674
+/// A multipart upload whose source file has readable metadata but cannot be opened fails with an
+/// error naming the open and the path. The file's mode is
+/// `000`, so its metadata check passes and the part reader's open, after CreateMultipartUpload
+/// returns, fails with `PermissionDenied`. A process that can open the file regardless, such as
+/// one running as root, skips the test.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_multipart_upload_unreadable_file_error_names_action_and_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unreadable.bin");
+    std::fs::write(&path, b"").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&path).is_ok() {
+        return;
+    }
+
+    let error = upload_unreadable_file(&path, ByteSize::mib(32).as_u64()).await;
+
+    assert_file_io_error(
+        &error,
+        "opening",
+        &path,
+        std::io::ErrorKind::PermissionDenied,
+    );
+}
+
+// --- Request body ------------------------------------------------------------
+
+/// An upload without a body fails at `initiate()` and sends nothing, rather than storing an empty
+/// object over the key. This holds whether the body was never set or was set to `None`.
+#[tokio::test]
+async fn test_upload_without_body_fails_at_initiate() {
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+    let tm = tm_with(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]));
+
+    let never_set = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .content_type("text/plain")
+        .initiate()
+        .expect_err("an upload with no body must not start");
+    assert_eq!(ErrorKind::InputInvalid, *never_set.kind());
+
+    let set_to_none = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .set_body(None)
+        .initiate()
+        .expect_err("an upload whose body was set to None must not start");
+    assert_eq!(ErrorKind::InputInvalid, *set_to_none.kind());
+
+    assert_eq!(0, put_object.num_calls());
+}
+
+/// An explicitly empty body uploads an empty object with one PutObject.
+#[tokio::test]
+async fn test_explicit_empty_body_uploads_empty_object() {
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests(|req| req.body().bytes() == Some(&b""[..]))
+        .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+    let tm = tm_with(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]));
+
+    tm.upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_static(b""))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect("an explicitly empty body must upload an empty object");
+    assert_eq!(1, put_object.num_calls());
+}
+
+// --- Conditional-write preconditions -----------------------------------------
+//
+// Assertion shape: check the header on the request the mock received, so a
+// missing/wrong precondition fails the test rather than silently passing. A
+// PutObject rule uses `match_requests`, which fails the join; the multipart path
+// reads the `MultipartRecord`.
+
+/// A single-PUT upload with `if_none_match("*")` must forward the header to
+/// `PutObject`. Satisfied case: the mock rule matches, upload succeeds.
+#[tokio::test]
+async fn test_put_object_forwards_if_none_match() {
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests(|req| req.if_none_match() == Some("*"))
+        .then_output(|| PutObjectOutput::builder().e_tag("test-etag").build());
+    let tm = tm_with(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[put_object]));
+
+    tm.upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .if_none_match("*")
+        .body(InputStream::from(vec![0u8; 1024]))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect("PutObject must carry the caller's If-None-Match header");
+}
+
+/// When S3 returns 412 on the single-PUT path, the transfer must fail with the
+/// service code reachable — that is how a caller tells a failed `If-Match` from
+/// any other service error. The 412 must also be terminal: neither the SDK's own
+/// retry (412 is a non-retryable 4xx) nor the TM's outer retry loop may re-issue
+/// it, so the request is sent exactly once.
+#[tokio::test]
+async fn test_put_object_412_surfaces_precondition_failed_code() {
+    let put_object = mock!(aws_sdk_s3::Client::put_object).then_http_response(|| {
+        HttpResponse::new(
+            StatusCode::try_from(412).unwrap(),
+            SdkBody::from("<Error><Code>PreconditionFailed</Code></Error>"),
+        )
+    });
+    let tm = tm_with(mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&put_object]));
+
+    let err = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .if_match("\"stale-etag\"")
+        .body(InputStream::from(vec![0u8; 1024]))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect_err("a 412 on PutObject must fail the upload");
+    assert!(
+        matches!(err.kind(), ErrorKind::ServiceError),
+        "expected ErrorKind::ServiceError, got {:?}",
+        err.kind()
+    );
+    assert_eq!(
+        err.code(),
+        Some("PreconditionFailed"),
+        "caller must be able to identify the precondition failure by service code"
+    );
+    // The underlying SdkError is preserved as the source for callers who want
+    // the raw 412 detail.
+    let src = std::error::Error::source(&err).expect("source is set");
+    assert!(
+        src.downcast_ref::<SdkError<PutObjectError, HttpResponse>>()
+            .is_some(),
+        "source should be the underlying PutObject SdkError"
+    );
+    // A precondition failure is deterministic — it must not be retried.
+    assert_eq!(
+        put_object.num_calls(),
+        1,
+        "PutObject 412 must be issued exactly once (no SDK or TM retry)"
+    );
+}
+
+/// The multipart path must forward `if_match` / `if_none_match` to
+/// `CompleteMultipartUpload` (and only there — never on `CreateMultipartUpload`
+/// or `UploadPart`, where S3 doesn't accept them and mixing them in would
+/// silently drop the header at build time).
+#[tokio::test]
+async fn test_complete_mpu_forwards_if_match() {
+    let part_size = ByteSize::mib(5).as_usize();
+    let content_length = 2 * part_size;
+    let expected_etag = "\"expected-etag\"";
+
+    let mock = MultipartMock::new();
+    let tm = mock.tm();
+
+    let (tx, rx) = mpsc::channel(2);
+    let stream = TestStream::exact(rx, content_length as u64);
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .if_match(expected_etag)
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    drop(tx);
+    handle.join().await.expect("upload should succeed");
+    let completions = mock.record().completions();
+    let if_match: Vec<_> = completions
+        .iter()
+        .map(CompleteMultipartUploadInput::if_match)
+        .collect();
+    assert_eq!(
+        vec![Some(expected_etag)],
+        if_match,
+        "CompleteMultipartUpload must carry the caller's If-Match header"
+    );
+}
+
+/// When S3 rejects `CompleteMultipartUpload` with 412, the multipart path must
+/// surface the same service code the single-PUT path does. Mirrors that test but
+/// exercises the MPU code path (which fails at a different site than PutObject).
+#[tokio::test]
+async fn test_complete_mpu_412_surfaces_precondition_failed_code() {
+    let part_size = ByteSize::mib(5).as_usize();
+    let content_length = 2 * part_size;
+
+    let complete_mpu =
+        mock!(aws_sdk_s3::Client::complete_multipart_upload).then_http_response(|| {
+            HttpResponse::new(
+                StatusCode::try_from(412).unwrap(),
+                SdkBody::from("<Error><Code>PreconditionFailed</Code></Error>"),
+            )
+        });
+    let tm = MultipartMock::new().with_override(&complete_mpu).tm();
+
+    let (tx, rx) = mpsc::channel(2);
+    let stream = TestStream::exact(rx, content_length as u64);
+
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .if_match("\"stale-etag\"")
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    tx.send(Bytes::from(vec![0u8; part_size])).await.unwrap();
+    drop(tx);
+    let err = handle
+        .join()
+        .await
+        .expect_err("a 412 on CompleteMultipartUpload must fail the upload");
+    assert!(
+        matches!(err.kind(), ErrorKind::ServiceError),
+        "expected ErrorKind::ServiceError, got {:?}",
+        err.kind()
+    );
+    assert_eq!(
+        err.code(),
+        Some("PreconditionFailed"),
+        "caller must be able to identify the precondition failure by service code"
+    );
+    let src = std::error::Error::source(&err).expect("source is set");
+    assert!(
+        src.downcast_ref::<SdkError<CompleteMultipartUploadError, HttpResponse>>()
+            .is_some(),
+        "source should be the underlying CompleteMultipartUpload SdkError"
+    );
+}
+
+// --- Source release on failure -----------------------------------------------
+
+/// How long a producer may wait, once the upload has failed, for its channel to close.
+const SOURCE_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A non-retryable error response.
+fn precondition_failed() -> HttpResponse {
+    HttpResponse::new(
+        StatusCode::try_from(412).unwrap(),
+        SdkBody::from("<Error><Code>PreconditionFailed</Code></Error>"),
+    )
+}
+
+/// Starts an unknown-length upload of the stream fed by the returned sender. A channel of one
+/// part is a producer applying backpressure: a second `send` waits until the upload takes the
+/// first part.
+fn upload_from_channel(
+    tm: &aws_s3_transfer::Client,
+) -> (
+    mpsc::Sender<Bytes>,
+    aws_s3_transfer::operation::upload::UploadHandle,
+) {
+    let (tx, rx) = mpsc::channel(1);
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(TestStream::unknown_length(
+            rx,
+        )))
+        .initiate()
+        .unwrap();
+    (tx, handle)
+}
+
+/// Waits for the upload to fail, then for the producer's channel to close while the handle is
+/// still held. A `send` blocked on the channel returns its error at the same moment.
+async fn assert_failure_releases_stream(
+    tx: &mpsc::Sender<Bytes>,
+    handle: &aws_s3_transfer::operation::upload::UploadHandle,
+) {
+    tokio::time::timeout(SOURCE_RELEASE_TIMEOUT, async {
+        while handle.status() != aws_s3_transfer::types::TransferStatus::Failed {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("upload did not fail");
+    tokio::time::timeout(SOURCE_RELEASE_TIMEOUT, tx.closed())
+        .await
+        .expect("failed upload retained its stream while the handle was held");
+}
+
+// ref: awslabs/aws-s3-transfer-manager-rs#226
+/// A failed UploadPart releases the custom stream while the caller still holds the handle, so a
+/// producer applying backpressure observes its channel close rather than waiting forever for the
+/// upload to take another part.
+#[tokio::test]
+async fn test_upload_part_failure_releases_stream_while_handle_held() {
+    let upload_part =
+        mock!(aws_sdk_s3::Client::upload_part).then_http_response(precondition_failed);
+    let mock = MultipartMock::new().with_override(&upload_part);
+    let (tx, handle) = upload_from_channel(&mock.tm());
+
+    tx.send(Bytes::from_static(b"part one")).await.unwrap();
+    assert_failure_releases_stream(&tx, &handle).await;
+
+    handle.join().await.expect_err("UploadPart failed");
+    assert_eq!(1, upload_part.num_calls());
+}
+
+// ref: awslabs/aws-s3-transfer-manager-rs#226
+/// A failed CreateMultipartUpload releases the custom stream it never read, while the caller still
+/// holds the handle.
+///
+/// The producer sends nothing: the failure can release the stream before a first `send` runs, so
+/// the assertion does not depend on that order.
+#[tokio::test]
+async fn test_create_multipart_failure_releases_stream_while_handle_held() {
+    let create_mpu =
+        mock!(aws_sdk_s3::Client::create_multipart_upload).then_http_response(precondition_failed);
+    let mock = MultipartMock::new().with_override(&create_mpu);
+    let (tx, handle) = upload_from_channel(&mock.tm());
+
+    assert_failure_releases_stream(&tx, &handle).await;
+
+    handle
+        .join()
+        .await
+        .expect_err("CreateMultipartUpload failed");
+    assert_eq!(0, mock.record().upload_part_calls());
+}
+
+/// Panics the worker that sends UploadPart without running the panic hook. With
+/// `RUST_BACKTRACE` set, the hook captures and prints a backtrace before the worker unwinds, which
+/// takes seconds under ThreadSanitizer.
+fn upload_part_panic() -> ! {
+    std::panic::resume_unwind(Box::new("UploadPart panicked"))
+}
+
+// ref: awslabs/aws-s3-transfer-manager-rs#226
+/// A worker panic fails the upload from outside its state machine. The custom stream is still
+/// released while the caller holds the handle.
+#[tokio::test]
+async fn test_worker_panic_releases_stream_while_handle_held() {
+    let upload_part = mock!(aws_sdk_s3::Client::upload_part)
+        .then_output(|| -> UploadPartOutput { upload_part_panic() });
+    let mock = MultipartMock::new().with_override(&upload_part);
+    let (tx, handle) = upload_from_channel(&mock.tm());
+
+    tx.send(Bytes::from_static(b"part one")).await.unwrap();
+    assert_failure_releases_stream(&tx, &handle).await;
+
+    let err = handle.join().await.expect_err("a worker panicked");
+    assert_eq!(err.kind(), &ErrorKind::RuntimeError);
+}
+
+/// Answers CreateMultipartUpload, holds part 1's UploadPart forever, adding a permit to
+/// `part_one_sent` when it arrives, and panics on part 2's.
+#[derive(Debug)]
+struct HeldPartThenPanicConnector {
+    part_one_sent: Arc<Semaphore>,
+}
+
+impl HttpConnector for HeldPartThenPanicConnector {
+    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+        let uri = request.uri().to_string();
+        if uri.contains("partNumber=1") {
+            self.part_one_sent.add_permits(1);
+            return HttpConnectorFuture::new(std::future::pending());
+        }
+        if uri.contains("partNumber=2") {
+            upload_part_panic();
+        }
+        assert!(
+            request.method() == "POST" && uri.contains("uploads"),
+            "unexpected request: {} {uri}",
+            request.method()
+        );
+        HttpConnectorFuture::ready(Ok(HttpResponse::new(
+            200.try_into().unwrap(),
+            SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+                    <InitiateMultipartUploadResult>
+                        <Bucket>test-bucket</Bucket>
+                        <Key>test-key</Key>
+                        <UploadId>test-upload-id</UploadId>
+                    </InitiateMultipartUploadResult>"#,
+            ),
+        )))
+    }
+}
+
+// ref: awslabs/aws-s3-transfer-manager-rs#226
+/// A worker panic interrupts a part whose request has not returned, so the custom stream that
+/// part's reader holds is released while the caller holds the handle.
+#[tokio::test]
+async fn test_worker_panic_releases_stream_held_by_a_hung_part() {
+    let part_one_sent = Arc::new(Semaphore::new(0));
+    let connector = SharedHttpConnector::new(HeldPartThenPanicConnector {
+        part_one_sent: part_one_sent.clone(),
+    });
+    let client = aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::config::Config::builder()
+            .http_client(http_client_fn(move |_, _| connector.clone()))
+            .region(aws_sdk_s3::config::Region::new("us-west-2"))
+            .with_test_defaults()
+            .build(),
+    );
+    let tm = aws_s3_transfer::Client::new(
+        aws_s3_transfer::Config::builder()
+            .s3_config(test_common::s3_config_with_test_http(
+                client.config().to_builder(),
+            ))
+            .concurrency(aws_s3_transfer::config::ConcurrencyMode::Explicit(4))
+            .build()
+            .expect("valid config"),
+    );
+    let (tx, handle) = upload_from_channel(&tm);
+
+    tx.send(Bytes::from_static(b"part one")).await.unwrap();
+    tokio::time::timeout(SOURCE_RELEASE_TIMEOUT, part_one_sent.acquire())
+        .await
+        .expect("part 1 was not sent")
+        .expect("semaphore closed")
+        .forget();
+    tx.send(Bytes::from_static(b"part two")).await.unwrap();
+    assert_failure_releases_stream(&tx, &handle).await;
+}
+
+/// A custom stream whose `full_object_checksum` signals `entered` and then blocks its thread
+/// until `release`, standing in for a slow checksum computation.
+#[derive(Debug)]
+struct SlowChecksumStream {
+    inner: TestStream,
+    entered: Arc<Semaphore>,
+    release: Arc<std::sync::Barrier>,
+    dropped: Arc<Semaphore>,
+}
+
+impl Drop for SlowChecksumStream {
+    fn drop(&mut self) {
+        self.dropped.add_permits(1);
+    }
+}
+
+impl PartStream for SlowChecksumStream {
+    fn poll_part(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        stream_cx: &StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        std::pin::Pin::new(&mut self.inner).poll_part(cx, stream_cx)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+
+    fn full_object_checksum(&self) -> Option<String> {
+        self.entered.add_permits(1);
+        self.release.wait();
+        None
+    }
+}
+
+// ref: awslabs/aws-s3-transfer-manager-rs#226
+/// An upload whose handle is dropped while CompleteMultipartUpload prepares its request, here
+/// while the caller's stream computes the full-object checksum, never sends it.
+#[tokio::test]
+async fn test_complete_not_sent_when_upload_ends_during_checksum() {
+    let complete = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+    let mock = MultipartMock::new().with_override(&complete);
+    let tm = mock.tm();
+    let entered = Arc::new(Semaphore::new(0));
+    let dropped = Arc::new(Semaphore::new(0));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let (tx, rx) = mpsc::channel(1);
+    let stream = SlowChecksumStream {
+        inner: TestStream::unknown_length(rx),
+        entered: entered.clone(),
+        release: release.clone(),
+        dropped: dropped.clone(),
+    };
+    let handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32))
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap();
+    tx.send(Bytes::from_static(b"part one")).await.unwrap();
+    drop(tx);
+    tokio::time::timeout(SOURCE_RELEASE_TIMEOUT, entered.acquire())
+        .await
+        .expect("CompleteMultipartUpload did not request the checksum")
+        .expect("semaphore closed")
+        .forget();
+    assert_eq!(complete.num_calls(), 0);
+
+    drop(handle);
+    release.wait();
+    drop(tm);
+    tokio::time::timeout(SOURCE_RELEASE_TIMEOUT, dropped.acquire())
+        .await
+        .expect("the stream was not dropped")
+        .expect("semaphore closed")
+        .forget();
+    assert_eq!(complete.num_calls(), 0);
+}

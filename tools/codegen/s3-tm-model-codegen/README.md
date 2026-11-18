@@ -21,7 +21,7 @@ just test-codegen
 
 `codegen` writes artifacts, not TM source. `install-model` independently
 regenerates in temporary storage before comparing or installing
-`aws-sdk-s3-transfer-manager/src/model` and `src/sdk_v1`; running `codegen` first
+`crates/aws-s3-transfer/src/model` and `src/sdk_v1`; running `codegen` first
 is not required. Review the installed Rust changes with Git.
 
 `just` is optional shorthand for `python3 tools/scripts/codegen`,
@@ -205,7 +205,7 @@ this Gradle project's `build/model-codegen/raw`. The entire `src/model` subtree
 is generated, including exports, enum helpers, and fluent field delegation.
 The standalone crate depends on `aws-smithy-types`, not `aws-sdk-s3`.
 Installation copies only the Rust module trees, not manifests, build scripts,
-or reports. Values are public under `aws_sdk_s3_transfer_manager::model`;
+or reports. Values are public under `aws_s3_transfer::model`;
 the SDK adapter module is crate-private.
 
 Change generator policies rather than editing installed files:
@@ -296,8 +296,8 @@ backup and `target/codegen/install-model.lock` before removing a stale lock.
 ```sh
 just test-codegen
 just install-model --check --pinned-only
-cargo test --locked -p aws-sdk-s3-transfer-manager --lib --test model_api_test
-cargo test --locked -p aws-sdk-s3-transfer-manager \
+cargo test --locked -p aws-s3-transfer --lib --test model_api_test
+cargo test --locked -p aws-s3-transfer \
   --lib --test sdk_v1_compat_test --features sdk-v1
 ```
 
@@ -316,7 +316,7 @@ cached or downloadable. Generated Rust fixture caches are
 `target/codegen/cargo-home` and `target/codegen/cargo-target`.
 
 The TM tests use installed code and real stream, policy, and metrics types.
-Handwritten internal tests live under `aws-sdk-s3-transfer-manager/src/tests`,
+Handwritten internal tests live under `crates/aws-s3-transfer/src/tests`,
 outside generated roots; tests under the crate's `tests` directory exercise
 external-consumer APIs. The required modeled-generation CI job runs tooling
 tests, pinned installed-source checking, and these real-runtime tests.

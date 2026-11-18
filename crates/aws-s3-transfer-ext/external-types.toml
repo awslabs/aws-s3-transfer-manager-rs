@@ -1,0 +1,4 @@
+allowed_external_types = [
+    "aws_s3_transfer::config::runtime::Managed",
+    "aws_smithy_execution::runtime::ManagedRuntime",
+]

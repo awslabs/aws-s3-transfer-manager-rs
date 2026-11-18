@@ -1,14 +1,14 @@
 [workspace]
 resolver = "3"
 members = [
-    "aws-sdk-s3-transfer-manager",
+    "crates/aws-s3-transfer",
     "crates/aws-smithy-topology",
     "crates/aws-smithy-execution",
     "crates/aws-smithy-managed-http",
-    "crates/aws-sdk-s3-transfer-manager-ext",
+    "crates/aws-s3-transfer-ext",
 
     # internal
-    "s3-mock-server",
+    "crates/s3-mock-server",
     "benches",
     "integration-tests",
     "wasm32-wasi-tests",
@@ -21,7 +21,7 @@ edition = "2024"
 authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>"]
 
 [workspace.dependencies]
-aws-sdk-s3-transfer-manager = { version = "=0.4.0", path = "aws-sdk-s3-transfer-manager", default-features = false }
+aws-s3-transfer = { version = "=1.0.0", path = "crates/aws-s3-transfer", default-features = false }
 aws-credential-types = "1.3.0"
 aws-smithy-managed-http = { version = "0.1.0", path = "crates/aws-smithy-managed-http" }
 aws-smithy-async = "1.3.0"

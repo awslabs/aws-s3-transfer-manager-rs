@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Integration tests for aws-sdk-s3-transfer-manager.
+//! Integration tests for aws-s3-transfer.
 //!
 //! These tests use s3-mock-server to test the full transfer manager flow
 //! against a real HTTP server, validating the public API without mocking internals.
@@ -20,6 +20,7 @@ mod metrics;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod network_interfaces;
 mod test_data;
+mod test_util;
 mod upload;
 mod upload_objects;
 mod upload_retry;

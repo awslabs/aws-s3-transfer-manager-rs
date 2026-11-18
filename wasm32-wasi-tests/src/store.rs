@@ -6,16 +6,16 @@
 //! A scenario's connection to the mock S3 server, and a record of the
 //! requests its transfer-manager clients send.
 
-use aws_sdk_s3_transfer_manager::types::ByteSize;
+use aws_s3_transfer::types::ByteSize;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use aws_s3_transfer::config::Builder as ConfigBuilder;
+use aws_s3_transfer::config::PartSize;
+use aws_s3_transfer::{Client, Config};
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3_transfer_manager::config::Builder as ConfigBuilder;
-use aws_sdk_s3_transfer_manager::config::PartSize;
-use aws_sdk_s3_transfer_manager::{Client, Config};
 use aws_smithy_async::rt::sleep::TokioSleep;
 use aws_smithy_runtime_api::client::http::{
     http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector,

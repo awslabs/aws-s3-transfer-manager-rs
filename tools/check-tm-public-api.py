@@ -10,8 +10,8 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TM = "aws-sdk-s3-transfer-manager"
-ADAPTER = "crates/aws-sdk-s3-transfer-manager-ext"
+TM = "crates/aws-s3-transfer"
+ADAPTER = "crates/aws-s3-transfer-ext"
 
 
 def check(package, config, *features):
@@ -78,7 +78,7 @@ def check_ordinary():
         if removed != 1:
             raise RuntimeError("expected one s3_tm_dial9 dev-dependency table")
         text, removed = re.subn(
-            r"^aws-sdk-s3-transfer-manager-ext = .*\n", "", text, flags=re.M
+            r"^aws-s3-transfer-ext = .*\n", "", text, flags=re.M
         )
         if removed != 1:
             raise RuntimeError("expected one extension-crate dev-dependency")

@@ -1,0 +1,1361 @@
+/*
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+use aws_s3_transfer::types::ByteSize;
+use std::{str::FromStr, task::Poll};
+
+use aws_s3_transfer::config::{ConcurrencyMode, PartSize};
+use aws_s3_transfer::{
+    io::{InputStream, PartData, PartStream, SizeHint},
+    operation::upload::UploadOutput,
+    types::checksum::{CompositeAlgorithm, Crc32, Crc32C, Crc64Nvme, Sha1, Sha256},
+    types::{ChecksumAlgorithm, ChecksumStrategy, ChecksumType},
+};
+use aws_sdk_s3::operation::{
+    complete_multipart_upload::CompleteMultipartUploadOutput,
+    create_multipart_upload::CreateMultipartUploadOutput, put_object::PutObjectOutput,
+    upload_part::UploadPartOutput,
+};
+use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
+use bytes::Bytes;
+use pin_project_lite::pin_project;
+
+const PART_SIZE: usize = ByteSize::mib(5).as_usize();
+
+fn calculate_checksum(algorithm: &ChecksumAlgorithm, data: &[u8]) -> String {
+    let smithy_algorithm =
+        aws_smithy_checksums::ChecksumAlgorithm::from_str(algorithm.as_str()).unwrap();
+    let mut http_checksum = smithy_algorithm.into_impl();
+    http_checksum.update(data);
+    http_checksum.header_value().to_str().unwrap().to_string()
+}
+
+fn calculate_full_object_checksum(algorithm: &ChecksumAlgorithm, parts: &Vec<Bytes>) -> String {
+    // S3 doesn't allow SHA algorithms to do full-object checksums with multipart upload
+    assert_ne!(algorithm, &ChecksumAlgorithm::Sha1);
+    assert_ne!(algorithm, &ChecksumAlgorithm::Sha256);
+
+    let smithy_algorithm =
+        aws_smithy_checksums::ChecksumAlgorithm::from_str(algorithm.as_str()).unwrap();
+    let mut http_checksum = smithy_algorithm.into_impl();
+    for part in parts {
+        http_checksum.update(part.as_ref());
+    }
+    http_checksum.header_value().to_str().unwrap().to_string()
+}
+
+fn calculate_composite_checksum(algorithm: &ChecksumAlgorithm, parts: &Vec<Bytes>) -> String {
+    // S3 doesn't allow CRC64NVME to do composite checksums
+    assert_ne!(algorithm, &ChecksumAlgorithm::Crc64Nvme);
+
+    let mut concatenated_part_checksums = String::new();
+    for part in parts {
+        let checksum = calculate_checksum(algorithm, part.as_ref());
+        concatenated_part_checksums.push_str(&checksum);
+    }
+
+    let composite_checksum = calculate_checksum(algorithm, concatenated_part_checksums.as_bytes());
+    let count = parts.len();
+    format!("{composite_checksum}-{count}")
+}
+
+/// Calculate final Composite or FullObject checksum for multipart upload
+fn calculate_multipart_checksum(
+    algorithm: &ChecksumAlgorithm,
+    checksum_type: &ChecksumType,
+    parts: &Vec<Bytes>,
+) -> String {
+    match checksum_type {
+        ChecksumType::Composite => calculate_composite_checksum(algorithm, parts),
+        ChecksumType::FullObject => calculate_full_object_checksum(algorithm, parts),
+        _ => panic!("unrecognized checksum type"),
+    }
+}
+
+/// Calculate ETag as it appears in S3 headers, with the extra quotes and everything
+fn calculate_etag(data: &[u8]) -> String {
+    let digest = md5::compute(data);
+    format!("\"{digest:x}\"")
+}
+
+/// Get checksum algorithm and value from types like PutObjectInput,
+/// that have a field per algorithm (checksum_crc32, checksum_crc64_nvme, etc)
+/// Returns Optional<(ChecksumAlgorithm, String)>
+#[macro_export]
+macro_rules! get_checksum_value {
+    ($shape:expr) => {{
+        let algorithms_and_optional_values = [
+            (ChecksumAlgorithm::Crc32, $shape.checksum_crc32()),
+            (ChecksumAlgorithm::Crc32C, $shape.checksum_crc32_c()),
+            (ChecksumAlgorithm::Crc64Nvme, $shape.checksum_crc64_nvme()),
+            (ChecksumAlgorithm::Sha1, $shape.checksum_sha1()),
+            (ChecksumAlgorithm::Sha256, $shape.checksum_sha256()),
+        ];
+
+        let mut found: Option<(ChecksumAlgorithm, String)> = None;
+        for (algorithm, optional_value) in algorithms_and_optional_values {
+            if let Some(value) = optional_value {
+                if found.is_some() {
+                    panic!("Multiple checksums are set, but only one is allowed.")
+                }
+                found = Some((algorithm, value.to_string()));
+            }
+        }
+
+        found
+    }};
+}
+
+/// Set checksum value on types like PutObjectFluentBuilder,
+/// that have a field per algorithm (checksum_crc32, checksum_crc64_nvme, etc).
+#[macro_export]
+macro_rules! set_checksum_value {
+    ($builder:expr, $algorithm:expr, $value:expr) => {
+        match $algorithm {
+            ChecksumAlgorithm::Crc32 => $builder.checksum_crc32($value),
+            ChecksumAlgorithm::Crc32C => $builder.checksum_crc32_c($value),
+            ChecksumAlgorithm::Crc64Nvme => $builder.checksum_crc64_nvme($value),
+            ChecksumAlgorithm::Sha1 => $builder.checksum_sha1($value),
+            ChecksumAlgorithm::Sha256 => $builder.checksum_sha256($value),
+            _ => panic!("unknown algorithm"),
+        }
+    };
+}
+
+pin_project! {
+    #[derive(Debug)]
+    struct TestStream {
+        parts: Vec<Bytes>,
+        next_part_num: u64,
+        part_checksums: Vec<Option<String>>,
+        full_object_checksum: Option<String>,
+    }
+}
+
+impl TestStream {
+    pub fn new(
+        parts: Vec<Bytes>,
+        checksum_strategy: Option<ChecksumStrategy>,
+        send_checksums_from_part_stream: bool,
+        send_full_object_checksum_from_part_stream: bool,
+    ) -> Self {
+        let part_checksums = if send_checksums_from_part_stream {
+            // assert this test is set up in a valid way
+            let checksum_strategy = checksum_strategy.as_ref().unwrap();
+
+            parts
+                .iter()
+                .map(|x| Some(calculate_checksum(checksum_strategy.algorithm(), x)))
+                .collect()
+        } else {
+            vec![None; parts.len()]
+        };
+
+        let full_object_checksum = if send_full_object_checksum_from_part_stream {
+            // assert this test is set up in a valid way
+            let checksum_strategy = checksum_strategy.as_ref().unwrap();
+            assert_eq!(
+                checksum_strategy.multipart_checksum_type(),
+                &ChecksumType::FullObject
+            );
+            assert!(checksum_strategy.expected_value().is_none());
+
+            Some(calculate_full_object_checksum(
+                checksum_strategy.algorithm(),
+                &parts,
+            ))
+        } else {
+            None
+        };
+
+        TestStream {
+            parts,
+            next_part_num: 1,
+            part_checksums,
+            full_object_checksum,
+        }
+    }
+}
+
+impl PartStream for TestStream {
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _stream_cx: &aws_s3_transfer::io::StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        let this = self.project();
+        let part_index = *this.next_part_num as usize - 1;
+        let part = this.parts.get(part_index).map(|b| {
+            let part_number = *this.next_part_num;
+            *this.next_part_num += 1;
+            let mut part_data = PartData::new(part_number, b.clone());
+            if let Some(checksum) = &this.part_checksums[part_index] {
+                part_data = part_data.with_checksum(checksum);
+            }
+
+            Ok(part_data)
+        });
+        Poll::Ready(part)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::exact(self.parts.iter().map(|b| b.len() as u64).sum())
+    }
+
+    fn full_object_checksum(&self) -> Option<String> {
+        self.full_object_checksum.clone()
+    }
+}
+
+fn mock_s3_client_for_multipart_upload(
+    request_strategy: Option<ChecksumStrategy>,
+    response_algorithm: ChecksumAlgorithm,
+    response_checksum_type: ChecksumType,
+    expected_parts: &Vec<Bytes>,
+    expect_checksums_from_part_stream: bool,
+    expect_full_object_checksum_from_part_stream: bool,
+) -> aws_sdk_s3::Client {
+    let mock_client_rules = multipart_upload_rules(
+        request_strategy,
+        response_algorithm,
+        response_checksum_type,
+        expected_parts,
+        expect_checksums_from_part_stream,
+        expect_full_object_checksum_from_part_stream,
+    );
+    mock_client!(aws_sdk_s3, RuleMode::Sequential, &mock_client_rules)
+}
+
+/// Rules for a multipart upload, in the order a completed upload sends them: CreateMultipartUpload
+/// (index 0), one UploadPart per expected part (indices `1..=expected_parts.len()`),
+/// CompleteMultipartUpload, then AbortMultipartUpload, which only a failed upload sends.
+fn multipart_upload_rules(
+    request_strategy: Option<ChecksumStrategy>,
+    response_algorithm: ChecksumAlgorithm,
+    response_checksum_type: ChecksumType,
+    expected_parts: &Vec<Bytes>,
+    expect_checksums_from_part_stream: bool,
+    expect_full_object_checksum_from_part_stream: bool,
+) -> Vec<Rule> {
+    let mut mock_client_rules: Vec<Rule> = Vec::new();
+
+    // Pre-calculate stuff for later
+    let upload_id = "test-upload-id".to_string();
+    let part_checksums: Vec<String> = expected_parts
+        .iter()
+        .map(|part| calculate_checksum(&response_algorithm, part))
+        .collect();
+
+    let part_etags: Vec<String> = expected_parts
+        .iter()
+        .map(|part| calculate_etag(part))
+        .collect();
+
+    let multipart_checksum =
+        calculate_multipart_checksum(&response_algorithm, &response_checksum_type, expected_parts);
+
+    // CreateMultipartUpload
+    mock_client_rules.push(
+        mock!(aws_sdk_s3::Client::create_multipart_upload)
+            .match_requests({
+                let request_strategy = request_strategy.clone();
+                move |input| {
+                    // checksum algorithm and type should only be specified if a strategy is being used
+                    assert_eq!(
+                        input.checksum_algorithm().map(|v| v.as_str()),
+                        request_strategy.as_ref().map(|s| s.algorithm().as_str())
+                    );
+                    assert_eq!(
+                        input.checksum_type().map(|v| v.as_str()),
+                        request_strategy
+                            .as_ref()
+                            .map(|s| s.multipart_checksum_type().as_str())
+                    );
+                    true
+                }
+            })
+            .then_output({
+                let upload_id = upload_id.clone();
+                let response_algorithm = response_algorithm.clone();
+                let response_checksum_type = response_checksum_type.clone();
+                move || {
+                    CreateMultipartUploadOutput::builder()
+                        .upload_id(&upload_id)
+                        .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::from(
+                            response_algorithm.as_str(),
+                        ))
+                        .checksum_type(aws_sdk_s3::types::ChecksumType::from(
+                            response_checksum_type.as_str(),
+                        ))
+                        .build()
+                }
+            }),
+    );
+
+    // N UploadPart rules
+    for part_i in 0..expected_parts.len() {
+        mock_client_rules.push(
+            mock!(aws_sdk_s3::Client::upload_part)
+                .match_requests({
+                    let upload_id = upload_id.clone();
+                    let request_strategy = request_strategy.clone();
+                    let part_checksum = part_checksums[part_i].clone();
+                    let part_number = part_i as i32 + 1;
+                    move |input| {
+                        assert_eq!(input.upload_id(), Some(upload_id.as_str()));
+                        assert_eq!(input.part_number(), Some(part_number));
+
+                        let mut input_has_checksum_value = false;
+
+                        if let Some(request_strategy) = &request_strategy {
+                            // Transfer Manager is doing checksums.
+                            // If it doesn't know the part's actual checksum value, it should set the algorithm.
+                            if let Some((field_algorithm, field_value)) = get_checksum_value!(input)
+                            {
+                                input_has_checksum_value = true;
+
+                                assert_eq!(&field_algorithm, request_strategy.algorithm());
+                                assert_eq!(field_value, part_checksum);
+                                // doesn't matter if algorithm is set too, but if it is, it should be correct
+                                if let Some(input_algorithm) = input.checksum_algorithm() {
+                                    assert_eq!(
+                                        input_algorithm.as_str(),
+                                        request_strategy.algorithm().as_str()
+                                    );
+                                }
+                            } else {
+                                assert!(!expect_checksums_from_part_stream);
+                                assert_eq!(
+                                    input.checksum_algorithm().map(|v| v.as_str()),
+                                    Some(request_strategy.algorithm().as_str())
+                                );
+                            }
+                        } else {
+                            // Transfer Manager is not doing checksums
+                            assert_eq!(input.checksum_algorithm(), None);
+                            assert!(get_checksum_value!(input).is_none());
+                        }
+
+                        // Assert that, if test is configured to stream part checksums, that they're in the request
+                        assert_eq!(input_has_checksum_value, expect_checksums_from_part_stream);
+                        true
+                    }
+                })
+                .then_output({
+                    let response_algorithm = response_algorithm.clone();
+                    let part_checksum = part_checksums[part_i].clone();
+                    let part_etag = part_etags[part_i].clone();
+                    move || {
+                        let mut resp = UploadPartOutput::builder().e_tag(&part_etag);
+                        // As of 2025, S3 always sends checksums in UploadPart responses
+                        resp = set_checksum_value!(resp, response_algorithm, &part_checksum);
+                        resp.build()
+                    }
+                }),
+        );
+    }
+
+    // CompleteMultipartUpload
+    mock_client_rules.push(
+        mock!(aws_sdk_s3::Client::complete_multipart_upload)
+            .match_requests({
+                let upload_id = upload_id.clone();
+                let request_strategy = request_strategy.clone();
+                let response_algorithm = response_algorithm.clone();
+                let part_checksums = part_checksums.clone();
+                let part_etags = part_etags.clone();
+                let multipart_checksum = multipart_checksum.clone();
+                move |input| {
+                    assert_eq!(input.upload_id(), Some(upload_id.as_str()));
+
+                    // The full-object checksum value should be in the CompleteMultipartUpload
+                    // if it was passed via ChecksumStrategy, or via PartStream.
+                    let input_checksum_field = get_checksum_value!(input);
+                    if let Some(request_strategy) = &request_strategy {
+                        assert_eq!(
+                            input.checksum_type().map(|v| v.as_str()),
+                            Some(request_strategy.multipart_checksum_type().as_str())
+                        );
+
+                        if let Some((field_algorithm, field_value)) = &input_checksum_field {
+                            assert_eq!(field_algorithm, request_strategy.algorithm());
+                            assert_eq!(field_value, &multipart_checksum);
+                            assert!(
+                                request_strategy.expected_value().is_some()
+                                    || expect_full_object_checksum_from_part_stream
+                            );
+                        } else {
+                            assert!(request_strategy.expected_value().is_none());
+                            assert!(!expect_full_object_checksum_from_part_stream);
+                        }
+                    } else {
+                        assert!(input_checksum_field.is_none());
+                        assert!(input.checksum_type.is_none());
+                    }
+
+                    // The multipart_upload struct should include info about each part
+                    let input_parts = input.multipart_upload().unwrap().parts();
+                    assert_eq!(input_parts.len(), part_checksums.len());
+                    for input_part in input_parts {
+                        let part_i =
+                            usize::try_from(input_part.part_number().unwrap() - 1).unwrap();
+                        assert_eq!(input_part.e_tag(), Some(part_etags[part_i].as_str()));
+
+                        // As of 2025, S3 always sends a checksum in UploadPart responses,
+                        // ensure these checksums are reported in CompleteMultipartUpload.
+                        // (Technically, it would be OK to omit the part checksums in a few situations,
+                        // they only seem to be required for composite checksums,
+                        // but it never hurts to include them, so do it for simplicity's sake)
+                        let (input_part_algorithm, input_part_checksum) =
+                            get_checksum_value!(input_part).unwrap();
+                        assert_eq!(input_part_checksum, part_checksums[part_i]);
+                        assert_eq!(input_part_algorithm, response_algorithm);
+                    }
+
+                    true
+                }
+            })
+            .then_output({
+                let response_algorithm = response_algorithm.clone();
+                let response_checksum_type = response_checksum_type.clone();
+                let multipart_checksum = multipart_checksum.clone();
+                move || {
+                    // As of 2025, S3 always sends a checksum in CompleteMultipartUpload response
+                    let mut req = CompleteMultipartUploadOutput::builder().checksum_type(
+                        aws_sdk_s3::types::ChecksumType::from(response_checksum_type.as_str()),
+                    );
+                    req = set_checksum_value!(req, &response_algorithm, &multipart_checksum);
+                    req.build()
+                }
+            }),
+    );
+
+    // AbortMultipartUpload, sent only when the upload fails
+    mock_client_rules.push(
+        mock!(aws_sdk_s3::Client::abort_multipart_upload)
+            .match_requests(move |input| {
+                assert_eq!(input.upload_id(), Some(upload_id.as_str()));
+                true
+            })
+            .then_output(|| {
+                aws_sdk_s3::operation::abort_multipart_upload::AbortMultipartUploadOutput::builder()
+                    .build()
+            }),
+    );
+
+    mock_client_rules
+}
+
+fn mock_s3_client_for_put_object(
+    request_strategy: Option<ChecksumStrategy>,
+    response_algorithm: ChecksumAlgorithm,
+    expected_body: &Bytes,
+) -> aws_sdk_s3::Client {
+    let mut mock_client_rules: Vec<Rule> = Vec::new();
+
+    // Pre-calculate stuff for later
+    let checksum_value = calculate_checksum(&response_algorithm, expected_body);
+    let etag = calculate_etag(expected_body);
+
+    // PutObject
+    mock_client_rules.push(
+        mock!(aws_sdk_s3::Client::put_object)
+            .match_requests({
+                let request_strategy = request_strategy.clone();
+                move |input| {
+                    if let Some(request_strategy) = &request_strategy {
+                        // Transfer Manager is doing checksums.
+                        if let Some(provided_checksum) = &request_strategy.expected_value() {
+                            // Full-object checksum provided up front. Assert it was used
+                            let (input_checksum_algorithm, input_checksum_value) =
+                                get_checksum_value!(input).unwrap();
+                            assert_eq!(&input_checksum_algorithm, request_strategy.algorithm());
+                            assert_eq!(&input_checksum_value, provided_checksum);
+                        } else {
+                            // Transfer Manager should set algorithm, so SDK will calculate actual checksum value
+                            assert_eq!(
+                                input.checksum_algorithm().map(|v| v.as_str()),
+                                Some(request_strategy.algorithm().as_str())
+                            );
+                        }
+                    } else {
+                        // Transfer Manager is not doing checksums
+                        assert!(get_checksum_value!(input).is_none());
+                        assert_eq!(input.checksum_algorithm(), None);
+                    }
+
+                    true
+                }
+            })
+            .then_output({
+                let response_algorithm = response_algorithm.clone();
+                let checksum_value = checksum_value.clone();
+                let etag = etag.clone();
+                move || {
+                    // As of 2025, S3 always sends checksums in PutObject responses
+                    let mut resp = PutObjectOutput::builder()
+                        .e_tag(&etag)
+                        .checksum_type(aws_sdk_s3::types::ChecksumType::FullObject);
+                    resp = set_checksum_value!(resp, response_algorithm, &checksum_value);
+
+                    resp.build()
+                }
+            }),
+    );
+
+    mock_client!(aws_sdk_s3, RuleMode::Sequential, &mock_client_rules)
+}
+
+async fn test_mpu(
+    user_checksum_strategy: Option<ChecksumStrategy>,
+    parts: Vec<Bytes>,
+) -> UploadOutput {
+    run_test(TestConfig {
+        user_checksum_strategy,
+        parts,
+        send_as_multipart: true,
+        ..Default::default()
+    })
+    .await
+}
+
+async fn test_put_object(
+    user_checksum_strategy: Option<ChecksumStrategy>,
+    body: Bytes,
+) -> UploadOutput {
+    run_test(TestConfig {
+        user_checksum_strategy,
+        parts: vec![body],
+        send_as_multipart: false,
+        ..Default::default()
+    })
+    .await
+}
+
+struct TestConfig {
+    user_checksum_strategy: Option<ChecksumStrategy>,
+    parts: Vec<Bytes>,
+    send_as_multipart: bool,
+    send_checksums_from_part_stream: bool,
+    send_full_object_checksum_from_part_stream: bool,
+    sdk_checksum_calculation: aws_sdk_s3::config::RequestChecksumCalculation,
+}
+
+impl Default for TestConfig {
+    fn default() -> Self {
+        Self {
+            user_checksum_strategy: None,
+            parts: Vec::new(),
+            send_as_multipart: true,
+            send_checksums_from_part_stream: false,
+            send_full_object_checksum_from_part_stream: false,
+            sdk_checksum_calculation: aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported,
+        }
+    }
+}
+
+impl TestConfig {
+    async fn run(self) -> UploadOutput {
+        run_test(self).await
+    }
+}
+
+async fn run_test(config: TestConfig) -> UploadOutput {
+    // This is the ChecksumStrategy we expect the Transfer Manager to use while sending requests
+    let request_checksum_strategy = config.user_checksum_strategy.clone().or(
+        // If user didn't set a strategy, Transfer Manager should fall back to default strategy,
+        // unless user also disabled checksums via SDK's config.
+        if config.sdk_checksum_calculation
+            == aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported
+        {
+            Some(ChecksumStrategy::default())
+        } else {
+            None
+        },
+    );
+
+    // Determine which kind of checksums will be in the response.
+    // As of 2025, S3 always provides checksums in response, even if request had none.
+    let (response_checksum_algorithm, response_checksum_type) = match &request_checksum_strategy {
+        None => (ChecksumAlgorithm::Crc64Nvme, ChecksumType::FullObject),
+        Some(request_checksum_strategy) => (
+            request_checksum_strategy.algorithm().clone(),
+            request_checksum_strategy.multipart_checksum_type().clone(),
+        ),
+    };
+
+    // Create mock aws_sdk_s3::Client
+    let s3_client = if config.send_as_multipart {
+        mock_s3_client_for_multipart_upload(
+            request_checksum_strategy.clone(),
+            response_checksum_algorithm.clone(),
+            response_checksum_type.clone(),
+            &config.parts,
+            config.send_checksums_from_part_stream,
+            config.send_full_object_checksum_from_part_stream,
+        )
+    } else {
+        assert_eq!(config.parts.len(), 1);
+        mock_s3_client_for_put_object(
+            request_checksum_strategy.clone(),
+            response_checksum_algorithm.clone(),
+            &config.parts[0],
+        )
+    };
+
+    // Adjust client's SDK config to use specific RequestChecksumCalculation
+    let s3_client = aws_sdk_s3::Client::from_conf(
+        s3_client
+            .config()
+            .to_builder()
+            .request_checksum_calculation(config.sdk_checksum_calculation)
+            .build(),
+    );
+
+    let body_stream: InputStream = if config.send_as_multipart {
+        InputStream::from_part_stream(TestStream::new(
+            config.parts.clone(),
+            request_checksum_strategy.clone(),
+            config.send_checksums_from_part_stream,
+            config.send_full_object_checksum_from_part_stream,
+        ))
+    } else {
+        assert!(!config.send_checksums_from_part_stream);
+        assert!(!config.send_full_object_checksum_from_part_stream);
+        config.parts[0].clone().into()
+    };
+
+    let tm_config = aws_s3_transfer::Config::builder()
+        .s3_config(test_common::s3_config_with_test_http(
+            s3_client.config().to_builder(),
+        ))
+        .part_size(PartSize::Target(ByteSize::new(PART_SIZE as u64)))
+        .multipart_threshold(PartSize::Target(ByteSize::new(PART_SIZE as u64)))
+        .concurrency(ConcurrencyMode::Explicit(1)) // guarantee parts sent in order
+        .build()
+        .expect("valid config");
+    let tm = aws_s3_transfer::Client::new(tm_config);
+
+    // Do upload
+    let upload_handle = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .set_checksum_strategy(config.user_checksum_strategy.clone())
+        .body(body_stream)
+        .initiate()
+        .unwrap();
+    let upload_output = upload_handle.join().await.unwrap();
+
+    // As of 2025, S3 always sends a checksum in the response.
+    // Assert that checksum type and value fields are set.
+    // Don't check exact contents though, leave that up to individual tests.
+    assert!(upload_output.checksum_type().is_some());
+    assert!(get_checksum_value!(upload_output).is_some());
+
+    upload_output
+}
+
+//
+// Multipart Upload Tests
+//
+
+#[tokio::test]
+async fn test_mpu_provided_full_object_crc32() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let full_object_checksum = calculate_full_object_checksum(&ChecksumAlgorithm::Crc32, &parts);
+    let strategy = ChecksumStrategy::full_object(Crc32).with_expected_value(&full_object_checksum);
+    let output = test_mpu(Some(strategy), parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert_eq!(output.checksum_crc32(), Some(full_object_checksum.as_ref()));
+}
+
+#[tokio::test]
+async fn test_mpu_provided_full_object_crc32_c() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let full_object_checksum = calculate_full_object_checksum(&ChecksumAlgorithm::Crc32C, &parts);
+    let strategy = ChecksumStrategy::full_object(Crc32C).with_expected_value(&full_object_checksum);
+    let output = test_mpu(Some(strategy), parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert_eq!(
+        output.checksum_crc32_c(),
+        Some(full_object_checksum.as_ref())
+    );
+}
+
+#[tokio::test]
+async fn test_mpu_provided_full_object_crc64_nvme() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let full_object_checksum =
+        calculate_full_object_checksum(&ChecksumAlgorithm::Crc64Nvme, &parts);
+    let strategy =
+        ChecksumStrategy::full_object(Crc64Nvme).with_expected_value(&full_object_checksum);
+    let output = test_mpu(Some(strategy), parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert_eq!(
+        output.checksum_crc64_nvme(),
+        Some(full_object_checksum.as_ref())
+    );
+}
+
+// NOTE: SHA algorithms not currently allowed to provide full-object checksums,
+// because it would prevent Transfer Manager from doing multipart upload.
+
+#[tokio::test]
+async fn test_mpu_calculated_full_object_crc32() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let strategy = ChecksumStrategy::full_object(Crc32);
+    let output = test_mpu(Some(strategy), parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc32().is_some());
+}
+
+#[tokio::test]
+async fn test_mpu_calculated_full_object_crc32_c() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let strategy = ChecksumStrategy::full_object(Crc32C);
+    let output = test_mpu(Some(strategy), parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc32_c().is_some());
+}
+
+#[tokio::test]
+async fn test_mpu_calculated_full_object_crc64_nvme() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let strategy = ChecksumStrategy::full_object(Crc64Nvme);
+    let output = test_mpu(Some(strategy), parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc64_nvme().is_some());
+}
+
+// NOTE: SHA full-object MPU checksums not supported by S3
+
+#[tokio::test]
+async fn test_mpu_calculated_composite_crc32() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let strategy = ChecksumStrategy::composite(Crc32);
+    let output = test_mpu(Some(strategy), parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::Composite));
+    assert!(output.checksum_crc32().is_some());
+}
+
+#[tokio::test]
+async fn test_mpu_calculated_composite_crc32_c() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let strategy = ChecksumStrategy::composite(Crc32C);
+    let output = test_mpu(Some(strategy), parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::Composite));
+    assert!(output.checksum_crc32_c().is_some());
+}
+
+// NOTE: CRC64NVME composite checksums not supported by S3
+
+#[tokio::test]
+async fn test_mpu_calculated_composite_sha1() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let strategy = ChecksumStrategy::composite(Sha1);
+    let output = test_mpu(Some(strategy), parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::Composite));
+    assert!(output.checksum_sha1().is_some());
+}
+
+#[tokio::test]
+async fn test_mpu_calculated_composite_sha256() {
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let strategy = ChecksumStrategy::composite(Sha256);
+    let output = test_mpu(Some(strategy), parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::Composite));
+    assert!(output.checksum_sha256().is_some());
+}
+#[tokio::test]
+async fn test_mpu_default_strategy() {
+    // Test where user didn't set a strategy, but SDK is calculating checksums wherever possible (its default behavior).
+    // Transfer Manager should end up using the default checksum strategy (full-object CRC64NVME).
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let strategy: Option<ChecksumStrategy> = None;
+    let output = test_mpu(strategy, parts).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc64_nvme().is_some());
+}
+
+#[tokio::test]
+async fn test_mpu_no_strategy() {
+    // Test where user didn't set a strategy AND disabled checksums via SDK's config.
+    // Transfer Manager should not send any checksum data. But it will still receive checksums because,
+    // as of 2025, S3 always sends them in responses (defaulting to full-object CRC64NVME).
+    let output = TestConfig {
+        parts: vec![
+            Bytes::from(vec![b'a'; PART_SIZE]),
+            Bytes::from("abcdefghijklm".as_bytes()),
+        ],
+        user_checksum_strategy: None,
+        send_as_multipart: true,
+        sdk_checksum_calculation: aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+        ..Default::default()
+    }
+    .run()
+    .await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc64_nvme().is_some());
+}
+
+//
+// PutObject Upload Tests
+//
+// TODO(redux): These tests require single PutObject path (below MPU threshold).
+// Currently the new scheduler always uses MPU. Re-enable when PutObject is implemented.
+
+#[tokio::test]
+async fn test_put_object_provided_full_object_crc32() {
+    let body = Bytes::from("abcdefghijklm".as_bytes());
+    let full_object_checksum = calculate_checksum(&ChecksumAlgorithm::Crc32, &body);
+    let strategy = ChecksumStrategy::full_object(Crc32).with_expected_value(&full_object_checksum);
+    let output = test_put_object(Some(strategy), body).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert_eq!(output.checksum_crc32(), Some(full_object_checksum.as_ref()));
+}
+
+#[tokio::test]
+async fn test_put_object_provided_full_object_crc32_c() {
+    let body = Bytes::from("abcdefghijklm".as_bytes());
+    let full_object_checksum = calculate_checksum(&ChecksumAlgorithm::Crc32C, &body);
+    let strategy = ChecksumStrategy::full_object(Crc32C).with_expected_value(&full_object_checksum);
+    let output = test_put_object(Some(strategy), body).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert_eq!(
+        output.checksum_crc32_c(),
+        Some(full_object_checksum.as_ref())
+    );
+}
+
+#[tokio::test]
+async fn test_put_object_provided_full_object_crc64_nvme() {
+    let body = Bytes::from("abcdefghijklm".as_bytes());
+    let full_object_checksum = calculate_checksum(&ChecksumAlgorithm::Crc64Nvme, &body);
+    let strategy =
+        ChecksumStrategy::full_object(Crc64Nvme).with_expected_value(&full_object_checksum);
+    let output = test_put_object(Some(strategy), body).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert_eq!(
+        output.checksum_crc64_nvme(),
+        Some(full_object_checksum.as_ref())
+    );
+}
+
+// NOTE: SHA algorithms not currently allowed to provide full-object checksums,
+// because it would prevent Transfer Manager from doing multipart upload.
+
+#[tokio::test]
+async fn test_put_object_calculated_full_object_crc32() {
+    let body = Bytes::from("abcdefghijklm".as_bytes());
+    let strategy = ChecksumStrategy::full_object(Crc32);
+    let output = test_put_object(Some(strategy), body).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc32().is_some());
+}
+
+#[tokio::test]
+async fn test_put_object_calculated_full_object_crc32_c() {
+    let body = Bytes::from("abcdefghijklm".as_bytes());
+    let strategy = ChecksumStrategy::full_object(Crc32C);
+    let output = test_put_object(Some(strategy), body).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc32_c().is_some());
+}
+
+#[tokio::test]
+async fn test_put_object_calculated_full_object_crc64_nvme() {
+    let body = Bytes::from("abcdefghijklm".as_bytes());
+    let strategy = ChecksumStrategy::full_object(Crc64Nvme);
+    let output = test_put_object(Some(strategy), body).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc64_nvme().is_some());
+}
+
+#[tokio::test]
+async fn test_put_object_calculated_crc32_composite_if_multipart() {
+    let body = Bytes::from("abcdefghijklm".as_bytes());
+    let strategy = ChecksumStrategy::composite(Crc32);
+    let output = test_put_object(Some(strategy), body).await;
+    // NOTE: since it wasn't multipart, the checksum isn't composite
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc32().is_some());
+}
+
+#[tokio::test]
+async fn test_put_object_calculated_crc32_c_composite_if_multipart() {
+    let body = Bytes::from("abcdefghijklm".as_bytes());
+    let strategy = ChecksumStrategy::composite(Crc32C);
+    let output = test_put_object(Some(strategy), body).await;
+    // NOTE: since it wasn't multipart, the checksum isn't composite
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc32_c().is_some());
+}
+
+// NOTE: CRC64NVME composite checksums not supported by S3
+
+#[tokio::test]
+async fn test_put_object_calculated_sha1_composite_if_multipart() {
+    let body = Bytes::from("abcdefghijklm".as_bytes());
+    let strategy = ChecksumStrategy::composite(Sha1);
+    let output = test_put_object(Some(strategy), body).await;
+    // NOTE: since it wasn't multipart, the checksum isn't composite
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_sha1().is_some());
+}
+
+#[tokio::test]
+async fn test_put_object_calculated_sha256_composite_if_multipart() {
+    let body = Bytes::from("abcdefghijklm".as_bytes());
+    let strategy = ChecksumStrategy::composite(Sha256);
+    let output = test_put_object(Some(strategy), body).await;
+    // NOTE: since it wasn't multipart, the checksum isn't composite
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_sha256().is_some());
+}
+
+#[tokio::test]
+async fn test_put_object_default_strategy() {
+    // Test where user didn't set a strategy, but SDK is calculating checksums wherever possible (its default behavior).
+    // Transfer Manager should end up using the default checksum strategy (full-object CRC64NVME).
+    let body = Bytes::from("abcdefghijklm".as_bytes());
+    let strategy: Option<ChecksumStrategy> = None;
+    let output = test_put_object(strategy, body).await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc64_nvme().is_some());
+}
+
+#[tokio::test]
+async fn test_put_object_no_strategy() {
+    // Test where user didn't set a strategy AND disabled checksums via SDK's config.
+    // Transfer Manager should not send any checksum data. But it will still receive checksums because,
+    // as of 2025, S3 always sends them in responses (defaulting to full-object CRC64NVME).
+    let output = TestConfig {
+        parts: vec![Bytes::from("abcdefghijklm".as_bytes())],
+        user_checksum_strategy: None,
+        send_as_multipart: false,
+        sdk_checksum_calculation: aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+        ..Default::default()
+    }
+    .run()
+    .await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc64_nvme().is_some());
+}
+
+#[tokio::test]
+async fn test_mpu_checksums_from_part_stream() {
+    // Test where the PartStream provides checksum values, instead of letting the SDK calculate them.
+    let output = TestConfig {
+        parts: vec![
+            Bytes::from(vec![b'a'; PART_SIZE]),
+            Bytes::from("abcdefghijklm".as_bytes()),
+        ],
+        user_checksum_strategy: Some(ChecksumStrategy::full_object(Crc32)),
+        send_as_multipart: true,
+        send_checksums_from_part_stream: true,
+        send_full_object_checksum_from_part_stream: true,
+        ..Default::default()
+    }
+    .run()
+    .await;
+    assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
+    assert!(output.checksum_crc32().is_some());
+}
+
+//
+// Unsupported checksum inputs
+//
+
+/// Helper function builds a Transfer Manager over `s3_client` with the given request checksum policy.
+fn helper_create_transfer_manager(
+    s3_client: aws_sdk_s3::Client,
+    sdk_checksum_calculation: aws_sdk_s3::config::RequestChecksumCalculation,
+) -> aws_s3_transfer::Client {
+    let s3_config = s3_client
+        .config()
+        .to_builder()
+        .request_checksum_calculation(sdk_checksum_calculation);
+    let tm_config = aws_s3_transfer::Config::builder()
+        .s3_config(test_common::s3_config_with_test_http(s3_config))
+        .part_size(PartSize::Target(ByteSize::new(PART_SIZE as u64)))
+        .multipart_threshold(PartSize::Target(ByteSize::new(PART_SIZE as u64)))
+        .concurrency(ConcurrencyMode::Explicit(1))
+        .build()
+        .expect("valid config");
+    aws_s3_transfer::Client::new(tm_config)
+}
+
+/// Asserts that `error` is an input error whose cause names `expected_cause`.
+///
+/// The cause is reached through `source()`: the error's own `Display` carries only its kind.
+fn assert_input_invalid(error: &aws_s3_transfer::error::Error, expected_cause: &str) {
+    assert_eq!(
+        *error.kind(),
+        aws_s3_transfer::error::ErrorKind::InputInvalid,
+        "{error}"
+    );
+    let cause = std::error::Error::source(error)
+        .expect("an input error carries its cause")
+        .to_string();
+    assert!(cause.contains(expected_cause), "unexpected cause: {cause}");
+}
+
+// ref: RUST-1672
+#[tokio::test]
+async fn test_mpu_part_checksum_without_strategy_is_rejected() {
+    // The PartStream supplies part checksums, but no ChecksumStrategy is set and the SDK's
+    // config disables the default one, so nothing names the checksum algorithm.
+    let parts = vec![
+        Bytes::from(vec![b'a'; PART_SIZE]),
+        Bytes::from("abcdefghijklm".as_bytes()),
+    ];
+    let part_checksums = parts
+        .iter()
+        .map(|part| Some(calculate_checksum(&ChecksumAlgorithm::Crc32, part)))
+        .collect();
+    // With no strategy, S3 reports its default full-object CRC64NVME.
+    let rules = multipart_upload_rules(
+        None,
+        ChecksumAlgorithm::Crc64Nvme,
+        ChecksumType::FullObject,
+        &parts,
+        false,
+        false,
+    );
+    let (create, upload_parts, complete, abort) = (
+        &rules[0],
+        &rules[1..=parts.len()],
+        &rules[parts.len() + 1],
+        &rules[parts.len() + 2],
+    );
+    let stream = TestStream {
+        parts,
+        next_part_num: 1,
+        part_checksums,
+        full_object_checksum: None,
+    };
+
+    // The failed upload sends AbortMultipartUpload right after Create, out of the sequential order.
+    let tm = helper_create_transfer_manager(
+        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &rules),
+        aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+    );
+    let error = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .body(InputStream::from_part_stream(stream))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect_err("a part checksum without a ChecksumStrategy must fail the upload");
+
+    // Parts are read in order at concurrency 1, so part 1 is the first one rejected.
+    assert_input_invalid(
+        &error,
+        "upload stream supplied a checksum for part 1, but the upload has no ChecksumStrategy",
+    );
+    assert_eq!(create.num_calls(), 1);
+    assert!(
+        upload_parts.iter().all(|rule| rule.num_calls() == 0),
+        "the part carrying the checksum must not be sent"
+    );
+    assert_eq!(complete.num_calls(), 0);
+    // The failed upload is aborted, as for any failed part.
+    assert_eq!(abort.num_calls(), 1);
+}
+
+// ref: RUST-1672
+#[tokio::test]
+async fn test_mpu_content_md5_is_rejected() {
+    // A whole-object Content-MD5 cannot be sent with any multipart request.
+    let body = Bytes::from(vec![b'a'; PART_SIZE + 1]);
+    let content_md5 = aws_smithy_types::base64::encode(md5::compute(&body).0);
+
+    let strategy = ChecksumStrategy::default();
+    let rules = multipart_upload_rules(
+        Some(strategy.clone()),
+        strategy.algorithm().clone(),
+        strategy.multipart_checksum_type().clone(),
+        &vec![body.slice(..PART_SIZE), body.slice(PART_SIZE..)],
+        false,
+        false,
+    );
+    let tm = helper_create_transfer_manager(
+        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &rules),
+        aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported,
+    );
+    let error = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .content_md5(content_md5)
+        .body(InputStream::from(body))
+        .initiate()
+        .expect_err("content_md5 on a multipart upload must fail the upload");
+
+    assert_input_invalid(
+        &error,
+        "upload content_md5 is not supported for multipart uploads",
+    );
+    assert!(
+        rules.iter().all(|rule| rule.num_calls() == 0),
+        "no multipart request may be sent"
+    );
+}
+
+// ref: RUST-1672
+#[tokio::test]
+async fn test_put_object_content_md5_is_sent() {
+    let body = Bytes::from("abcdefghijklm".as_bytes());
+    let content_md5 = aws_smithy_types::base64::encode(md5::compute(&body).0);
+
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests({
+            let content_md5 = content_md5.clone();
+            move |input| input.content_md5() == Some(content_md5.as_str())
+        })
+        .then_output({
+            let etag = calculate_etag(&body);
+            move || PutObjectOutput::builder().e_tag(&etag).build()
+        });
+    let tm = helper_create_transfer_manager(
+        mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&put_object]),
+        aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported,
+    );
+    tm.upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .content_md5(content_md5)
+        .body(InputStream::from(body))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect("a single-request upload sends content_md5");
+
+    assert_eq!(put_object.num_calls(), 1);
+}
+
+/// Asserts that a single-request upload with a composite `algorithm` strategy and an expected
+/// value sends that value in the algorithm's PutObject header, in place of a calculated one: a
+/// single-request upload's checksum is a full object checksum.
+async fn assert_put_object_sends_composite_expected_value<A: CompositeAlgorithm>(algorithm: A) {
+    let strategy = ChecksumStrategy::composite(algorithm);
+    let algorithm = strategy.algorithm().clone();
+    let body = Bytes::from("abcdefghijklm".as_bytes());
+    let expected_value = calculate_checksum(&algorithm, &body);
+
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests({
+            let (algorithm, expected_value) = (algorithm.clone(), expected_value.clone());
+            move |input| {
+                input.checksum_algorithm().is_none()
+                    && get_checksum_value!(input)
+                        == Some((algorithm.clone(), expected_value.clone()))
+            }
+        })
+        .then_output({
+            let (algorithm, etag) = (algorithm.clone(), calculate_etag(&body));
+            let expected_value = expected_value.clone();
+            move || {
+                let output = PutObjectOutput::builder()
+                    .e_tag(&etag)
+                    .checksum_type(aws_sdk_s3::types::ChecksumType::FullObject);
+                match &algorithm {
+                    ChecksumAlgorithm::Sha1 => output.checksum_sha1(&expected_value),
+                    ChecksumAlgorithm::Sha256 => output.checksum_sha256(&expected_value),
+                    other => unreachable!("not a SHA algorithm: {other}"),
+                }
+                .build()
+            }
+        });
+    let tm = helper_create_transfer_manager(
+        mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&put_object]),
+        aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported,
+    );
+    let output = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .checksum_strategy(strategy.with_expected_value(&expected_value))
+        .body(InputStream::from(body))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect("a single-request upload sends a composite strategy's expected value");
+
+    assert_eq!(put_object.num_calls(), 1);
+    let stored = match algorithm {
+        ChecksumAlgorithm::Sha1 => output.checksum_sha1(),
+        _ => output.checksum_sha256(),
+    };
+    assert_eq!(stored, Some(expected_value.as_str()));
+}
+
+#[tokio::test]
+async fn test_put_object_composite_expected_value_is_sent() {
+    assert_put_object_sends_composite_expected_value(Sha256).await;
+}
+
+#[tokio::test]
+async fn test_put_object_composite_sha1_expected_value_is_sent() {
+    assert_put_object_sends_composite_expected_value(Sha1).await;
+}
+
+/// A `PartStream` whose size has no upper bound and that yields no parts.
+#[derive(Debug)]
+struct UnboundedEmptyStream;
+
+impl PartStream for UnboundedEmptyStream {
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _stream_cx: &aws_s3_transfer::io::StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        Poll::Ready(None)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+/// Asserts that uploading `body`, which is sent as a multipart upload, with a composite strategy
+/// that has an expected value fails at `initiate` with an input error and sends no request.
+fn assert_composite_expected_value_rejected<A: CompositeAlgorithm>(
+    algorithm: A,
+    body: InputStream,
+    message: &str,
+) {
+    let put_object =
+        mock!(aws_sdk_s3::Client::put_object).then_output(|| PutObjectOutput::builder().build());
+    let create = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+        CreateMultipartUploadOutput::builder()
+            .upload_id("test-upload-id")
+            .build()
+    });
+    let upload_part =
+        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let complete = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+    let rules = [put_object, create, upload_part, complete];
+    let tm = helper_create_transfer_manager(
+        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &rules),
+        aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported,
+    );
+    let error = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .checksum_strategy(
+            ChecksumStrategy::composite(algorithm)
+                .with_expected_value("ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0="),
+        )
+        .body(body)
+        .initiate()
+        .expect_err("a composite expected value on a multipart upload must fail the upload");
+
+    assert_input_invalid(&error, message);
+    assert!(
+        rules.iter().all(|rule| rule.num_calls() == 0),
+        "no request may be sent"
+    );
+}
+
+/// The message for a SHA expected value on a multipart upload: only a single-request upload can
+/// send it.
+const SHA256_MULTIPART: &str = "a `SHA256` expected value can only be sent by a single-request \
+     upload, and this upload is sent as a multipart upload; a single-request upload needs a body \
+     of known size below the multipart threshold that is not a PartStream";
+
+#[tokio::test]
+async fn test_mpu_composite_expected_value_is_rejected_at_threshold() {
+    // An in-memory body exactly at the multipart threshold is sent as a multipart upload.
+    assert_composite_expected_value_rejected(
+        Sha256,
+        InputStream::from(Bytes::from(vec![b'a'; PART_SIZE])),
+        SHA256_MULTIPART,
+    );
+}
+
+#[tokio::test]
+async fn test_mpu_composite_expected_value_is_rejected_above_threshold() {
+    assert_composite_expected_value_rejected(
+        Sha256,
+        InputStream::from(Bytes::from(vec![b'a'; PART_SIZE + 1])),
+        SHA256_MULTIPART,
+    );
+}
+
+#[tokio::test]
+async fn test_mpu_composite_expected_value_is_rejected_for_part_stream() {
+    // A `PartStream` is always sent as a multipart upload, even with an exact size below the
+    // multipart threshold.
+    let parts = vec![Bytes::from("abcdefghijklm".as_bytes())];
+    assert_composite_expected_value_rejected(
+        Sha256,
+        InputStream::from_part_stream(TestStream::new(parts, None, false, false)),
+        SHA256_MULTIPART,
+    );
+}
+
+#[tokio::test]
+async fn test_mpu_composite_expected_value_is_rejected_without_upper_bound() {
+    // Only a `PartStream` can declare a size with no upper bound.
+    assert_composite_expected_value_rejected(
+        Sha256,
+        InputStream::from_part_stream(UnboundedEmptyStream),
+        SHA256_MULTIPART,
+    );
+}
+
+#[tokio::test]
+async fn test_mpu_composite_crc_expected_value_suggests_full_object() {
+    // A CRC32 or CRC32C expected value can be sent by a multipart upload with a full object
+    // strategy, so the error says so.
+    assert_composite_expected_value_rejected(
+        Crc32,
+        InputStream::from(Bytes::from(vec![b'a'; PART_SIZE + 1])),
+        "a composite `CRC32` ChecksumStrategy's expected value cannot be sent by a multipart \
+         upload; use `ChecksumStrategy::full_object` with the same expected value",
+    );
+}

@@ -4,8 +4,8 @@ These instructions are for coding agents working in this repository. The same ru
 
 ## Repository
 
-- `aws-sdk-s3-transfer-manager/`: the crate.
-- `integration-tests/`, `s3-mock-server/`: mock-S3 integration tests.
+- `crates/aws-s3-transfer/`: the crate.
+- `integration-tests/`, `crates/s3-mock-server/`: mock-S3 integration tests.
 - `wasm32-wasi-tests/`: a WASI command that runs transfers over HTTP to `s3-mock-server` on `wasm32-wasip2` and `wasm32-wasip3`.
 - `benches/`: benchmarks.
 - `fuzz/`: a separate Cargo workspace with its own lockfile.
@@ -54,8 +54,8 @@ Some changes need a check that CI runs as a separate job:
 | Documentation or doc comments | `RUSTDOCFLAGS="-Dwarnings --cfg docsrs" cargo +nightly doc --lib --no-deps --document-private-items` |
 | `[package.metadata.docs.rs]` or public items behind a feature or `cfg` | `just docs` (requires `cargo install cargo-docs-rs`) |
 | Anything under `fuzz/` | `cargo fmt --manifest-path fuzz/Cargo.toml -- --check`, then `RUSTFLAGS='--cfg s3_tm_fuzz' .github/scripts/run-fuzz-targets.sh smoke` |
-| Atomics, the wake protocol, `runtime/sync` | `LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS='--cfg s3_tm_loom' cargo test -p aws-sdk-s3-transfer-manager --lib --release -- loom_tests` |
-| `unsafe` code, buffer ownership | `MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-recursive-validation' cargo +nightly miri test -p aws-sdk-s3-transfer-manager --lib` |
+| Atomics, the wake protocol, `runtime/sync` | `LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS='--cfg s3_tm_loom' cargo test -p aws-s3-transfer --lib --release -- loom_tests` |
+| `unsafe` code, buffer ownership | `MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-recursive-validation' cargo +nightly miri test -p aws-s3-transfer --lib` |
 | Feature gates | `cargo hack check --all --feature-powerset` |
 
 [.github/workflows/ci.yml](.github/workflows/ci.yml) defines the full matrix, which runs on every pull request.

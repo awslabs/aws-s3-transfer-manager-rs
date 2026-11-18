@@ -1,0 +1,1350 @@
+/*
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! In-memory implementation of the StorageBackend trait.
+
+use std::collections::HashMap;
+
+use std::time::SystemTime;
+
+use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
+use futures::{Stream, StreamExt};
+use tokio::sync::RwLock;
+
+use crate::error::{Error, Result};
+use crate::storage::models::{MultipartUploadMetadata, ObjectMetadata, ObjectPart, PartMetadata};
+use crate::storage::StorageBackend;
+use crate::streaming::{apply_range, VecByteStream};
+use crate::types::StoredObjectMetadata;
+
+/// Type alias for complex part storage structure
+type PartStorage = HashMap<i32, (Bytes, PartMetadata)>;
+
+/// State updated by multipart operations.
+///
+/// Upload metadata and part data share one lock so no operation can await one
+/// map while retaining a guard for the other.
+#[derive(Debug, Default)]
+struct MultipartState {
+    uploads: HashMap<String, MultipartUploadMetadata>,
+    parts: HashMap<String, PartStorage>,
+}
+
+/// State for a single bucket, including its creation time and objects.
+#[derive(Debug)]
+struct BucketState {
+    created_at: SystemTime,
+    objects: HashMap<String, (Bytes, ObjectMetadata)>,
+    /// The renames that succeeded with a client token, by token.
+    renames: HashMap<String, crate::storage::RenameRequest>,
+}
+
+impl BucketState {
+    fn new() -> Self {
+        Self {
+            created_at: SystemTime::now(),
+            objects: HashMap::new(),
+            renames: HashMap::new(),
+        }
+    }
+}
+
+/// An in-memory implementation of the StorageBackend trait.
+///
+/// This implementation stores all objects, metadata, and multipart uploads in memory,
+/// making it suitable for testing and benchmarking. All data is lost when the
+/// instance is dropped.
+#[derive(Debug)]
+pub(crate) struct InMemoryStorage {
+    /// Objects stored as bucket_name → BucketState { created_at, objects: key → (data, metadata) }
+    buckets: RwLock<HashMap<String, BucketState>>,
+
+    /// Active multipart uploads and their part data.
+    multipart: RwLock<MultipartState>,
+}
+
+impl InMemoryStorage {
+    /// Create a new in-memory storage backend.
+    pub(crate) fn new() -> Self {
+        Self {
+            buckets: RwLock::new(HashMap::new()),
+            multipart: RwLock::new(MultipartState::default()),
+        }
+    }
+}
+
+#[async_trait]
+impl StorageBackend for InMemoryStorage {
+    async fn put_object(
+        &self,
+        request: crate::storage::StoreObjectRequest,
+    ) -> Result<StoredObjectMetadata> {
+        let mut body = request.body;
+        let mut integrity_checks = request.integrity_checks;
+        let mut content = BytesMut::new();
+
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| Error::from_body_error(&e))?;
+            integrity_checks.update(&chunk);
+            content.extend_from_slice(&chunk);
+        }
+
+        let content = content.freeze();
+        let content_length = content.len() as u64;
+        let object_integrity = integrity_checks.finalize();
+        if let Some(client_checksums) = &request.client_checksums {
+            if let Err(algorithm) = object_integrity.validate(client_checksums) {
+                return Err(Error::BadDigest {
+                    algorithm,
+                    completion: false,
+                });
+            }
+        }
+        let last_modified = request.last_modified.unwrap_or_else(SystemTime::now);
+
+        let metadata = ObjectMetadata {
+            content_type: request.content_type,
+            content_length,
+            etag: request
+                .etag
+                .clone()
+                .unwrap_or_else(|| object_integrity.etag().unwrap_or_default()),
+            last_modified,
+            user_metadata: request.user_metadata,
+            checksum_algorithm: None,
+            crc32: object_integrity.crc32.clone(),
+            crc32c: object_integrity.crc32c.clone(),
+            crc64nvme: object_integrity.crc64nvme.clone(),
+            sha1: object_integrity.sha1.clone(),
+            sha256: object_integrity.sha256.clone(),
+            storage_class: request.storage_class,
+            server_side_encryption: request.server_side_encryption,
+            cache_control: request.cache_control,
+            content_encoding: request.content_encoding,
+            content_disposition: request.content_disposition,
+            content_language: request.content_language,
+            parts: Vec::new(),
+            append_segments: Vec::new(),
+            append_parts: 0,
+            part_checksums: false,
+            restore_status: request.restore_status,
+        };
+
+        let mut buckets = self.buckets.write().await;
+        let bucket_state = buckets
+            .get_mut(&request.bucket)
+            .ok_or(Error::NoSuchBucket)?;
+        // Checked under the write lock, so the condition holds at the moment of the write.
+        request
+            .precondition
+            .check(bucket_state.objects.get(&request.key).map(|(_, m)| m))?;
+        bucket_state
+            .objects
+            .insert(request.key.clone(), (content, metadata));
+
+        Ok(StoredObjectMetadata { object_integrity })
+    }
+
+    async fn get_object(
+        &self,
+        request: crate::storage::GetObjectRequest<'_>,
+    ) -> Result<Option<crate::storage::GetObjectResponse>> {
+        let buckets = self.buckets.read().await;
+        let bucket_state = match buckets.get(request.bucket) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let (data, metadata) = match bucket_state.objects.get(request.key) {
+            Some(entry) => entry,
+            None => return Ok(None),
+        };
+
+        let range_bounds = request.range.clone();
+        let data = if let Some(range) = request.range {
+            apply_range(data, range)
+        } else {
+            data.clone()
+        };
+
+        let stream = VecByteStream::new(data);
+        let boxed_stream: Box<
+            dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
+        > = Box::new(stream);
+
+        let mut response_metadata = metadata.clone();
+        if let Some(range) = range_bounds {
+            response_metadata.apply_range_checksums(range.start, range.end);
+        }
+
+        Ok(Some(crate::storage::GetObjectResponse {
+            stream: boxed_stream,
+            metadata: response_metadata,
+        }))
+    }
+
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        let bucket_state = buckets.get_mut(bucket).ok_or(Error::NoSuchBucket)?;
+        // DeleteObject is idempotent: deleting a non-existent key is not an error.
+        bucket_state.objects.remove(key);
+        Ok(())
+    }
+
+    async fn delete_object_if_match(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: &s3s::dto::ETagCondition,
+    ) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        let bucket_state = buckets.get_mut(bucket).ok_or(Error::NoSuchBucket)?;
+        crate::storage::check_delete_if_match(
+            if_match,
+            bucket_state.objects.get(key).map(|(_, metadata)| metadata),
+        )?;
+        bucket_state.objects.remove(key);
+        Ok(())
+    }
+
+    async fn list_objects(
+        &self,
+        request: crate::storage::ListObjectsRequest<'_>,
+    ) -> Result<crate::storage::ListObjectsResponse> {
+        let buckets = self.buckets.read().await;
+        let bucket_state = match buckets.get(request.bucket) {
+            Some(s) => s,
+            None => {
+                return Ok(crate::storage::ListObjectsResponse {
+                    objects: Vec::new(),
+                })
+            }
+        };
+
+        let mut matching_objects = Vec::new();
+        for (key, (_, metadata)) in bucket_state.objects.iter() {
+            if let Some(prefix) = request.prefix {
+                if !key.starts_with(prefix) {
+                    continue;
+                }
+            }
+            matching_objects.push(crate::storage::ObjectInfo {
+                key: key.clone(),
+                metadata: metadata.clone(),
+            });
+        }
+
+        matching_objects.sort_by(|a, b| a.key.cmp(&b.key));
+
+        Ok(crate::storage::ListObjectsResponse {
+            objects: matching_objects,
+        })
+    }
+
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMetadata>> {
+        let buckets = self.buckets.read().await;
+        let bucket_state = match buckets.get(bucket) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        Ok(bucket_state
+            .objects
+            .get(key)
+            .map(|(_, metadata)| metadata.clone()))
+    }
+
+    async fn create_bucket(&self, bucket: &str) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        buckets
+            .entry(bucket.to_string())
+            .or_insert_with(BucketState::new);
+        Ok(())
+    }
+
+    async fn delete_bucket(&self, bucket: &str) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        match buckets.get(bucket) {
+            Some(state) if !state.objects.is_empty() => Err(Error::BucketNotEmpty),
+            Some(_) => {
+                buckets.remove(bucket);
+                Ok(())
+            }
+            None => Err(Error::NoSuchBucket),
+        }
+    }
+
+    async fn head_bucket(&self, bucket: &str) -> Result<bool> {
+        let buckets = self.buckets.read().await;
+        Ok(buckets.contains_key(bucket))
+    }
+
+    async fn list_buckets(&self) -> Result<Vec<crate::storage::BucketInfo>> {
+        let buckets = self.buckets.read().await;
+        let mut result: Vec<crate::storage::BucketInfo> = buckets
+            .iter()
+            .map(|(name, state)| crate::storage::BucketInfo {
+                name: name.clone(),
+                creation_date: state.created_at,
+            })
+            .collect();
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(result)
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        request: crate::storage::CreateMultipartUploadRequest<'_>,
+    ) -> Result<()> {
+        let mut multipart = self.multipart.write().await;
+        let upload_metadata = MultipartUploadMetadata {
+            key: request.key.to_string(),
+            upload_id: request.upload_id.to_string(),
+            metadata: request.metadata,
+            parts: HashMap::new(),
+            checksum_type: Some(request.checksum_type),
+            bucket: Some(request.bucket.to_string()),
+        };
+        multipart
+            .uploads
+            .insert(request.upload_id.to_string(), upload_metadata);
+        multipart
+            .parts
+            .insert(request.upload_id.to_string(), HashMap::new());
+
+        Ok(())
+    }
+
+    async fn upload_part(
+        &self,
+        request: crate::storage::UploadPartRequest<'_>,
+    ) -> Result<crate::storage::UploadPartResponse> {
+        // Get upload metadata to determine checksum algorithm
+        let (checksum_algorithm, part_checksums) = {
+            let multipart = self.multipart.read().await;
+            let upload = multipart
+                .uploads
+                .get(request.upload_id)
+                .ok_or(Error::NoSuchUpload)?;
+            request.check_checksum(upload)?;
+            (
+                upload.metadata.checksum_algorithm,
+                upload.metadata.part_checksums,
+            )
+        };
+
+        // Calculate ETag (MD5 hash)
+        let etag = format!("\"{:x}\"", md5::compute(&request.content));
+
+        // Calculate part checksums if algorithm is specified
+        let mut part_metadata = PartMetadata {
+            etag: etag.clone(),
+            size: request.content.len() as u64,
+            ..Default::default()
+        };
+
+        if let Some(algorithm) = checksum_algorithm {
+            use crate::types::ObjectIntegrityChecks;
+
+            // Calculate checksum for the specified algorithm
+            let mut integrity_checks =
+                ObjectIntegrityChecks::new().with_checksum_algorithm(algorithm);
+            integrity_checks.update(&request.content);
+            let calculated_integrity = integrity_checks.finalize();
+
+            // Store the calculated checksum in part metadata
+            match algorithm {
+                aws_smithy_checksums::ChecksumAlgorithm::Crc32 => {
+                    part_metadata.crc32 = calculated_integrity.crc32;
+                }
+                aws_smithy_checksums::ChecksumAlgorithm::Crc32c => {
+                    part_metadata.crc32c = calculated_integrity.crc32c;
+                }
+                aws_smithy_checksums::ChecksumAlgorithm::Crc64Nvme => {
+                    part_metadata.crc64nvme = calculated_integrity.crc64nvme;
+                }
+                aws_smithy_checksums::ChecksumAlgorithm::Sha1 => {
+                    part_metadata.sha1 = calculated_integrity.sha1;
+                }
+                aws_smithy_checksums::ChecksumAlgorithm::Sha256 => {
+                    part_metadata.sha256 = calculated_integrity.sha256;
+                }
+                _ => {} // Ignore unsupported algorithms
+            }
+        }
+
+        // Publish part data and metadata together.
+        let mut multipart = self.multipart.write().await;
+        let MultipartState { uploads, parts } = &mut *multipart;
+        let upload = uploads
+            .get_mut(request.upload_id)
+            .ok_or(Error::NoSuchUpload)?;
+        let upload_parts = parts
+            .get_mut(request.upload_id)
+            .ok_or(Error::NoSuchUpload)?;
+
+        upload_parts.insert(
+            request.part_number,
+            (request.content.clone(), part_metadata.clone()),
+        );
+        let checksums = part_checksums.then(|| part_metadata.clone());
+        upload.parts.insert(request.part_number, part_metadata);
+
+        Ok(crate::storage::UploadPartResponse { etag, checksums })
+    }
+
+    async fn list_parts(&self, upload_id: &str) -> Result<Vec<crate::storage::PartInfo>> {
+        let multipart = self.multipart.read().await;
+        let upload = multipart
+            .uploads
+            .get(upload_id)
+            .ok_or(Error::NoSuchUpload)?;
+
+        let mut result = Vec::new();
+        for part_number in upload.parts.keys() {
+            result.push(crate::storage::PartInfo {
+                part_number: *part_number,
+            });
+        }
+
+        // Sort by part number for consistent ordering
+        result.sort_by_key(|part| part.part_number);
+        Ok(result)
+    }
+
+    async fn multipart_checksum_type(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<aws_sdk_s3::types::ChecksumType>> {
+        let multipart = self.multipart.read().await;
+        let upload = multipart
+            .uploads
+            .get(upload_id)
+            .ok_or(Error::NoSuchUpload)?;
+        Ok(upload.checksum_type.clone())
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        request: crate::storage::CompleteMultipartUploadRequest<'_>,
+    ) -> Result<crate::storage::CompleteMultipartUploadResponse> {
+        let (bucket, key, mut final_metadata, checksum_algorithm, checksum_type, upload_parts) = {
+            let multipart = self.multipart.read().await;
+            let upload = multipart
+                .uploads
+                .get(request.upload_id)
+                .cloned()
+                .ok_or(Error::NoSuchUpload)?;
+            request.check_listed_part_checksums(&upload)?;
+            let upload_parts = multipart
+                .parts
+                .get(request.upload_id)
+                .cloned()
+                .ok_or(Error::NoSuchUpload)?;
+            (
+                upload.bucket.unwrap_or_else(|| request.bucket.to_string()),
+                upload.key,
+                upload.metadata.clone(),
+                upload.metadata.checksum_algorithm,
+                upload.checksum_type,
+                upload_parts,
+            )
+        };
+
+        // Verify all parts exist and ETags match
+        for (part_number, expected_etag) in &request.parts {
+            match upload_parts.get(part_number) {
+                Some((_, part_metadata)) => {
+                    if part_metadata.etag != *expected_etag {
+                        return Err(Error::InvalidPart);
+                    }
+                }
+                None => return Err(Error::InvalidPart),
+            }
+        }
+
+        // Combine all parts in the specified order, into one allocation of the object's size: a
+        // growing buffer would reallocate and copy the object as it doubles past each power of two.
+        let combined_len = request
+            .parts
+            .iter()
+            .filter_map(|(part_number, _)| upload_parts.get(part_number))
+            .map(|(part_data, _)| part_data.len())
+            .sum();
+        let mut combined = BytesMut::with_capacity(combined_len);
+        let mut etags = Vec::new();
+        let mut total_size = 0u64;
+
+        for (part_number, _) in &request.parts {
+            if let Some((part_data, part_metadata)) = upload_parts.get(part_number) {
+                combined.extend_from_slice(part_data);
+                etags.push(part_metadata.etag.clone());
+                total_size += part_metadata.size;
+                final_metadata.parts.push(ObjectPart {
+                    size: part_metadata.size,
+                    crc32: part_metadata.crc32.clone(),
+                    crc32c: part_metadata.crc32c.clone(),
+                    crc64nvme: part_metadata.crc64nvme.clone(),
+                    sha1: part_metadata.sha1.clone(),
+                    sha256: part_metadata.sha256.clone(),
+                });
+            }
+        }
+
+        // Calculate the final ETag for multipart upload
+        let combined_etag = if etags.len() > 1 {
+            let etags_concat = etags.join("");
+            format!("\"{:x}-{}\"", md5::compute(etags_concat), etags.len())
+        } else if !etags.is_empty() {
+            etags[0].clone()
+        } else {
+            format!("\"{:x}\"", md5::compute(""))
+        };
+
+        // Calculate checksums if algorithm is specified
+        let mut integrity_checks = checksum_algorithm
+            .as_ref()
+            .map(|algorithm| {
+                crate::types::ObjectIntegrityChecks::new().with_checksum_algorithm(*algorithm)
+            })
+            .unwrap_or_else(crate::types::ObjectIntegrityChecks::new);
+
+        match checksum_type {
+            Some(aws_sdk_s3::types::ChecksumType::FullObject) => {
+                // Update with complete object data
+                integrity_checks.update(&combined);
+            }
+            Some(aws_sdk_s3::types::ChecksumType::Composite) => {
+                // Update with part checksum bytes for composite calculation
+                if let Some(algorithm) = checksum_algorithm.as_ref() {
+                    for (part_number, _) in &request.parts {
+                        if let Some((_, part_metadata)) = upload_parts.get(part_number) {
+                            let part_checksum = match algorithm {
+                                aws_smithy_checksums::ChecksumAlgorithm::Crc32 => {
+                                    &part_metadata.crc32
+                                }
+                                aws_smithy_checksums::ChecksumAlgorithm::Crc32c => {
+                                    &part_metadata.crc32c
+                                }
+                                aws_smithy_checksums::ChecksumAlgorithm::Sha1 => {
+                                    &part_metadata.sha1
+                                }
+                                aws_smithy_checksums::ChecksumAlgorithm::Sha256 => {
+                                    &part_metadata.sha256
+                                }
+                                _ => &None,
+                            };
+
+                            if let Some(checksum) = part_checksum {
+                                // S3 computes the composite over the raw part-checksum
+                                // bytes, not their base64 text.
+                                if let Ok(raw) = base64::Engine::decode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    checksum,
+                                ) {
+                                    integrity_checks.update(&raw);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None => {} // No checksum calculation
+            Some(_) => {
+                // Future checksum types - default to composite behavior
+                if let Some(algorithm) = checksum_algorithm.as_ref() {
+                    for (part_number, _) in &request.parts {
+                        if let Some((_, part_metadata)) = upload_parts.get(part_number) {
+                            let part_checksum = match algorithm {
+                                aws_smithy_checksums::ChecksumAlgorithm::Crc32 => {
+                                    &part_metadata.crc32
+                                }
+                                aws_smithy_checksums::ChecksumAlgorithm::Crc32c => {
+                                    &part_metadata.crc32c
+                                }
+                                aws_smithy_checksums::ChecksumAlgorithm::Sha1 => {
+                                    &part_metadata.sha1
+                                }
+                                aws_smithy_checksums::ChecksumAlgorithm::Sha256 => {
+                                    &part_metadata.sha256
+                                }
+                                _ => &None,
+                            };
+
+                            if let Some(checksum) = part_checksum {
+                                // S3 computes the composite over the raw part-checksum
+                                // bytes, not their base64 text.
+                                if let Ok(raw) = base64::Engine::decode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    checksum,
+                                ) {
+                                    integrity_checks.update(&raw);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut object_integrity = integrity_checks.finalize();
+
+        // A composite checksum carries a `-<part_count>` suffix (e.g. `aB3..==-14`).
+        if matches!(
+            checksum_type,
+            Some(aws_sdk_s3::types::ChecksumType::Composite)
+        ) {
+            let n = request.parts.len();
+            for v in [
+                &mut object_integrity.crc32,
+                &mut object_integrity.crc32c,
+                &mut object_integrity.sha1,
+                &mut object_integrity.sha256,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                v.push_str(&format!("-{n}"));
+            }
+        }
+
+        // Validate against client-provided checksum if present
+        if let Some(client_checksums) = request.client_checksums {
+            if let Err(algorithm) = object_integrity.validate(client_checksums) {
+                return Err(Error::BadDigest {
+                    algorithm,
+                    completion: true,
+                });
+            }
+        }
+
+        // Update the final metadata
+        final_metadata.content_length = total_size;
+        final_metadata.etag = combined_etag.clone();
+        final_metadata.last_modified = SystemTime::now();
+
+        // Store calculated checksums in metadata
+        final_metadata.crc32 = object_integrity.crc32.clone();
+        final_metadata.crc32c = object_integrity.crc32c.clone();
+        final_metadata.sha1 = object_integrity.sha1.clone();
+        final_metadata.sha256 = object_integrity.sha256.clone();
+        final_metadata.crc64nvme = object_integrity.crc64nvme.clone();
+
+        // Completion errors leave the upload and its parts available for retry. Remove both only
+        // after every request and checksum validation has succeeded.
+        if !self.buckets.read().await.contains_key(&bucket) {
+            return Err(Error::NoSuchBucket);
+        }
+        {
+            let mut multipart = self.multipart.write().await;
+            if multipart.uploads.remove(request.upload_id).is_none() {
+                return Err(Error::NoSuchUpload);
+            }
+            if multipart.parts.remove(request.upload_id).is_none() {
+                return Err(Error::NoSuchUpload);
+            }
+        }
+
+        // Store the final object
+        let combined_data = combined.freeze();
+        let mut buckets = self.buckets.write().await;
+        let bucket_state = buckets.get_mut(&bucket).ok_or(Error::NoSuchBucket)?;
+        bucket_state
+            .objects
+            .insert(key.clone(), (combined_data, final_metadata.clone()));
+
+        Ok(crate::storage::CompleteMultipartUploadResponse {
+            key: key.clone(),
+            etag: combined_etag,
+            object_integrity,
+        })
+    }
+
+    async fn abort_multipart_upload(&self, upload_id: &str) -> Result<()> {
+        let mut multipart = self.multipart.write().await;
+        if multipart.uploads.remove(upload_id).is_none() {
+            return Err(Error::NoSuchUpload);
+        }
+        multipart.parts.remove(upload_id);
+
+        Ok(())
+    }
+
+    async fn append_object(
+        &self,
+        request: crate::storage::AppendObjectRequest,
+    ) -> Result<StoredObjectMetadata> {
+        let mut buckets = self.buckets.write().await;
+        let bucket_state = buckets
+            .get_mut(&request.bucket)
+            .ok_or(Error::NoSuchBucket)?;
+        let (data, metadata) = bucket_state
+            .objects
+            .get(&request.key)
+            .ok_or(Error::NoSuchKey)?;
+
+        request.precondition.check(Some(metadata))?;
+        if request.content.is_empty() && metadata.content_length > 0 {
+            return Err(Error::InvalidArgument(
+                "Request body cannot be empty when 'write offset' is specified",
+            ));
+        }
+        if metadata.content_length != request.offset {
+            return Err(Error::InvalidWriteOffset);
+        }
+        // Each append adds a part to those the object has: its multipart upload's, or one.
+        let parts = match metadata.append_parts {
+            0 => (metadata.parts.len() as u32).max(1),
+            parts => parts,
+        };
+        if parts >= crate::storage::MAX_PARTS {
+            return Err(Error::TooManyParts);
+        }
+        let algorithms = metadata.checksum_algorithms();
+        // An append without a checksum is checked as a CRC64NVME one, the default algorithm.
+        let algorithm = request
+            .checksum_algorithm
+            .unwrap_or(aws_smithy_checksums::ChecksumAlgorithm::Crc64Nvme);
+        if !algorithms.is_empty() && !algorithms.contains(&algorithm) {
+            return Err(Error::ChecksumTypeMismatch {
+                expected: algorithms
+                    .iter()
+                    .map(|a| a.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                actual: algorithm.as_str().to_owned(),
+                // Only directory buckets serve appends.
+                bucket_type: crate::BucketType::Directory,
+            });
+        }
+
+        // The ETag and the full-object checksums cover the combined content.
+        let mut checks = crate::types::ObjectIntegrityChecks::new().with_md5();
+        for algorithm in &algorithms {
+            checks = checks.with_checksum_algorithm(*algorithm);
+        }
+        let mut content = BytesMut::with_capacity(data.len() + request.content.len());
+        content.extend_from_slice(data);
+        content.extend_from_slice(&request.content);
+        let content = content.freeze();
+        checks.update(&content);
+        let mut object_integrity = checks.finalize();
+
+        // A SHA-1 or SHA-256 checksum is not extended: an appended object's is the composite of the
+        // checksums of its segments.
+        let mut append_segments = Vec::new();
+        if let Some(algorithm) = algorithms.iter().copied().find(|algorithm| {
+            matches!(
+                algorithm,
+                aws_smithy_checksums::ChecksumAlgorithm::Sha1
+                    | aws_smithy_checksums::ChecksumAlgorithm::Sha256
+            )
+        }) {
+            let sha256 = algorithm == aws_smithy_checksums::ChecksumAlgorithm::Sha256;
+            let checksum_of = |sha1: &Option<String>, sha256_value: &Option<String>| {
+                if sha256 {
+                    sha256_value.clone()
+                } else {
+                    sha1.clone()
+                }
+            };
+            append_segments = if !metadata.append_segments.is_empty() {
+                metadata.append_segments.clone()
+            } else if !metadata.parts.is_empty() {
+                metadata
+                    .parts
+                    .iter()
+                    .filter_map(|part| checksum_of(&part.sha1, &part.sha256))
+                    .collect()
+            } else {
+                checksum_of(&metadata.sha1, &metadata.sha256)
+                    .into_iter()
+                    .collect()
+            };
+            let mut appended =
+                crate::types::ObjectIntegrityChecks::new().with_checksum_algorithm(algorithm);
+            appended.update(&request.content);
+            let appended = appended.finalize();
+            append_segments.extend(checksum_of(&appended.sha1, &appended.sha256));
+            let composite = Some(crate::types::composite_of(&append_segments, algorithm));
+            if sha256 {
+                object_integrity.sha256 = composite;
+            } else {
+                object_integrity.sha1 = composite;
+            }
+        }
+
+        let mut metadata = metadata.clone();
+        metadata.content_length = content.len() as u64;
+        metadata.etag = object_integrity.etag().unwrap_or_default();
+        metadata.last_modified = SystemTime::now();
+        metadata.crc32 = object_integrity.crc32.clone();
+        metadata.crc32c = object_integrity.crc32c.clone();
+        metadata.crc64nvme = object_integrity.crc64nvme.clone();
+        metadata.sha1 = object_integrity.sha1.clone();
+        metadata.sha256 = object_integrity.sha256.clone();
+        // An appended object has no part layout to report.
+        metadata.parts = Vec::new();
+        metadata.append_segments = append_segments;
+        metadata.append_parts = parts + 1;
+        bucket_state
+            .objects
+            .insert(request.key, (content, metadata));
+        Ok(StoredObjectMetadata { object_integrity })
+    }
+
+    async fn rename_object(
+        &self,
+        bucket: &str,
+        request: crate::storage::RenameRequest,
+    ) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        let bucket_state = buckets.get_mut(bucket).ok_or(Error::NoSuchBucket)?;
+        if let Some(token) = &request.client_token {
+            match bucket_state.renames.get(token) {
+                Some(previous) if *previous == request => return Ok(()),
+                Some(_) => return Err(Error::IdempotentParameterMismatch),
+                None => {}
+            }
+        }
+        request.preconditions.check(
+            bucket_state.objects.get(&request.src_key).map(|(_, m)| m),
+            bucket_state.objects.get(&request.dst_key).map(|(_, m)| m),
+        )?;
+        let object = bucket_state
+            .objects
+            .remove(&request.src_key)
+            .expect("the preconditions check that the source exists");
+        bucket_state.objects.insert(request.dst_key.clone(), object);
+        if let Some(token) = request.client_token.clone() {
+            bucket_state.renames.insert(token, request);
+        }
+        Ok(())
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<crate::storage::MultipartUploadInfo>> {
+        let multipart = self.multipart.read().await;
+        let mut uploads: Vec<_> = multipart
+            .uploads
+            .values()
+            .filter(|upload| upload.bucket.as_deref() == Some(bucket))
+            .map(|upload| crate::storage::MultipartUploadInfo {
+                key: upload.key.clone(),
+                upload_id: upload.upload_id.clone(),
+            })
+            .collect();
+        uploads.sort();
+        Ok(uploads)
+    }
+
+    async fn update_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        update: crate::storage::MetadataUpdate,
+    ) -> Result<()> {
+        let mut buckets = self.buckets.write().await;
+        let (_, metadata) = buckets
+            .get_mut(bucket)
+            .ok_or(Error::NoSuchBucket)?
+            .objects
+            .get_mut(key)
+            .ok_or(Error::NoSuchKey)?;
+        update(metadata);
+        Ok(())
+    }
+
+    async fn reset(&self) -> Result<()> {
+        self.buckets.write().await.clear();
+        let mut multipart = self.multipart.write().await;
+        multipart.uploads.clear();
+        multipart.parts.clear();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ClientChecksums, ObjectIntegrityChecks};
+    use futures::StreamExt;
+    use std::collections::HashMap;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Barrier;
+    use tokio::task::JoinSet;
+
+    const TEST_BUCKET: &str = "test-bucket";
+
+    // Helper function to collect stream data into bytes
+    async fn collect_stream_data(
+        mut stream: Box<
+            dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send + Sync + Unpin,
+        >,
+    ) -> Bytes {
+        let mut collected_data = Vec::new();
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.unwrap();
+            collected_data.extend_from_slice(&chunk);
+        }
+        Bytes::from(collected_data)
+    }
+
+    fn create_test_metadata(content_length: u64) -> ObjectMetadata {
+        ObjectMetadata {
+            content_type: Some("text/plain".to_string()),
+            content_length,
+            etag: format!("\"{:x}\"", md5::compute("test")),
+            last_modified: SystemTime::now(),
+            user_metadata: HashMap::new(),
+            ..Default::default()
+        }
+    }
+
+    fn bytes_to_stream(
+        data: Bytes,
+    ) -> Pin<Box<dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>> {
+        Box::pin(futures::stream::once(async move { Ok(data) }))
+    }
+
+    #[tokio::test]
+    async fn test_put_and_get_object() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
+        let key = "test-key";
+        let content = Bytes::from("test content");
+        let integrity_checks = ObjectIntegrityChecks::new().with_md5();
+
+        // Put object
+        let stream = bytes_to_stream(content.clone());
+        storage
+            .put_object(crate::storage::StoreObjectRequest::new(
+                TEST_BUCKET,
+                key,
+                stream,
+                integrity_checks,
+            ))
+            .await
+            .unwrap();
+
+        // Get object
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: None,
+        };
+        let result = storage.get_object(request).await.unwrap();
+        assert!(result.is_some());
+        let response = result.unwrap();
+        let retrieved_content = collect_stream_data(response.stream).await;
+        assert_eq!(retrieved_content, content);
+        assert_eq!(response.metadata.content_length, content.len() as u64);
+        assert_eq!(response.metadata.content_type, None);
+    }
+
+    #[tokio::test]
+    async fn test_get_object_with_range() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
+        let key = "test-key";
+        let content = Bytes::from("0123456789");
+        let integrity_checks = ObjectIntegrityChecks::new().with_md5();
+
+        let stream = bytes_to_stream(content);
+        storage
+            .put_object(crate::storage::StoreObjectRequest::new(
+                TEST_BUCKET,
+                key,
+                stream,
+                integrity_checks,
+            ))
+            .await
+            .unwrap();
+
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: Some(2..5),
+        };
+        let result = storage.get_object(request).await.unwrap();
+        assert!(result.is_some());
+        let response = result.unwrap();
+        let retrieved_content = collect_stream_data(response.stream).await;
+        assert_eq!(retrieved_content, Bytes::from("234"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_object() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
+        let key = "test-key";
+        let content = Bytes::from("test content");
+        let integrity_checks = ObjectIntegrityChecks::new().with_md5();
+
+        let stream = bytes_to_stream(content);
+        storage
+            .put_object(crate::storage::StoreObjectRequest::new(
+                TEST_BUCKET,
+                key,
+                stream,
+                integrity_checks,
+            ))
+            .await
+            .unwrap();
+
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: None,
+        };
+        let result = storage.get_object(request).await.unwrap();
+        assert!(result.is_some());
+
+        storage.delete_object(TEST_BUCKET, key).await.unwrap();
+
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: None,
+        };
+        let result = storage.get_object(request).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_objects() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
+        let content = Bytes::from("test content");
+
+        for i in 0..3 {
+            let key = format!("test-key-{}", i);
+            let integrity_checks = ObjectIntegrityChecks::new().with_md5();
+            let stream = bytes_to_stream(content.clone());
+            storage
+                .put_object(crate::storage::StoreObjectRequest::new(
+                    TEST_BUCKET,
+                    &key,
+                    stream,
+                    integrity_checks,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let request = crate::storage::ListObjectsRequest {
+            bucket: TEST_BUCKET,
+            prefix: None,
+        };
+        let objects = storage.list_objects(request).await.unwrap();
+        assert_eq!(objects.objects.len(), 3);
+
+        let request = crate::storage::ListObjectsRequest {
+            bucket: TEST_BUCKET,
+            prefix: Some("test-key-1"),
+        };
+        let objects = storage.list_objects(request).await.unwrap();
+        assert_eq!(objects.objects.len(), 1);
+        assert_eq!(objects.objects[0].key, "test-key-1");
+    }
+
+    #[tokio::test]
+    async fn test_multipart_upload() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
+        let upload_id = "test-upload-123";
+        let key = "test-multipart-key";
+        let metadata = create_test_metadata(0);
+
+        let request = crate::storage::CreateMultipartUploadRequest {
+            bucket: TEST_BUCKET,
+            key,
+            upload_id,
+            metadata,
+            checksum_type: aws_sdk_s3::types::ChecksumType::Composite,
+        };
+        storage.create_multipart_upload(request).await.unwrap();
+
+        let part1 = Bytes::from("part1");
+        let part2 = Bytes::from("part2");
+
+        let request1 = crate::storage::UploadPartRequest {
+            upload_id,
+            part_number: 1,
+            content: part1.clone(),
+            client_checksum_algorithms: vec![],
+        };
+        let etag1 = storage.upload_part(request1).await.unwrap();
+        let request2 = crate::storage::UploadPartRequest {
+            upload_id,
+            part_number: 2,
+            content: part2.clone(),
+            client_checksum_algorithms: vec![],
+        };
+        let etag2 = storage.upload_part(request2).await.unwrap();
+
+        let parts = storage.list_parts(upload_id).await.unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].part_number, 1);
+
+        let parts_to_complete = vec![(1, etag1.etag), (2, etag2.etag)];
+        let request = crate::storage::CompleteMultipartUploadRequest {
+            bucket: TEST_BUCKET,
+            upload_id,
+            parts: parts_to_complete,
+            client_checksums: None,
+            listed_part_checksum: None,
+        };
+        let response = storage.complete_multipart_upload(request).await.unwrap();
+
+        assert_eq!(response.key, key);
+
+        let request = crate::storage::GetObjectRequest {
+            bucket: TEST_BUCKET,
+            key,
+            range: None,
+        };
+        let result = storage.get_object(request).await.unwrap();
+        assert!(result.is_some());
+        let response = result.unwrap();
+        assert_eq!(
+            response.metadata.content_length,
+            (part1.len() + part2.len()) as u64
+        );
+        let final_content = collect_stream_data(response.stream).await;
+        assert_eq!(final_content, Bytes::from("part1part2"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_multipart_create_and_upload_do_not_deadlock() {
+        const OPERATIONS: usize = 64;
+
+        let storage = Arc::new(InMemoryStorage::new());
+        for index in 0..OPERATIONS {
+            let upload_id = format!("existing-{index}");
+            storage
+                .create_multipart_upload(crate::storage::CreateMultipartUploadRequest {
+                    bucket: TEST_BUCKET,
+                    key: &format!("existing-key-{index}"),
+                    upload_id: &upload_id,
+                    metadata: create_test_metadata(0),
+                    checksum_type: aws_sdk_s3::types::ChecksumType::Composite,
+                })
+                .await
+                .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(OPERATIONS * 2 + 1));
+        let mut tasks = JoinSet::new();
+        for index in 0..OPERATIONS {
+            let create_storage = Arc::clone(&storage);
+            let create_barrier = Arc::clone(&barrier);
+            tasks.spawn(async move {
+                let upload_id = format!("created-{index}");
+                let key = format!("created-key-{index}");
+                create_barrier.wait().await;
+                create_storage
+                    .create_multipart_upload(crate::storage::CreateMultipartUploadRequest {
+                        bucket: TEST_BUCKET,
+                        key: &key,
+                        upload_id: &upload_id,
+                        metadata: create_test_metadata(0),
+                        checksum_type: aws_sdk_s3::types::ChecksumType::Composite,
+                    })
+                    .await
+            });
+
+            let upload_storage = Arc::clone(&storage);
+            let upload_barrier = Arc::clone(&barrier);
+            tasks.spawn(async move {
+                let upload_id = format!("existing-{index}");
+                upload_barrier.wait().await;
+                upload_storage
+                    .upload_part(crate::storage::UploadPartRequest {
+                        upload_id: &upload_id,
+                        part_number: 1,
+                        content: Bytes::from_static(b"part"),
+                        client_checksum_algorithms: vec![],
+                    })
+                    .await
+                    .map(|_| ())
+            });
+        }
+
+        barrier.wait().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap().unwrap();
+            }
+        })
+        .await
+        .expect("multipart operations deadlocked");
+    }
+
+    #[tokio::test]
+    async fn test_rejected_multipart_completion_retains_upload() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
+        let upload_id = "test-upload-123";
+        let key = "test-multipart-key";
+        let metadata = create_test_metadata(0);
+
+        let request = crate::storage::CreateMultipartUploadRequest {
+            bucket: TEST_BUCKET,
+            key,
+            upload_id,
+            metadata,
+            checksum_type: aws_sdk_s3::types::ChecksumType::Composite,
+        };
+        storage.create_multipart_upload(request).await.unwrap();
+
+        let part1 = Bytes::from("part1");
+        let request = crate::storage::UploadPartRequest {
+            upload_id,
+            part_number: 1,
+            content: part1,
+            client_checksum_algorithms: vec![],
+        };
+        let etag1 = storage.upload_part(request).await.unwrap();
+
+        let valid_etag = etag1.etag;
+        let parts_to_complete = vec![(1, "wrong-etag".to_string())];
+        let request = crate::storage::CompleteMultipartUploadRequest {
+            bucket: TEST_BUCKET,
+            upload_id,
+            parts: parts_to_complete,
+            client_checksums: None,
+            listed_part_checksum: None,
+        };
+        let result = storage.complete_multipart_upload(request).await;
+        assert!(result.is_err());
+
+        let parts = storage
+            .list_parts(upload_id)
+            .await
+            .expect("rejected completion must retain multipart state");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].part_number, 1);
+
+        let request = crate::storage::CompleteMultipartUploadRequest {
+            bucket: TEST_BUCKET,
+            upload_id,
+            parts: vec![(1, valid_etag)],
+            client_checksums: None,
+            listed_part_checksum: None,
+        };
+        storage
+            .complete_multipart_upload(request)
+            .await
+            .expect("a corrected completion request must be retryable");
+    }
+
+    #[tokio::test]
+    async fn test_checksum_rejection_retains_multipart_upload() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket(TEST_BUCKET).await.unwrap();
+        let upload_id = "test-upload-checksum";
+        let key = "test-multipart-checksum-key";
+        let mut metadata = create_test_metadata(0);
+        metadata.checksum_algorithm = Some(aws_smithy_checksums::ChecksumAlgorithm::Crc32);
+
+        storage
+            .create_multipart_upload(crate::storage::CreateMultipartUploadRequest {
+                bucket: TEST_BUCKET,
+                key,
+                upload_id,
+                metadata,
+                checksum_type: aws_sdk_s3::types::ChecksumType::FullObject,
+            })
+            .await
+            .unwrap();
+
+        let etag = storage
+            .upload_part(crate::storage::UploadPartRequest {
+                upload_id,
+                part_number: 1,
+                content: Bytes::from_static(b"part1"),
+                client_checksum_algorithms: vec![],
+            })
+            .await
+            .unwrap()
+            .etag;
+        let invalid_checksum = ClientChecksums {
+            crc32: Some("AAAAAA==".to_string()),
+            crc32c: None,
+            sha1: None,
+            sha256: None,
+            crc64nvme: None,
+            md5: None,
+        };
+
+        let result = storage
+            .complete_multipart_upload(crate::storage::CompleteMultipartUploadRequest {
+                bucket: TEST_BUCKET,
+                upload_id,
+                parts: vec![(1, etag.clone())],
+                client_checksums: Some(&invalid_checksum),
+                listed_part_checksum: None,
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::BadDigest {
+                completion: true,
+                ..
+            })
+        ));
+        assert_eq!(
+            storage.list_parts(upload_id).await.unwrap().len(),
+            1,
+            "checksum rejection must retain multipart state"
+        );
+
+        storage
+            .complete_multipart_upload(crate::storage::CompleteMultipartUploadRequest {
+                bucket: TEST_BUCKET,
+                upload_id,
+                parts: vec![(1, etag)],
+                client_checksums: None,
+                listed_part_checksum: None,
+            })
+            .await
+            .expect("completion must remain retryable after checksum rejection");
+    }
+
+    #[tokio::test]
+    async fn test_abort_multipart_upload() {
+        let storage = InMemoryStorage::new();
+        let upload_id = "test-upload-123";
+        let key = "test-multipart-key";
+        let metadata = create_test_metadata(0);
+
+        let request = crate::storage::CreateMultipartUploadRequest {
+            bucket: TEST_BUCKET,
+            key,
+            upload_id,
+            metadata,
+            checksum_type: aws_sdk_s3::types::ChecksumType::Composite,
+        };
+        storage.create_multipart_upload(request).await.unwrap();
+
+        let part1 = Bytes::from("part1");
+        let request = crate::storage::UploadPartRequest {
+            upload_id,
+            part_number: 1,
+            content: part1,
+            client_checksum_algorithms: vec![],
+        };
+        storage.upload_part(request).await.unwrap();
+
+        storage.abort_multipart_upload(upload_id).await.unwrap();
+
+        let result = storage.list_parts(upload_id).await;
+        assert!(result.is_err());
+    }
+}

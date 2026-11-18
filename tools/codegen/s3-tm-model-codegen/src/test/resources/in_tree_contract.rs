@@ -13,6 +13,9 @@ pub mod io {
 }
 pub mod types {
     #[derive(Debug, Clone)]
+    pub struct ChecksumStrategy;
+
+    #[derive(Debug, Clone)]
     pub enum FailedMultipartUploadPolicy {
         Abort,
     }
@@ -48,9 +51,6 @@ pub mod operation {
         }
     }
     pub mod upload {
-        #[derive(Debug, Clone)]
-        pub struct ChecksumStrategy;
-
         pub mod builders {
             #[derive(Debug, Default)]
             pub struct UploadFluentBuilder {
@@ -72,8 +72,7 @@ pub mod operation {
 #[cfg(test)]
 mod tests {
     use super::{
-        config::ReadAhead, io::InputStream, metrics::TransferMetrics, model::*,
-        operation::upload::ChecksumStrategy, types::*,
+        config::ReadAhead, io::InputStream, metrics::TransferMetrics, model::*, types::*,
     };
 
     // The part number is crate-private: callers cannot select a part, but the

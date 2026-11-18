@@ -5,198 +5,247 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [release-2026-11-18]
 
-### Added
-- `UploadObjectsInput::builder`, matching the other operation inputs.
-- `set_failure_policy` on `UploadObjectsInputBuilder`, `DownloadObjectsInputBuilder`,
-  `UploadObjectsFluentBuilder`, and `DownloadObjectsFluentBuilder`. `None` selects the default,
-  `FailedTransferPolicy::Abort`.
-- `ConfigLoader::s3_config` uses an existing `SdkConfig` or `S3ClientConfig` in place of loading
-  the shared AWS configuration; `load` still detects the machine profile.
-- `ConfigLoader::read_ahead` sets the client's default download read-ahead, as
-  `config::Builder::read_ahead` does.
-- `ConfigLoader` is exported as `config::ConfigLoader`.
-- `Error::upload_id` returns the ID of a multipart upload that a failed upload left open in S3:
-  under `FailedMultipartUploadPolicy::Retain`, when AbortMultipartUpload failed, or when a worker
-  panic, such as one in the caller's `PartStream`, failed the upload after the multipart upload
-  was created. It is `None` when the multipart upload was aborted.
-- Client construction logs one `INFO` record of the resolved sizing (concurrency target and the
-  signal it came from, memory ceiling, part size, connection cap), a `WARN` when the part size
-  exceeds the memory ceiling, and a `WARN` when the soft file-descriptor limit holds connections
-  per host below the concurrency target.
-- `aws-sdk-s3-transfer-manager`: downloads report `ChecksumValidation::Validated` when a response
-  checksum covered every delivered byte and every one of those checksums matched.
-  `IntegrityChecks::checksum_validation` previously never reported `Validated`.
-- `aws-sdk-s3-transfer-manager`: `NotValidatedReason::UnsupportedAlgorithm`, reported when a
-  download's responses carried checksums only in algorithms the SDK does not compute, such as MD5.
-- `io::PartBuffer::new` creates a buffer for one upload part charged to a caller's
-  `memory::BufferPool`. `PartBuffer::writable` returns the bytes writable without another
-  `poll_acquire`, and `PartBuffer::fill_from_slice` copies as much of a slice as fits and returns
-  the count.
+Transfer Manager for Amazon S3 1.0.0 is published as `aws-s3-transfer`, renamed from
+`aws-sdk-s3-transfer-manager`. From 1.0.0 its public API follows Semantic Versioning; the
+non-default `__unstable_ext` feature remains experimental. Code written for 0.4 needs the changes
+in [Upgrading from 0.4](#upgrading-from-04).
 
-### Changed
-- `TransferMetrics::started_at` and `TransferMetrics::finished_at` are replaced by
-  `TransferMetrics::elapsed`: the time from when the transfer was initiated until it recorded its
-  finish, or until the snapshot if it has not. The metrics in an operation's output hold the final
-  value; a handle's `status` reports whether the transfer has finished.
-- Configuration types live in `config`, which now holds everything `Config` accepts: `PartSize`,
-  `ReadAhead`, `ConcurrencyMode`, `TargetThroughput`, `MemoryConfig` and `MemoryBudgetConfig` move
-  there from `types` (and, for the two memory types, from `memory`). `types` keeps the model shapes,
-  the per-request policies and the outputs, and gains the value types. `TransferMetrics` moves from
-  `types` to `metrics`, which now holds observation snapshots only. `ByteUnit`, `Throughput` and
-  `ThroughputDisplayContext` move from `metrics` to `types`; the `metrics::unit` module is gone.
-  The crate root re-exports `Client`, `Config` and `from_env`; `RuntimeConfig`, `Managed` and
-  `S3ClientConfig` are reachable through `config`. No type is reachable at two paths, so the old
-  paths are removed rather than re-exported.
-- `types::ByteSize` is a quantity of bytes, and configuration takes it wherever it takes a size:
-  `PartSize::Target` and `MemoryBudgetConfig::Limit`. Construct it with `ByteSize::new`,
-  `ByteSize::kib`, `ByteSize::mib` or `ByteSize::gib`, all `const fn`. `as_u64` and `as_usize`
-  return the byte count, the latter panicking only where `usize` is narrower than 64 bits and the
-  size does not fit, and `as_unit` returns the size in a given `ByteUnit` as an `f64`. `Display`
-  formats in the largest binary unit that keeps the value at or above 1, and `display_as` formats
-  in a fixed unit.
-  Positions, counters, object lengths and in-memory buffer lengths stay integers.
-- `BufferPoolBuilder::memory_budget` with a `MemoryBudgetConfig::Limit` larger than `usize::MAX`
-  returns `BufferPoolBuildError::CapacityOverflow`, which can happen only where `usize` is narrower
-  than 64 bits.
-- `ByteUnit` keeps its variants, `AsRef<str>` and `FromStr`, and is the unit a `ByteSize` or
-  `Throughput` is displayed in. Its `as_bytes_u64`, `as_bytes_usize`, `as_bits_u64`, `as_bits_usize`
-  and `convert` methods are removed, as is `ByteUnit::display`: `ByteSize::mib(8)` replaces
-  `8 * ByteUnit::Mebibyte.as_bytes_u64()`, `ByteSize::as_unit` replaces `ByteUnit::convert`, and
-  `ByteSize`'s `Display` replaces `ByteUnit::display`.
-  `ByteCountDisplayContext` is renamed `ByteSizeDisplayContext`, and `ByteSize::display_as` is its
-  only constructor: `ByteCountDisplayContext::new` is removed.
-- `aws-sdk-s3-transfer-manager`, `aws-sdk-s3-transfer-manager-ext`, `aws-smithy-topology`,
-  `aws-smithy-execution` and `aws-smithy-managed-http`: the minimum supported Rust version is
-  1.96.0.
-- `error::Error` no longer implements `From<tokio::task::JoinError>` or
-  `From<std::sync::PoisonError<T>>`. Construct an error of the intended kind with `Error::new`.
-- `error::Error` no longer implements `From<SdkError<E, HttpResponse>>` for the `aws-sdk-s3`
-  operation errors `GetObjectError`, `HeadObjectError`, `PutObjectError`, `UploadPartError`,
-  `CreateMultipartUploadError`, `CompleteMultipartUploadError`, `AbortMultipartUploadError`, and
-  `ListObjectsV2Error`. Errors returned by transfers are unchanged.
-- `S3ClientConfig::network_interfaces` and `ConfigLoader::network_interfaces` are removed. To bind
-  connections to network interfaces, build a `ManagedRuntime`, set the S3 configuration's HTTP
-  client to an `aws_smithy_managed_http::client::ManagedHttpPool` over a connection pool whose
-  partitions, one per runtime thread, bind to the interfaces, and adopt the runtime with
-  `aws_sdk_s3_transfer_manager_ext::managed`. `examples/cp.rs` builds this for
-  `--network-interfaces`.
-- `io::error` is no longer public. `InputStream::from_path` and `PathBodyBuilder::build` return
-  `error::Error`: a missing path or an offset past the end of the file is
-  `ErrorKind::InputInvalid`, and a failure reading file metadata, such as a missing file, is
-  `ErrorKind::IOError` with the `std::io::Error` as its source.
-- A failure of the transfer manager's own file reader that is not a read error, such as a panicked
-  read task, is `ErrorKind::RuntimeError` instead of `ErrorKind::IOError`.
-- `PartData::mark_last` is removed. A `PartStream` ends an upload by returning `None` from
-  `poll_part`.
-- `DownloadInput::part_number` and its getter are no longer public. Single-part downloads are
-  not supported.
-- `io::walk::WalkErrorKind` and `types::ByteUnit` are `#[non_exhaustive]`.
-- `io::PartBuffer` no longer implements `bytes::BufMut`. Use `PartBuffer::writable` in place of
-  `remaining_mut`, and `PartBuffer::fill_from_slice` in place of `put_slice`.
-- `StreamContext::part_buffer` is no longer public.
-- `BufferPool::reserve`, `BufferPool::try_reserve`, `BufferPool::acquire`,
-  `BufferPool::acquire_unreserved`, `BufferPool::carrier_size`, and `memory::PooledBufMut`,
-  `memory::Reservation`, `memory::ReserveFuture`, `memory::AcquireError`, and
-  `memory::ReserveError` are no longer public. `PartBuffer::poll_acquire` still reports pool
-  failures as `std::io::ErrorKind::Other`; the source error's type is no longer public.
-- `MemoryMetrics` getters are renamed: `configured_capacity_bytes` to `capacity_bytes`,
-  `admission_used_bytes` to `admitted_bytes`, `charged_capacity_bytes` to `in_use_bytes`,
-  `queued_reservations` to `waiting_requests`, and `reservation_enqueues_total` to `waits_total`.
-  `prepared_capacity_bytes` is replaced by `committed_bytes`, which returns `Option<u64>`.
-  `active_planned_demand_bytes` and `admission_overage_bytes` are no longer public.
-- The fields of `types::ThroughputDisplayContext` and `types::ByteSizeDisplayContext` are private.
-  Create them with `Throughput::display_as` or `ByteSize::display_as`.
-- `config::Builder::build` returns `Result<Config, BuildError>` and returns an error when
-  `s3_config` is not set, instead of panicking.
+This release publishes:
+
+- `aws-s3-transfer` 1.0.0, previously `aws-sdk-s3-transfer-manager` 0.4.0.
+- `aws-s3-transfer-ext` 0.1.0, previously `aws-sdk-s3-transfer-manager-ext` 0.1.0. It requires
+  `aws-s3-transfer` 1.0.0 exactly.
+- `aws-smithy-topology`, `aws-smithy-execution` and `aws-smithy-managed-http` 0.1.1.
+
+The minimum supported Rust version of every package is 1.96.0, up from 1.94.1.
+
+### Upgrading from 0.4
+
+#### Crate names
+
+- Depend on `aws-s3-transfer` and import `aws_s3_transfer`. The extension is
+  `aws-s3-transfer-ext`, imported as `aws_s3_transfer_ext`.
+- Tracing targets start with `aws_s3_transfer::` instead of `aws_sdk_s3_transfer_manager::`.
+  Update `RUST_LOG` and other filters that name them.
+
+#### Moved paths
+
+`config` holds everything `Config` accepts, `types` holds the value types, and `metrics` holds
+observation snapshots only. Each type has one path; the old paths are removed, not re-exported.
+
+| 0.4 | 1.0 |
+| --- | --- |
+| `RuntimeConfig`, `Managed`, `S3ClientConfig` at the crate root | `config::RuntimeConfig`, `config::Managed`, `config::S3ClientConfig` |
+| `types::{PartSize, ReadAhead, ConcurrencyMode, TargetThroughput}` | `config::{PartSize, ReadAhead, ConcurrencyMode, TargetThroughput}` |
+| `types::{MemoryConfig, MemoryBudgetConfig}`, also re-exported from `memory` | `config::{MemoryConfig, MemoryBudgetConfig}` |
+| `types::TransferMetrics` | `metrics::TransferMetrics` |
+| `metrics::unit::ByteUnit`, `metrics::{Throughput, ThroughputDisplayContext}` | `types::{ByteUnit, Throughput, ThroughputDisplayContext}` |
+| `metrics::unit::ByteCountDisplayContext` | `types::ByteSizeDisplayContext` |
+| `operation::upload::ChecksumStrategy` | `types::ChecksumStrategy` |
+
+The crate root still exports `Client`, `Config` and `from_env`.
+
+#### Configuration
+
+- Sizes are `types::ByteSize` values: `PartSize::Target(ByteSize::mib(8))` replaces
+  `PartSize::Target(u64)`, and `MemoryBudgetConfig::Limit(ByteSize::gib(2))` replaces
+  `MemoryBudgetConfig::Limit(usize)`. `ByteSize::new`, `kib`, `mib` and `gib` are `const fn`;
+  `as_u64`, `as_usize` and `as_unit` read the size back, and `Display` formats it in the largest
+  binary unit that keeps the value at or above 1.
+- `ByteUnit` only names a display unit and is `#[non_exhaustive]`. Its `as_bytes_u64`,
+  `as_bytes_usize`, `as_bits_u64`, `as_bits_usize`, `convert` and `display` methods are removed:
+  `ByteSize::mib(8)` replaces `8 * ByteUnit::Mebibyte.as_bytes_u64()`, `ByteSize::as_unit`
+  replaces `convert`, and `ByteSize`'s `Display` replaces `display`. Create display contexts with
+  `ByteSize::display_as` and `Throughput::display_as`; their fields are private and
+  `ByteCountDisplayContext::new` is removed.
+- `TargetThroughput::gbps(f64)` replaces `new_gigabits_per_sec(u64)`, so targets below 1 Gbps can
+  be expressed. It returns `Result<TargetThroughput, BuildError>`, rejecting a value that is not
+  finite and positive. One target covers uploads and downloads: `as_gbps()` replaces `upload()`
+  and `download()`.
+- `config::Builder::build` returns `Result<Config, BuildError>`, failing instead of panicking when
+  `s3_config` is not set.
 - The transfer manager no longer enables the `behavior-version-latest` feature of `aws-config` or
   `aws-sdk-s3`. Configuration loaded without a behavior version, such as with
   `aws_config::load_from_env`, needs one: use `aws_config::load_defaults(BehaviorVersion::latest())`
   or enable the feature in the application.
-- The `dial9` feature, `config::Builder::dial9_handle`, and `ConfigLoader::dial9_handle` are
+- Set framework metadata on the `SdkConfig` or S3 configuration, which now reaches the user agent
+  (see Fixed). The hidden `framework_metadata` methods of `config::Builder`, `ConfigLoader` and
+  `Config` are removed.
+
+#### Runtime and HTTP
+
+- `S3ClientConfig::network_interfaces` and `ConfigLoader::network_interfaces` are removed. To bind
+  connections to network interfaces, build a `ManagedRuntime`, set the S3 configuration's HTTP
+  client to an `aws_smithy_managed_http::client::ManagedHttpPool` over a connection pool whose
+  partitions, one per runtime thread, bind to the interfaces, and adopt the runtime with
+  `aws_s3_transfer_ext::managed`. `examples/cp.rs` builds this for `--network-interfaces`.
+- The `dial9` feature and the `dial9_handle` methods of `config::Builder` and `ConfigLoader` are
   removed. To trace managed execution, pass the recorder's handle to
-  `ManagedRuntime::builder().dial9_handle`, then adopt the runtime with
-  `aws_sdk_s3_transfer_manager_ext::managed`. The `aws-sdk-s3-transfer-manager-ext` `dial9` feature
-  enables `aws-smithy-execution/dial9` only.
-- The hidden `config::Builder::framework_metadata`, `ConfigLoader::framework_metadata`, and
-  `Config::framework_metadata` are removed. Set framework metadata on the `SdkConfig` or S3
-  configuration.
-- `ErrorKind::IOError` and `ErrorKind::InputInvalid` errors from a local filesystem operation on a
-  known path name the operation and the path, as in `I/O error creating directory "out/logs"`,
-  and the object key for a `download_objects` object.
-  This covers temporary file creation and renaming, for downloads to a path and for
-  `download_objects` objects, directory creation in `download_objects`, opening and reading upload source files, and the directory walk. Except for
-  the directory walk, whose source remains the `io::walk::WalkError`, the error's source is the
-  `std::io::Error` itself, where some of these sites previously used a message that embedded it,
-  such as `failed to open …` or `failed to create directory for key …`.
+  `ManagedRuntime::builder().dial9_handle` and adopt the runtime with
+  `aws_s3_transfer_ext::managed`. The `aws-s3-transfer-ext` `dial9` feature enables
+  `aws-smithy-execution/dial9` only.
+
+#### Upload checksums
+
+`ChecksumStrategy` is built from an algorithm type in `types::checksum` (`Crc64Nvme`, `Crc32`,
+`Crc32C`, `Sha1` or `Sha256`). `full_object` and `composite` name the checksum type a multipart
+upload stores. They cannot fail: a combination S3 doesn't support doesn't compile.
+
+| 0.4 | 1.0 |
+| --- | --- |
+| `with_calculated_crc64_nvme()`, `with_calculated_crc32()`, `with_calculated_crc32_c()` | `full_object(Crc64Nvme)` (also `ChecksumStrategy::default()`), `full_object(Crc32)`, `full_object(Crc32C)` |
+| `with_crc64_nvme(v)`, `with_crc32(v)`, `with_crc32_c(v)` | `full_object(..).with_expected_value(v)` with the same algorithm |
+| `with_calculated_*_composite_if_multipart()` | `composite(Crc32)`, `composite(Crc32C)`, `composite(Sha1)`, `composite(Sha256)` |
+| `type_if_multipart()`, `full_object_checksum()` | `multipart_checksum_type()`, `expected_value()` |
+| `ChecksumStrategy::builder()`, `ChecksumStrategyBuilder` | Removed |
+
+#### Errors
+
+- `error::Error` no longer implements `From<tokio::task::JoinError>`,
+  `From<std::sync::PoisonError<T>>`, or `From<SdkError<E, HttpResponse>>` for the `aws-sdk-s3`
+  operation errors. Construct an error of the intended kind with `Error::new`. Errors returned by
+  transfers are unchanged.
+- `io::error` is no longer public. `InputStream::from_path` and `PathBodyBuilder::build` return
+  `error::Error`: `ErrorKind::InputInvalid` when no path is set or the offset is past the end of
+  the file, and `ErrorKind::IOError`, with the `std::io::Error` as its source, when reading file
+  metadata fails, such as for a file that does not exist.
+- A download response whose `Content-Range` doesn't match the requested range fails with
+  `ErrorKind::ServiceError` carrying the operation and request ids, instead of
+  `ObjectNotDiscoverable` during discovery and `RuntimeError` afterwards.
+- A failure of the transfer manager's own file reader other than a read error, such as a panicked
+  read task, is `ErrorKind::RuntimeError` instead of `ErrorKind::IOError`.
 - The source of an `ErrorKind::ChildOperationFailed` error from `upload_objects` or
-  `download_objects` is the error of the first failed object, the one that stopped the transfer
-  under `FailedTransferPolicy::Abort`, instead of a message naming it.
-- `download_objects` writes each object at its full key under the destination. The walker's
-  prefix only selects objects and is no longer removed from local paths: with the prefix
-  `photos/`, the key `photos/a.txt` was written to `<dest>/a.txt` and is now written to
-  `<dest>/photos/a.txt`. A prefix that ends partway through a name no longer cuts it: with the
-  prefix `photos`, the key `photos-other/x.txt` was written to `<dest>/-other/x.txt`.
-- `TargetThroughput::gbps` replaces `new_gigabits_per_sec`. It takes an `f64` instead of a `u64`,
-  so targets below 1 Gbps can be expressed, and returns `Result<TargetThroughput, BuildError>`,
-  rejecting a value that is not finite and positive.
-- `TargetThroughput` holds one target for uploads and downloads. `upload()` and `download()` are
-  replaced by `as_gbps()`.
-- The concurrency target, payload-memory ceiling, part size, and connection cap are resolved
-  together at client construction. The concurrency target is not lowered by the memory ceiling
-  or the connection cap: requests beyond either wait for memory admission or a connection.
-- The automatic part size is 8 MiB for both uploads and downloads. Downloads previously used
-  5 MiB, so objects larger than 5 MiB and up to 8 MiB now download with a single GET.
-- The per-host connection cap's descriptor budget is the smaller of half the soft
-  `RLIMIT_NOFILE` and the soft limit less 64 descriptors, so it binds only below a soft limit
-  of 128.
-- The automatic memory ceiling for a client is at least 256 MiB, limited to half of detected
-  memory. `BufferPool` built with `MemoryBudgetConfig::Auto` directly is unchanged.
-- `aws-sdk-s3-transfer-manager`: the minimum `aws-sdk-s3` is now 1.158.0, the first release that
-  reports the response checksum outcome the verdict is built from.
-- The bandwidth table adds m5n, m5dn, r5n, r5dn, m5zn, x2iezn, d3, d3en, is4gen, c8ine, g4dn
-  and g6e, and uses one network card's bandwidth for p5, p5e, p5en, p6-b200, p6-b300, trn1 and
-  trn1n.
+  `download_objects` is the error of the first failed object, instead of a message naming it.
+- `io::walk::WalkErrorKind` is `#[non_exhaustive]`.
+
+#### Custom part streams and memory
+
+- A `PartStream` ends an upload by returning `None` from `poll_part`; `PartData::mark_last` is
+  removed.
+- `StreamContext::part_buffer` is no longer public. Create a buffer with
+  `PartBuffer::new(&pool, stream_cx.part_size())`, charged to a `memory::BufferPool` you own, and
+  share the pool with the client through `MemoryConfig::Explicit` to bound their memory together.
+- `PartBuffer` no longer implements `bytes::BufMut`: `PartBuffer::writable` replaces
+  `remaining_mut`, and `PartBuffer::fill_from_slice`, which copies as much of a slice as fits and
+  returns the count, replaces `put_slice`.
+- `memory` exports `BufferPool`, `BufferPoolBuilder`, `BufferPoolBuildError` and `SegmentedBytes`.
+  `BufferPool::reserve`, `try_reserve`, `acquire`, `acquire_unreserved` and `carrier_size`, and
+  `PooledBufMut`, `Reservation`, `ReserveFuture`, `AcquireError` and `ReserveError` are no longer
+  public. `PartBuffer::poll_acquire` still reports pool failures as `std::io::ErrorKind::Other`.
+
+#### Metrics
+
+- `TransferMetrics::elapsed` replaces `started_at` and `finished_at`: the time from when the
+  transfer was initiated until it recorded its finish, or until the snapshot if it has not. A
+  handle's `status` reports whether the transfer has finished.
+- `MemoryMetrics` getters are renamed: `configured_capacity_bytes` to `capacity_bytes`,
+  `admission_used_bytes` to `admitted_bytes`, `charged_capacity_bytes` to `in_use_bytes`,
+  `queued_reservations` to `waiting_requests`, and `reservation_enqueues_total` to `waits_total`.
+  `committed_bytes`, returning `Option<u64>`, replaces `prepared_capacity_bytes`.
+  `active_planned_demand_bytes` and `admission_overage_bytes` are no longer public.
+
+#### Downloads
+
+- `download_objects` writes each object at its full key under the destination; the prefix only
+  selects objects. With the prefix `photos/`, the key `photos/a.txt` was written to
+  `<dest>/a.txt` and is now written to `<dest>/photos/a.txt`. A prefix that ends partway through a
+  name no longer cuts it: with the prefix `photos`, `photos-other/x.txt` was written to
+  `<dest>/-other/x.txt`.
+- `DownloadInput::part_number` and its getter are no longer public. Single-part downloads are not
+  supported.
+
+### Added
+
+- Whole-object downloads verify a stored CRC32, CRC32C or CRC64NVME full object checksum, including
+  when the object is downloaded in independent ranges and when it is empty. A mismatch fails
+  `join()` with `ErrorKind::IntegrityError` before the destination is finalized; streamed bytes
+  can arrive before the final check. `IntegrityChecks::checksum_validation` reports `Validated`
+  when every delivered byte was covered by a matching checksum, which it previously never did.
+- `IntegrityChecks` reports stored SHA-512, MD5, XXHASH64, XXHASH3 and XXHASH128 values through
+  `checksum_sha512`, `checksum_md5`, `checksum_xxhash64`, `checksum_xxhash3` and
+  `checksum_xxhash128`, and `NotValidatedReason::UnsupportedAlgorithm` reports a download whose
+  responses carried checksums only in algorithms the SDK does not compute, such as MD5.
+- A composite `ChecksumStrategy`, including SHA-1 and SHA-256, can carry an expected value. A
+  single-request upload sends it as the PutObject checksum; a multipart upload with one fails
+  `initiate` with `ErrorKind::InputInvalid` before any request is sent.
+- `Error::upload_id` returns the ID of a multipart upload that a failed upload left open in S3:
+  under `FailedMultipartUploadPolicy::Retain`, when AbortMultipartUpload failed, or when a worker
+  panic, such as one in the caller's `PartStream`, failed the upload after the multipart upload
+  was created.
+- `config::ConfigLoader` is public, and gains `s3_config`, which uses an existing `SdkConfig` or
+  `S3ClientConfig` in place of loading the shared AWS configuration, and `read_ahead`, which sets
+  the default download read-ahead.
+- `UploadObjectsInput::builder`, matching the other operation inputs, and `set_failure_policy` on
+  the `upload_objects` and `download_objects` input and fluent builders.
+- Client construction logs the resolved sizing at `INFO`: the concurrency target and the signal it
+  came from, the memory ceiling, the part size and the connection cap. It logs a `WARN` when the
+  part size exceeds the memory ceiling, or when the soft file-descriptor limit holds connections
+  per host below the concurrency target.
+- `aws-smithy-execution` and `aws-smithy-managed-http` 0.1.1: the documentation on docs.rs covers
+  every feature and labels the items each feature enables. `aws-smithy-topology` 0.1.1 changes only
+  its minimum supported Rust version.
+
+### Changed
+
+- Whole-object downloads with checksum validation enabled start with a checksum-mode HeadObject,
+  so `IntegrityChecks` reports the stored checksum values for split downloads too, except a
+  composite value, for which it reports only the type. Small nonempty objects take a HEAD and a
+  GET instead of one GET, except in `download_objects`, which downloads a listed single-part object
+  no larger than the part size with one GET pinned to its listed ETag, falling back to HEAD if the
+  object changed since the listing. Caller-range downloads and downloads with validation disabled
+  are unchanged.
+- A download that fails at HeadObject reports the error as S3 answers a HEAD: with the status and
+  request ids but no message. The error code is `PreconditionFailed` for 412, `NotModified` for
+  304, `InvalidRange` for 416, and `NotFound` for 404, where GetObject reported `NoSuchKey`.
+- The automatic part size is 8 MiB for uploads and downloads. Downloads used 5 MiB, so objects
+  larger than 5 MiB and up to 8 MiB now download with one GET.
+- Automatic sizing resolves the concurrency target, memory ceiling, part size and connection cap
+  together when the client is built. The memory ceiling and the connection cap no longer lower the
+  concurrency target; requests beyond either wait for memory or a connection. A client's automatic
+  memory ceiling is raised to at least 256 MiB, but not above half of detected memory; a
+  `BufferPool` built with `MemoryBudgetConfig::Auto` is unchanged. The per-host connection cap
+  budgets at most half the soft `RLIMIT_NOFILE` and leaves at least 64 descriptors free. Sizing
+  recognizes more EC2 instance types, and sizes instances with several network cards by one card's
+  bandwidth.
+- Errors from a local filesystem operation on a known path name the operation and the path, as in
+  `I/O error creating directory "out/logs"`, and the object key in `download_objects`. Their
+  source is the `std::io::Error` itself, or the `io::walk::WalkError` for the directory walk.
+- A ranged GET that covers the whole object accepts a `200 OK` response without `Content-Range`
+  when its `Content-Length` is the object's length, as from a server that ignores `Range`.
+- The minimum `aws-sdk-s3` is 1.158.0.
 
 ### Fixed
-- `InputStream::from_path` and `PathBodyBuilder::build` reject a path that does not name a regular
-  file, such as a directory, a device, a FIFO, or a Windows pipe, with `ErrorKind::InputInvalid`.
-- `PathBodyBuilder::build` without a path returns an `ErrorKind::InputInvalid` error instead of
-  panicking.
+
+- An upload fails with `ErrorKind::InputInvalid`, before any request, when a checksum the caller
+  supplied cannot be sent: a `PartStream` part with a checksum on an upload with no
+  `ChecksumStrategy`, or a `content_md5` on a multipart upload.
+- `IntegrityError::algorithm()` names the algorithm on a checksum mismatch; it was always `None`.
+  A download no longer reports a checksum value that does not cover the whole object.
+- Validated multipart downloads no longer stall on a capped connection pool by sending a discovery
+  request while holding an unread first-range response.
 - The metrics in an upload's output are the transfer's metrics at completion. A single-request
-  upload's output reported zero `network_tx`, and zero `disk_read` for a file source.
-- Framework metadata set on the `SdkConfig` or S3 configuration was missing from the
-  `x-amz-user-agent` header of requests the transfer manager sent. The header now carries each
-  entry as `lib/<name>/<version>` alongside the transfer manager's attribution, in the order
-  configured and without duplicates.
-
-### Fixed
-- `upload_objects` with a custom delimiter could derive one key from two files, such as `a-/b` and
-  `a/-b` with the delimiter `--`, and report both as uploaded while the later write replaced the
-  earlier one. It now fails the second file with `ErrorKind::InputInvalid`, names the first file, and
-  follows the `FailedTransferPolicy`. The default and native delimiters keep no key registry.
+  upload reported zero `network_tx`, and zero `disk_read` for a file source.
+- Framework metadata set on the `SdkConfig` or S3 configuration is sent in the `x-amz-user-agent`
+  header as `lib/<name>/<version>`, in the order configured and without duplicates. It was
+  missing.
+- `InputStream::from_path` and `PathBodyBuilder::build` reject a path that is not a regular file,
+  such as a directory, a device, a FIFO or a Windows pipe, and `PathBodyBuilder::build` without a
+  path returns an error instead of panicking. Both are `ErrorKind::InputInvalid`.
+- `upload_objects` with a custom delimiter could map two files to one key, such as `a-/b` and
+  `a/-b` with the delimiter `--`, and report both uploaded while the second replaced the first. It
+  now fails the second file with `ErrorKind::InputInvalid`, naming the first, under the
+  `FailedTransferPolicy`.
 - `upload_objects` with an empty `key_prefix` uploads each file under its relative path instead of
   a key with a leading `/`.
-- `download_objects` accepts a destination containing `.` or `..` components, such as `./out` or
-  `out/../out`, instead of rejecting every object as resolving outside it. The destination is
-  resolved lexically, without following symbolic links.
-- `download_objects` rejects a key that resolves outside a destination made of `..` components, such
-  as `../b.txt` under `..`, which was previously accepted.
-- `download_objects` creates a destination directory that does not exist, with any missing
-  parents, instead of failing.
-- `download_objects` fails an object whose key maps to the destination directory itself, such as
-  `.`, `./`, or `a/..`, with `ErrorKind::InputInvalid` before creating any file or requesting the
-  object. Such an object was previously downloaded to a temporary file beside the destination
-  and then failed to be renamed onto it.
-- `aws-sdk-s3-transfer-manager`: `IntegrityError::algorithm()` now names the algorithm on a
-  checksum mismatch. It was always `None`.
-- `aws-sdk-s3-transfer-manager`: an upload now fails with `ErrorKind::InputInvalid` when a checksum the
-  caller supplied cannot be sent. A `PartStream` part that carries
-  a checksum on an upload with no `ChecksumStrategy`, and a `content_md5` on a multipart upload, are
-  both rejected before any request is sent.
-- `aws-sdk-s3-transfer-manager`: a download no longer reports a checksum value that does not cover
-  the whole object.
+- `download_objects` resolves its destination lexically, without following symbolic links. It
+  accepts a destination containing `.` or `..`, such as `./out`, for which it rejected every
+  object, and rejects a key that resolves outside a destination made of `..` components, such as
+  `../b.txt` under `..`, which it accepted.
+- `download_objects` creates a missing destination directory and its parents instead of failing,
+  and fails an object whose key maps to the destination itself, such as `.` or `a/..`, with
+  `ErrorKind::InputInvalid` before requesting it.
 
 ## [release-2026-11-05]
 

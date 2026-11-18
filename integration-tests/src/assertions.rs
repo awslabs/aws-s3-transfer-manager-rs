@@ -9,12 +9,10 @@
 //! are written and maintained once. Module-specific assertions (e.g. ones tied
 //! to a particular output type) stay with their module.
 
-use aws_sdk_s3_transfer_manager::error::{Error, ErrorKind};
-use aws_sdk_s3_transfer_manager::metrics::TransferMetrics;
-use aws_sdk_s3_transfer_manager::operation::download::DownloadOutput;
-use aws_sdk_s3_transfer_manager::types::{
-    ChecksumAlgorithm, ChecksumValidation, NotValidatedReason,
-};
+use aws_s3_transfer::error::{Error, ErrorKind};
+use aws_s3_transfer::metrics::TransferMetrics;
+use aws_s3_transfer::operation::download::DownloadOutput;
+use aws_s3_transfer::types::{ChecksumAlgorithm, ChecksumValidation, NotValidatedReason};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -69,7 +67,7 @@ pub(crate) fn assert_integrity_error<T>(result: Result<T, Error>) {
 /// checksum-mismatch error shape (algorithm/expected/computed extraction).
 pub(crate) fn expect_integrity_error<T: std::fmt::Debug>(
     result: Result<T, Error>,
-) -> aws_sdk_s3_transfer_manager::error::IntegrityError {
+) -> aws_s3_transfer::error::IntegrityError {
     match result {
         Err(e) => match e.kind() {
             ErrorKind::IntegrityError(ie) => ie.clone(),
@@ -110,4 +108,64 @@ pub(crate) fn assert_same_content(expected: &[u8], actual: &[u8]) {
         actual.len(),
         first_diff
     );
+}
+
+/// Whether `path` names a temporary file of a path download: the transfer manager writes to a
+/// file whose name contains `.s3tmp.` and renames it to the destination on success.
+pub(crate) fn is_download_temp_file(path: &std::path::Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().contains(".s3tmp."))
+}
+
+/// Checks that `error` is an integrity error in `algorithm` whose expected and computed values
+/// are both set and differ. Returns the reason it isn't as `Err`.
+pub(crate) fn check_integrity_error(
+    error: &Error,
+    algorithm: &ChecksumAlgorithm,
+) -> Result<(), String> {
+    let ErrorKind::IntegrityError(integrity) = error.kind() else {
+        return Err(format!("expected an integrity error, got {error:?}"));
+    };
+    if integrity.algorithm() != Some(algorithm) {
+        return Err(format!(
+            "integrity error in {:?}, expected {algorithm:?}",
+            integrity.algorithm()
+        ));
+    }
+    if integrity.expected().is_none()
+        || integrity.computed().is_none()
+        || integrity.expected() == integrity.computed()
+    {
+        return Err(format!(
+            "integrity error must carry different expected and computed values: {integrity:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The code and kind of an S3 request error, without its message or `Debug` form.
+///
+/// An authorization failure's message names the caller's account and role, and tests that run
+/// against real S3 print to public CI logs, so they describe a failed request with this instead.
+pub(crate) fn describe_sdk_error<E, R>(error: &aws_sdk_s3::error::SdkError<E, R>) -> String
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata + std::error::Error + 'static,
+    R: std::fmt::Debug,
+{
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    match error.code() {
+        Some(code) => format!("{error} ({code})"),
+        None => format!("{error}"),
+    }
+}
+
+/// The kind, operation and code of a transfer manager error, without its source, for the same
+/// reason as [`describe_sdk_error`].
+pub(crate) fn describe_error(error: &Error) -> String {
+    format!(
+        "{:?} from {:?} ({:?})",
+        error.kind(),
+        error.operation_name(),
+        error.code()
+    )
 }

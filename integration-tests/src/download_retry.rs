@@ -41,11 +41,12 @@ use crate::assertions::{
     assert_integrity_error, assert_io_error, assert_same_content, assert_validated,
 };
 use crate::harness::Target;
-use aws_sdk_s3_transfer_manager::config::PartSize;
-use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
-use aws_sdk_s3_transfer_manager::types::ByteSize;
-use aws_sdk_s3_transfer_manager::types::{ChecksumAlgorithm, ChecksumMode};
-use aws_sdk_s3_transfer_manager::Client as TmClient;
+use aws_s3_transfer::config::PartSize;
+use aws_s3_transfer::types::checksum::Crc32;
+use aws_s3_transfer::types::ByteSize;
+use aws_s3_transfer::types::ChecksumStrategy;
+use aws_s3_transfer::types::{ChecksumAlgorithm, ChecksumMode};
+use aws_s3_transfer::Client as TmClient;
 use s3_mock_server::S3MockServer;
 use s3_mock_server::{BodyCadence, FaultType, Occurrence, Operation};
 
@@ -103,12 +104,8 @@ const SINGLE_RANGE_FAULT_AFTER: u64 = 2 * 1024 * 1024;
 async fn truncate_body_once_recovers() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = multipart_data();
-    t.put(
-        "obj",
-        data.clone(),
-        ChecksumStrategy::with_calculated_crc32(),
-    )
-    .await;
+    t.put("obj", data.clone(), ChecksumStrategy::full_object(Crc32))
+        .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -137,12 +134,8 @@ async fn truncate_body_once_recovers() {
 async fn truncate_body_once_recovers_validated() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = two_part_data();
-    t.put(
-        "obj",
-        data.clone(),
-        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
-    )
-    .await;
+    t.put("obj", data.clone(), ChecksumStrategy::composite(Crc32))
+        .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -175,12 +168,8 @@ async fn truncate_body_once_recovers_validated() {
 async fn connection_reset_once_recovers() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = multipart_data();
-    t.put(
-        "obj",
-        data.clone(),
-        ChecksumStrategy::with_calculated_crc32(),
-    )
-    .await;
+    t.put("obj", data.clone(), ChecksumStrategy::full_object(Crc32))
+        .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -207,12 +196,8 @@ async fn connection_reset_once_recovers() {
 async fn short_body_once_recovers() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = multipart_data();
-    t.put(
-        "obj",
-        data.clone(),
-        ChecksumStrategy::with_calculated_crc32(),
-    )
-    .await;
+    t.put("obj", data.clone(), ChecksumStrategy::full_object(Crc32))
+        .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -242,7 +227,7 @@ async fn short_body_once_recovers() {
 async fn truncate_body_always_exhausts_and_fails() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
+    t.put("obj", data, ChecksumStrategy::full_object(Crc32))
         .await;
 
     let mock = t.mock().expect("requires the mock backend");
@@ -283,7 +268,7 @@ async fn truncate_body_always_exhausts_and_fails() {
 async fn cold_tracker_body_stall_does_not_hang() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
+    t.put("obj", data, ChecksumStrategy::full_object(Crc32))
         .await;
 
     let mock = t.mock().expect("requires the mock backend");
@@ -360,7 +345,7 @@ async fn slow_progressing_body_download_completes() {
         t.put(
             &key,
             warmup_data.clone(),
-            ChecksumStrategy::with_calculated_crc32(),
+            ChecksumStrategy::full_object(Crc32),
         )
         .await;
         t.download(&key, Some(ChecksumMode::Enabled))
@@ -371,12 +356,8 @@ async fn slow_progressing_body_download_completes() {
     // A single-range-chunk object so the fault targets exactly one chunk and the
     // deadline's per-timeout widening is bounded by the attempt budget.
     let data = single_range_chunk_data();
-    t.put(
-        "slow",
-        data.clone(),
-        ChecksumStrategy::with_calculated_crc32(),
-    )
-    .await;
+    t.put("slow", data.clone(), ChecksumStrategy::full_object(Crc32))
+        .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -410,12 +391,7 @@ async fn slow_progressing_body_download_completes() {
 async fn corrupt_body_always_fails() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = multipart_data();
-    t.put(
-        "obj",
-        data,
-        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
-    )
-    .await;
+    t.put("obj", data, ChecksumStrategy::composite(Crc32)).await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -441,12 +417,7 @@ async fn corrupt_body_always_fails() {
 async fn corrupt_body_once_is_not_retried() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = multipart_data();
-    t.put(
-        "obj",
-        data,
-        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
-    )
-    .await;
+    t.put("obj", data, ChecksumStrategy::composite(Crc32)).await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -481,12 +452,8 @@ fn two_part_data() -> Vec<u8> {
 #[tokio::test]
 async fn corrupt_body_on_retry_is_not_retried() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
-    t.put(
-        "obj",
-        two_part_data(),
-        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
-    )
-    .await;
+    t.put("obj", two_part_data(), ChecksumStrategy::composite(Crc32))
+        .await;
 
     // The two faults fire in order, on the lone range chunk's first two attempts.
     let mock = t.mock().expect("requires the mock backend");
@@ -542,12 +509,8 @@ async fn corrupt_body_on_discovery_retry_is_not_retried() {
     let t = Target::mock_gp()
         .connect_mock_configured(Some(PART_SIZE), without_sdk_retries)
         .await;
-    t.put(
-        "obj",
-        one_part_data(),
-        ChecksumStrategy::with_calculated_crc32(),
-    )
-    .await;
+    t.put("obj", one_part_data(), ChecksumStrategy::full_object(Crc32))
+        .await;
 
     // The two faults fire in order, on the discovery GET's first two attempts.
     let mock = t.mock().expect("requires the mock backend");
@@ -584,12 +547,8 @@ async fn corrupt_body_on_discovery_retry_is_not_retried() {
 #[tokio::test]
 async fn corrupt_body_on_sdk_retry_is_not_retried() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
-    t.put(
-        "obj",
-        one_part_data(),
-        ChecksumStrategy::with_calculated_crc32(),
-    )
-    .await;
+    t.put("obj", one_part_data(), ChecksumStrategy::full_object(Crc32))
+        .await;
 
     // The two faults fire in order, on the SDK's first two attempts of the call.
     let mock = t.mock().expect("requires the mock backend");
@@ -629,12 +588,8 @@ async fn corrupt_body_on_realigned_discovery_retry_is_not_retried() {
     let t = Target::mock_gp()
         .connect_mock_configured(None, without_sdk_retries)
         .await;
-    t.put(
-        "obj",
-        two_part_data(),
-        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
-    )
-    .await;
+    t.put("obj", two_part_data(), ChecksumStrategy::composite(Crc32))
+        .await;
 
     // The two faults fire in order, on the partNumber=1 GET's first two attempts.
     let mock = t.mock().expect("requires the mock backend");
@@ -666,12 +621,8 @@ async fn corrupt_body_on_realigned_discovery_retry_is_not_retried() {
 #[tokio::test]
 async fn corrupt_body_on_discovery_chunk_reissue_is_not_retried() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
-    t.put(
-        "obj",
-        one_part_data(),
-        ChecksumStrategy::with_calculated_crc32(),
-    )
-    .await;
+    t.put("obj", one_part_data(), ChecksumStrategy::full_object(Crc32))
+        .await;
 
     // The faults fire in order: on the discovery GET, then the chunk's first two
     // re-issues.
@@ -719,12 +670,8 @@ async fn corrupt_body_on_discovery_chunk_reissue_is_not_retried() {
 async fn discovery_chunk_truncate_once_recovers() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = multipart_data();
-    t.put(
-        "obj",
-        data.clone(),
-        ChecksumStrategy::with_calculated_crc32(),
-    )
-    .await;
+    t.put("obj", data.clone(), ChecksumStrategy::full_object(Crc32))
+        .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -753,7 +700,7 @@ async fn discovery_chunk_truncate_once_recovers() {
 async fn discovery_chunk_truncate_always_fails() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = multipart_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
+    t.put("obj", data, ChecksumStrategy::full_object(Crc32))
         .await;
 
     let mock = t.mock().expect("requires the mock backend");
@@ -789,12 +736,8 @@ async fn discovery_chunk_truncate_always_fails() {
 async fn range_retries_up_to_budget_recover() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = single_range_chunk_data();
-    t.put(
-        "obj",
-        data.clone(),
-        ChecksumStrategy::with_calculated_crc32(),
-    )
-    .await;
+    t.put("obj", data.clone(), ChecksumStrategy::full_object(Crc32))
+        .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -823,7 +766,7 @@ async fn range_retries_up_to_budget_recover() {
 async fn range_retries_exhaust_at_budget_fail() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = single_range_chunk_data();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
+    t.put("obj", data, ChecksumStrategy::full_object(Crc32))
         .await;
 
     let mock = t.mock().expect("requires the mock backend");
@@ -924,8 +867,8 @@ async fn requests_carry_per_bucket_retry_partition() {
         aws_sdk_s3::Client::from_conf(conf)
     };
     let tm = TmClient::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
-            .s3_config(aws_sdk_s3_transfer_manager::config::S3ClientConfig::new(
+        aws_s3_transfer::Config::builder()
+            .s3_config(aws_s3_transfer::config::S3ClientConfig::new(
                 s3.config().to_builder(),
             ))
             .part_size(PART_SIZE)
@@ -1004,12 +947,8 @@ async fn tm_download(tm: &TmClient, bucket: &str, key: &str) -> Result<Vec<u8>, 
 async fn discovery_service_error_surfaces_underlying_cause() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = single_range_chunk_data();
-    t.put(
-        "obj",
-        data.clone(),
-        ChecksumStrategy::with_calculated_crc32(),
-    )
-    .await;
+    t.put("obj", data.clone(), ChecksumStrategy::full_object(Crc32))
+        .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(
@@ -1027,7 +966,7 @@ async fn discovery_service_error_surfaces_underlying_cause() {
 
     assert_eq!(
         *err.kind(),
-        aws_sdk_s3_transfer_manager::error::ErrorKind::ServiceError,
+        aws_s3_transfer::error::ErrorKind::ServiceError,
         "discovery failure must surface the underlying service error (SlowDown), \
          got {err:?}",
     );
@@ -1043,12 +982,8 @@ async fn discovery_service_error_surfaces_underlying_cause() {
 async fn discovery_single_service_error_recovers() {
     let t = Target::mock_gp().connect_with(Some(PART_SIZE)).await;
     let data = single_range_chunk_data();
-    t.put(
-        "obj",
-        data.clone(),
-        ChecksumStrategy::with_calculated_crc32(),
-    )
-    .await;
+    t.put("obj", data.clone(), ChecksumStrategy::full_object(Crc32))
+        .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(

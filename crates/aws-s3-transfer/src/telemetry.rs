@@ -1,0 +1,238 @@
+/*
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! Tracing target constants and observability surface for transfer operations.
+//!
+//! These targets allow filtering logs by concern rather than module path:
+//!
+//! ```text
+//! RUST_LOG=aws_s3_transfer::concurrency=debug   # concurrency resolution and control
+//! RUST_LOG=aws_s3_transfer::scheduling=debug    # scheduler + memory-budget admission
+//! RUST_LOG=aws_s3_transfer::execution=trace     # per-work-item execute/complete
+//! RUST_LOG=aws_s3_transfer::transfer=debug      # transfer lifecycle events
+//! RUST_LOG=aws_s3_transfer::memory=debug        # buffer-pool admission + storage
+//! ```
+//!
+//! ## Transfer targets
+//!
+//! Each transfer operation logs under its own target below `transfer`:
+//!
+//! ```text
+//! aws_s3_transfer::transfer                    # shared: pending, wake, retry, walkers
+//! aws_s3_transfer::transfer::upload            # upload
+//! aws_s3_transfer::transfer::download          # download
+//! aws_s3_transfer::transfer::upload_objects    # upload_objects parent
+//! aws_s3_transfer::transfer::download_objects  # download_objects parent
+//! ```
+//!
+//! A directive matches its target and every target that starts with it, so
+//! `transfer=debug` enables all transfer records. `transfer::upload` also
+//! matches `transfer::upload_objects`, and `transfer::download` also matches
+//! `transfer::download_objects`. The longest matching directive wins, so a
+//! second directive sets the composite parent to its own level.
+//!
+//! To quiet a bulk transfer's parent and keep its children:
+//!
+//! ```text
+//! RUST_LOG=aws_s3_transfer::transfer::upload=debug,aws_s3_transfer::transfer::upload_objects=warn
+//! ```
+//!
+//! To quiet its children and keep the parent, name the parent as well, since
+//! lowering `transfer::upload` also lowers `transfer::upload_objects`:
+//!
+//! ```text
+//! RUST_LOG=aws_s3_transfer::transfer=debug,aws_s3_transfer::transfer::upload=info,aws_s3_transfer::transfer::upload_objects=debug
+//! ```
+//!
+//! Each child of a composite transfer is an ordinary upload or download and
+//! logs under `transfer::upload` or `transfer::download`, not under its
+//! parent's target.
+
+use crate::metrics::latency::LatencyTracker;
+use crate::metrics::IOCounters;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Concurrency resolution and control: selected targets, transitions, and probe results.
+pub(crate) const TARGET_CONCURRENCY: &str = "aws_s3_transfer::concurrency";
+
+/// Scheduler capacity decisions, worker pool growth, work submission, and memory-budget admission.
+pub(crate) const TARGET_SCHEDULING: &str = "aws_s3_transfer::scheduling";
+
+/// Buffer-pool admission, physical storage, reclamation, and fatal errors.
+pub(crate) const TARGET_MEMORY: &str = "aws_s3_transfer::memory";
+
+/// Per-work-item execution: dispatch, complete, skip, panic.
+pub(crate) const TARGET_EXECUTION: &str = "aws_s3_transfer::execution";
+
+/// Transfer lifecycle: enqueue, complete, cancel, fail, state transitions.
+pub(crate) const TARGET_TRANSFER: &str = "aws_s3_transfer::transfer";
+
+/// Upload state machine: events, request records, and terminal summary.
+pub(crate) const TARGET_TRANSFER_UPLOAD: &str = "aws_s3_transfer::transfer::upload";
+
+/// Download state machine: events, request records, and terminal summary.
+pub(crate) const TARGET_TRANSFER_DOWNLOAD: &str = "aws_s3_transfer::transfer::download";
+
+/// `upload_objects` parent: events and terminal summary.
+pub(crate) const TARGET_TRANSFER_UPLOAD_OBJECTS: &str = "aws_s3_transfer::transfer::upload_objects";
+
+/// `download_objects` parent: events and terminal summary.
+pub(crate) const TARGET_TRANSFER_DOWNLOAD_OBJECTS: &str =
+    "aws_s3_transfer::transfer::download_objects";
+
+/// Observability surface for transfer operations.
+///
+/// Groups latency tracking and throughput counters. Transfers record
+/// directly; the adaptive concurrency controller reads aggregated views.
+pub(crate) struct Telemetry {
+    /// Latency tracking for inbound data plane (download range receives); drives
+    /// the download time-to-first-byte deadline. There is no send-side tracker:
+    /// the upload path carries no adaptive latency deadline.
+    pub(crate) recv_latencies: LatencyTracker,
+    /// Throughput counters (network tx/rx, disk read/write).
+    pub(crate) io_counters: Arc<IOCounters>,
+}
+
+impl Telemetry {
+    /// Create telemetry with the given window duration for throughput counters.
+    pub(crate) fn new(counter_window: Duration) -> Self {
+        Self {
+            recv_latencies: LatencyTracker::new(),
+            io_counters: Arc::new(IOCounters::new(counter_window)),
+        }
+    }
+}
+
+impl std::fmt::Debug for Telemetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Telemetry")
+            .field("recv_latencies", &self.recv_latencies)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        TARGET_TRANSFER, TARGET_TRANSFER_DOWNLOAD, TARGET_TRANSFER_DOWNLOAD_OBJECTS,
+        TARGET_TRANSFER_UPLOAD, TARGET_TRANSFER_UPLOAD_OBJECTS,
+    };
+    use tracing::Level;
+    use tracing_subscriber::EnvFilter;
+
+    // Runs `check` with a subscriber filtered by `directives`.
+    fn with_filter(directives: &str, check: impl FnOnce()) {
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(directives))
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, check);
+    }
+
+    #[test]
+    fn transfer_directive_enables_every_operation() {
+        with_filter("aws_s3_transfer::transfer=debug", || {
+            assert!(tracing::enabled!(target: TARGET_TRANSFER, Level::DEBUG));
+            assert!(tracing::enabled!(target: TARGET_TRANSFER_UPLOAD, Level::DEBUG));
+            assert!(tracing::enabled!(target: TARGET_TRANSFER_DOWNLOAD, Level::DEBUG));
+            assert!(tracing::enabled!(
+                target: TARGET_TRANSFER_UPLOAD_OBJECTS,
+                Level::DEBUG
+            ));
+            assert!(tracing::enabled!(
+                target: TARGET_TRANSFER_DOWNLOAD_OBJECTS,
+                Level::DEBUG
+            ));
+            assert!(!tracing::enabled!(target: TARGET_TRANSFER_UPLOAD, Level::TRACE));
+        });
+    }
+
+    #[test]
+    fn operation_directive_matches_targets_it_prefixes() {
+        with_filter("aws_s3_transfer::transfer::download=debug", || {
+            assert!(tracing::enabled!(target: TARGET_TRANSFER_DOWNLOAD, Level::DEBUG));
+            assert!(!tracing::enabled!(target: TARGET_TRANSFER_UPLOAD, Level::DEBUG));
+            assert!(!tracing::enabled!(
+                target: TARGET_TRANSFER_UPLOAD_OBJECTS,
+                Level::DEBUG
+            ));
+            assert!(!tracing::enabled!(target: TARGET_TRANSFER, Level::DEBUG));
+            // `transfer::download` is a prefix of `transfer::download_objects`.
+            assert!(tracing::enabled!(
+                target: TARGET_TRANSFER_DOWNLOAD_OBJECTS,
+                Level::DEBUG
+            ));
+        });
+    }
+
+    #[test]
+    fn child_directive_overrides_parent_directive() {
+        with_filter(
+            "aws_s3_transfer::transfer=warn,aws_s3_transfer::transfer::upload=debug",
+            || {
+                assert!(tracing::enabled!(target: TARGET_TRANSFER_UPLOAD, Level::DEBUG));
+                assert!(!tracing::enabled!(target: TARGET_TRANSFER_DOWNLOAD, Level::DEBUG));
+                assert!(tracing::enabled!(target: TARGET_TRANSFER_DOWNLOAD, Level::WARN));
+            },
+        );
+    }
+
+    #[test]
+    fn one_operation_at_a_different_level() {
+        with_filter(
+            "aws_s3_transfer::transfer=debug,aws_s3_transfer::transfer::upload_objects=trace",
+            || {
+                assert!(tracing::enabled!(
+                    target: TARGET_TRANSFER_UPLOAD_OBJECTS,
+                    Level::TRACE
+                ));
+                assert!(!tracing::enabled!(target: TARGET_TRANSFER_UPLOAD, Level::TRACE));
+                assert!(tracing::enabled!(target: TARGET_TRANSFER_UPLOAD, Level::DEBUG));
+            },
+        );
+    }
+
+    #[test]
+    fn longer_directive_sets_composite_parent_level() {
+        with_filter(
+            "aws_s3_transfer::transfer::upload=debug,aws_s3_transfer::transfer::upload_objects=warn",
+            || {
+                assert!(tracing::enabled!(target: TARGET_TRANSFER_UPLOAD, Level::DEBUG));
+                assert!(!tracing::enabled!(
+                    target: TARGET_TRANSFER_UPLOAD_OBJECTS,
+                    Level::DEBUG
+                ));
+                assert!(tracing::enabled!(
+                    target: TARGET_TRANSFER_UPLOAD_OBJECTS,
+                    Level::WARN
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn quieting_children_keeps_parent_only_when_parent_is_named() {
+        let quiet_children =
+            "aws_s3_transfer::transfer=debug,aws_s3_transfer::transfer::upload=info";
+        with_filter(quiet_children, || {
+            assert!(!tracing::enabled!(target: TARGET_TRANSFER_UPLOAD, Level::DEBUG));
+            assert!(!tracing::enabled!(
+                target: TARGET_TRANSFER_UPLOAD_OBJECTS,
+                Level::DEBUG
+            ));
+        });
+        with_filter(
+            &format!("{quiet_children},aws_s3_transfer::transfer::upload_objects=debug"),
+            || {
+                assert!(!tracing::enabled!(target: TARGET_TRANSFER_UPLOAD, Level::DEBUG));
+                assert!(tracing::enabled!(
+                    target: TARGET_TRANSFER_UPLOAD_OBJECTS,
+                    Level::DEBUG
+                ));
+            },
+        );
+    }
+}

@@ -12,6 +12,11 @@ concurrency:
 env:
   RUSTFLAGS: -Dwarnings
   RUST_BACKTRACE: 1
+  # Retry crates.io downloads more than cargo's default 3 times, and use
+  # HTTP/1.1: jobs have failed fetching the index with curl's "[16] Error in
+  # the HTTP2 framing layer".
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_MULTIPLEXING: false
   # FIXME: Remove nightly `-Adeprecated` overrides when MSRV reaches 1.95 and
   # Atomic*::fetch_update can be replaced by try_update.
   # Change to specific Rust release to pin
@@ -172,9 +177,9 @@ jobs:
         run: just install-model --check --pinned-only
       - name: Test installed values with Transfer Manager runtime types
         run: |
-          cargo test --locked -p aws-sdk-s3-transfer-manager \
+          cargo test --locked -p aws-s3-transfer \
             --lib --test model_api_test
-          cargo test --locked -p aws-sdk-s3-transfer-manager \
+          cargo test --locked -p aws-s3-transfer \
             --lib --test model_api_test --test sdk_v1_compat_test --features sdk-v1
 
  # Basic actions that must pass before we kick off more expensive tests.
@@ -264,12 +269,13 @@ jobs:
         run: |
           nextest_args=()
           if [[ "$RUNNER_OS" == "macOS" ]]; then
-            # Several integration tests each create a local server and a
-            # concurrent transfer. Running those test processes in parallel can
-            # exhaust macOS socket buffers without increasing product coverage.
-            nextest_args+=(--test-threads 1)
+            # The `extended` integrity tier crosses object shapes with every
+            # algorithm; Linux runs it, as the E2E jobs do. The `ci` profile
+            # in .config/nextest.toml limits how many mock-server tests run
+            # at once on macOS.
+            nextest_args+=(-E 'not test(::extended::)')
           fi
-          cargo nextest run --locked --workspace --all-features --no-fail-fast "${nextest_args[@]}"
+          cargo nextest run --profile ci --locked --workspace --all-features --no-fail-fast "${nextest_args[@]}"
           cargo test --locked --doc --workspace --all-features --no-fail-fast
 
   linux-i686:
@@ -301,11 +307,11 @@ jobs:
           key: i686-unknown-linux-gnu
       - name: Clippy (library and tests)
         run: |
-          cargo clippy --locked -p aws-sdk-s3-transfer-manager --all-targets --no-deps
+          cargo clippy --locked -p aws-s3-transfer --all-targets --no-deps
       - name: Transfer-manager unit and integration tests
         run: |
-          cargo test --locked -p aws-sdk-s3-transfer-manager --lib
-          cargo test --locked -p aws-sdk-s3-transfer-manager --tests
+          cargo test --locked -p aws-s3-transfer --lib
+          cargo test --locked -p aws-s3-transfer --tests
       - name: Mock-server integration tests
         run: |
           cargo test --locked -p integration-tests
@@ -342,12 +348,18 @@ jobs:
       - name: Run real-S3 tests
         run: |
           RUSTFLAGS="-Dwarnings --cfg e2e_test" cargo test --locked --test e2e_transfer_test
-          integration_test_args=()
+          integration_test_args=(--)
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             # Mock integration tests start local servers and concurrent
-            # transfers. Serial execution avoids exhausting macOS socket
-            # buffers while preserving each test's internal concurrency.
-            integration_test_args+=(-- --test-threads 1)
+            # transfers. Running at most two at a time avoids exhausting macOS
+            # socket buffers, as the mock-server test group does for nextest.
+            integration_test_args+=(--test-threads 2)
+          fi
+          if [[ "$RUNNER_OS" != "Linux" ]]; then
+            # Integrity cases in the `extended` tier cross object shapes
+            # with algorithms, which is the same logic on every platform.
+            # Linux runs them; the other platforms run the rest.
+            integration_test_args+=(--skip ::extended::)
           fi
           RUSTFLAGS="-Dwarnings --cfg e2e_test" \
             cargo test --locked -p integration-tests "${integration_test_args[@]}"
@@ -374,6 +386,8 @@ jobs:
             --workdir /workspace \
             --env RUSTFLAGS \
             --env RUST_BACKTRACE \
+            --env CARGO_NET_RETRY \
+            --env CARGO_HTTP_MULTIPLEXING \
             --env CARGO_HOME=/tmp/cargo \
             --env CARGO_TARGET_DIR=/tmp/target \
             "rust:${rust_min}-alpine" \
@@ -505,13 +519,13 @@ jobs:
           key: ${{ matrix.target }}
       - name: Clippy
         run: |
-          cargo clippy --locked -p aws-sdk-s3-transfer-manager -p wasm32-wasi-tests \
+          cargo clippy --locked -p aws-s3-transfer -p wasm32-wasi-tests \
             --target ${{ matrix.target }} --no-deps
-          cargo clippy --locked -p aws-sdk-s3-transfer-manager --features sdk-v1 \
+          cargo clippy --locked -p aws-s3-transfer --features sdk-v1 \
             --target ${{ matrix.target }} --no-deps
       - name: Docs
         run: |
-          cargo doc --locked -p aws-sdk-s3-transfer-manager --target ${{ matrix.target }} \
+          cargo doc --locked -p aws-s3-transfer --target ${{ matrix.target }} \
             --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: -Dwarnings
@@ -584,9 +598,9 @@ jobs:
           key: wasm32-unknown-unknown
       - name: Clippy
         run: |
-          cargo clippy --locked -p aws-sdk-s3-transfer-manager \
+          cargo clippy --locked -p aws-s3-transfer \
             --target wasm32-unknown-unknown --no-deps -- -D warnings
-          cargo clippy --locked -p aws-sdk-s3-transfer-manager --features sdk-v1 \
+          cargo clippy --locked -p aws-s3-transfer --features sdk-v1 \
             --target wasm32-unknown-unknown --no-deps -- -D warnings
 
   fmt:
@@ -694,7 +708,7 @@ jobs:
       - name: Resolve aws-sdk-s3 to the declared minimum
         run: |
           floor=$(cargo metadata --format-version 1 --no-deps | jq -er '
-            [.packages[] | select(.name == "aws-sdk-s3-transfer-manager")
+            [.packages[] | select(.name == "aws-s3-transfer")
               | .dependencies[] | select(.name == "aws-sdk-s3" and .kind == null) | .req]
             | unique
             | if length == 1 then .[0] | ltrimstr("^")
@@ -706,7 +720,7 @@ jobs:
       # tests read. A filter that matches no test exits 0, so require a pass.
       - name: checksum verdict tests
         run: |
-          out=$(cargo test -p aws-sdk-s3-transfer-manager --all-features --test download_test \
+          out=$(cargo test -p aws-s3-transfer --all-features --test download_test \
             -- test_integrity_checks 2>&1) || { echo "$out"; exit 1; }
           echo "$out"
           if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
@@ -736,7 +750,7 @@ jobs:
             set -eux
             . "$HOME/.cargo/env"
             export CMAKE_GENERATOR=Ninja
-            cargo test --locked -p aws-sdk-s3-transfer-manager --lib
+            cargo test --locked -p aws-s3-transfer --lib
 
   check-external-types:
     name: check-external-types (${{ matrix.os }})
@@ -790,30 +804,40 @@ jobs:
         run: cargo deny --all-features --config .cargo-deny-config.toml check --hide-inclusion-graph licenses bans sources
 
   sanitizers:
-    name: sanitizers (${{ matrix.sanitizer }})
+    name: sanitizers (${{ matrix.name }})
     needs: basics
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
+        # nextest runs each test in its own process, so a sanitizer report,
+        # which LeakSanitizer and ThreadSanitizer write when the process
+        # exits, belongs to the one test that produced it, and tests run in
+        # parallel. The `sanitizer` profile in .config/nextest.toml fails a
+        # test that runs past its timeout.
         include:
           # ASAN: leak detection + use-after-free + heap/stack buffer overflow.
           # The dedicated target instruments the standard library as well as
           # this workspace. Frame pointers improve native stack unwinding; they
           # do not change which accesses ASan diagnoses.
-          # `--test-threads 1` keeps leak attribution readable when something
-          # panics mid-test and leaves Arc cycles behind.
-          - sanitizer: address
+          - name: address
+            sanitizer: address
             target: x86_64-unknown-linux-gnuasan
             cfg: s3_tm_asan
-            test_args: --test-threads 1 --nocapture
           # TSan uses the pre-instrumented standard-library target so happens-
-          # before edges inside std synchronization remain visible.
-          - sanitizer: thread
+          # before edges inside std synchronization remain visible. Its tests
+          # are split across two jobs to fit the time limit.
+          - name: thread 1/2
+            sanitizer: thread
             target: x86_64-unknown-linux-gnutsan
             cfg: s3_tm_tsan
-            test_args: --test-threads 1 --nocapture
+            nextest_args: --partition slice:1/2
+          - name: thread 2/2
+            sanitizer: thread
+            target: x86_64-unknown-linux-gnutsan
+            cfg: s3_tm_tsan
+            nextest_args: --partition slice:2/2
     steps:
       - uses: actions/checkout@v4
       - name: Install llvm
@@ -824,9 +848,13 @@ jobs:
         with:
           toolchain: ${{ env.rust_nightly }}
           targets: ${{ matrix.target }}
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - uses: Swatinem/rust-cache@v2
       - name: ${{ matrix.sanitizer }}
-        run: cargo test --workspace --features sdk-v1 --target ${{ matrix.target }} --tests -- ${{ matrix.test_args }}
+        run: cargo nextest run --profile sanitizer --workspace --features sdk-v1 --target ${{ matrix.target }} --no-fail-fast ${{ matrix.nextest_args }}
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated -C force-frame-pointers=yes --cfg ${{ matrix.cfg }}
           # Detect leaked ownership and stack lifetime errors, stop at the
@@ -874,7 +902,7 @@ jobs:
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated --cfg s3_tm_fuzz
       - name: Run optimized model and corpus replay
-        run: cargo nextest run --release -p aws-sdk-s3-transfer-manager --lib
+        run: cargo nextest run --release -p aws-s3-transfer --lib
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated
       - name: Build native fuzz targets
@@ -909,14 +937,15 @@ jobs:
       RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
     steps:
       - uses: actions/checkout@v4
+      # The baseline is the highest published release of `aws-s3-transfer` that is
+      # not above the manifest version.
       - name: Check semver
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
-          manifest-path: aws-sdk-s3-transfer-manager/Cargo.toml
-          package: aws-sdk-s3-transfer-manager
+          manifest-path: crates/aws-s3-transfer/Cargo.toml
+          package: aws-s3-transfer
           feature-group: all-features
           rust-toolchain: ${{ env.rust_min }}
-          baseline-version: '0.3.0'
 
   features:
     name: features
@@ -940,11 +969,11 @@ jobs:
         run: python3 tools/check-tm-consumers.py
       - name: Test ordinary and unstable managed configuration
         run: |
-          cargo test --locked -p aws-sdk-s3-transfer-manager --no-default-features \
+          cargo test --locked -p aws-s3-transfer --no-default-features \
             --lib client::tests -- --test-threads 1
-          cargo test --locked -p aws-sdk-s3-transfer-manager --no-default-features \
+          cargo test --locked -p aws-s3-transfer --no-default-features \
             --features __unstable_ext --lib client::tests -- --test-threads 1
-          cargo test --locked -p aws-sdk-s3-transfer-manager --no-default-features \
+          cargo test --locked -p aws-s3-transfer --no-default-features \
             --features __unstable_ext --lib config::runtime -- --test-threads 1
         env:
           RUSTFLAGS: -Dwarnings -Adeprecated
@@ -970,7 +999,7 @@ jobs:
           toolchain: ${{ env.rust_stable }}
       - uses: Swatinem/rust-cache@v2
       - name: build cp example with dial9
-        run: cargo build -p aws-sdk-s3-transfer-manager --example cp --all-features
+        run: cargo build -p aws-s3-transfer --example cp --all-features
         env:
           RUSTFLAGS: "-Dwarnings --cfg tokio_unstable --cfg s3_tm_dial9"
 
@@ -996,7 +1025,7 @@ jobs:
       # integer-to-pointer casts incompatible with strict provenance).
       - name: miri
         run: |
-          cargo miri test -p aws-sdk-s3-transfer-manager --lib
+          cargo miri test -p aws-s3-transfer --lib
         env:
           MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-recursive-validation
           RUSTFLAGS: -Dwarnings -Adeprecated
@@ -1016,12 +1045,12 @@ jobs:
       - name: loom
         run: |
           test_list=$(RUSTFLAGS='-Dwarnings --cfg s3_tm_loom' \
-            cargo test -p aws-sdk-s3-transfer-manager --lib --release -- --list)
+            cargo test -p aws-s3-transfer --lib --release -- --list)
           if ! grep -q 'loom_tests::.*: test' <<<"$test_list"; then
             echo "no Loom tests were registered" >&2
             exit 1
           fi
-          RUSTFLAGS='-Dwarnings --cfg s3_tm_loom' cargo test -p aws-sdk-s3-transfer-manager \
+          RUSTFLAGS='-Dwarnings --cfg s3_tm_loom' cargo test -p aws-s3-transfer \
             --lib --release -- loom_tests --nocapture
         env:
           # Three preemption points catches three-way interleaving bugs that

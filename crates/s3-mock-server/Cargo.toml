@@ -1,0 +1,42 @@
+[package]
+name = "s3-mock-server"
+version = "0.1.0"
+edition = "2021"
+authors = ["AWS Rust SDK Team <aws-sdk-rust@amazon.com>"]
+license = "Apache-2.0"
+publish = false
+description = "A mock S3 server for testing and benchmarking Transfer Manager for Amazon S3."
+
+[dependencies]
+async-trait = "0.1.83"
+aws-config = { workspace = true, features = ["default"] }
+aws-sdk-s3 = { workspace = true, features = ["default-https-client", "rt-tokio", "sigv4a"] }
+aws-smithy-checksums = { workspace = true }
+base64 = "0.22.1"
+bytes = "1"
+futures = "0.3.31"
+futures-util = "0.3.31"
+hex = "0.4.3"
+http = "1.4.0"
+hyper = "1"
+hyper-util = {  version = "0.1.13", features = ["server-graceful", "server-auto", "server", "http1", "http2", "tokio"]}
+md5 = "0.7.0"
+percent-encoding = "2.3.2"
+pin-project = "1.1.10"
+s3s = "0.17.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.12.0"
+thiserror = "2"
+tokio = { version = "1.45.0", features = ["full"] }
+tokio-util = { version = "0.7.15", features = ["io"] }
+tracing = "0.1"
+uuid = { version = "1.7.0", features = ["v4"] }
+
+[dev-dependencies]
+aws-credential-types = { workspace = true }
+aws-sigv4 = "1.5.1"
+crc-fast = "1.9.0"
+sha1 = "0.10.6"
+sha2 = "0.10.8"
+base64 = "0.22.1"

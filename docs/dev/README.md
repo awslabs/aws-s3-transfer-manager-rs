@@ -1,6 +1,7 @@
 # Maintainer documentation
 
 - [architecture.md](architecture.md): the crate map, module boundaries, and conventions for layout, placement, and test support.
+- [development.md](development.md): model tooling, tests, the `cp` example, runtime diagnostics, profiling, and end-to-end tests.
 - [standards.md](standards.md): standards for documentation, comments, tests, and evidence.
 - [pull-requests.md](pull-requests.md): pull request descriptions.
 - [tmdev.md](tmdev.md): standalone developer tool, lockfile, and validation.

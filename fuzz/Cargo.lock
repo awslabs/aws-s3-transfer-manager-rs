@@ -139,10 +139,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-s3-transfer"
+version = "1.0.0"
+dependencies = [
+ "arc-swap",
+ "aws-config",
+ "aws-runtime",
+ "aws-sdk-s3",
+ "aws-smithy-checksums",
+ "aws-smithy-dns",
+ "aws-smithy-execution",
+ "aws-smithy-http-client",
+ "aws-smithy-managed-http",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "bytes-utils",
+ "crossbeam-skiplist",
+ "crossbeam-utils",
+ "fastrand",
+ "futures-util",
+ "http-body",
+ "libc",
+ "nix",
+ "parking_lot",
+ "path-clean",
+ "pin-project-lite",
+ "rustix",
+ "same-file",
+ "smallvec",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "aws-s3-transfer-manager-fuzz"
 version = "0.0.0"
 dependencies = [
- "aws-sdk-s3-transfer-manager",
+ "aws-s3-transfer",
  "libfuzzer-sys",
 ]
 
@@ -180,44 +219,6 @@ dependencies = [
  "sha2",
  "tracing",
  "url",
-]
-
-[[package]]
-name = "aws-sdk-s3-transfer-manager"
-version = "0.4.0"
-dependencies = [
- "arc-swap",
- "aws-config",
- "aws-runtime",
- "aws-sdk-s3",
- "aws-smithy-dns",
- "aws-smithy-execution",
- "aws-smithy-http-client",
- "aws-smithy-managed-http",
- "aws-smithy-observability",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
- "bytes",
- "bytes-utils",
- "crossbeam-skiplist",
- "crossbeam-utils",
- "fastrand",
- "futures-util",
- "http-body",
- "libc",
- "nix",
- "parking_lot",
- "path-clean",
- "pin-project-lite",
- "rustix",
- "same-file",
- "smallvec",
- "tokio",
- "tokio-util",
- "tracing",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -377,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-execution"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aws-smithy-topology",
  "tokio",
@@ -441,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-managed-http"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aws-smithy-execution",
  "aws-smithy-http-client",
@@ -538,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-topology"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "many_cpus",
 ]

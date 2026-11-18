@@ -8,7 +8,7 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
-aws-sdk-s3-transfer-manager = { path = "../aws-sdk-s3-transfer-manager" }
+aws-s3-transfer = { path = "../crates/aws-s3-transfer" }
 libfuzzer-sys = "0.4"
 
 [[bin]]

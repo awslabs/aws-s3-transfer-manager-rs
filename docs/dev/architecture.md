@@ -1,6 +1,6 @@
 # Architecture
 
-This document maps the `aws-sdk-s3-transfer-manager` crate and states the boundaries and conventions that hold across its modules. Each module's documentation covers that module's internals. The [design documents](../design/README.md) cover each subsystem's requirements and invariants. Paths are relative to `aws-sdk-s3-transfer-manager/src/`.
+This document maps the `aws-s3-transfer` crate and states the boundaries and conventions that hold across its modules. Each module's documentation covers that module's internals. The [design documents](../design/README.md) cover each subsystem's requirements and invariants. Paths are relative to `crates/aws-s3-transfer/src/`.
 
 ## Codemap
 
@@ -29,7 +29,7 @@ managed execution. Transport configuration remains on the native pool builder;
 the wrapper retains execution handles and native clients without owning runtime
 shutdown. It supplies Smithy's HTTP client interface independently of TM.
 
-`crates/aws-sdk-s3-transfer-manager-ext/` transfers an execution runtime owner into
+`crates/aws-s3-transfer-ext/` transfers an execution runtime owner into
 opaque TM configuration through the non-default `__unstable_ext` hook. Its
 version constraints define the supported TM and execution pairing. HTTP pool
 composition belongs to managed HTTP independently of this extension.

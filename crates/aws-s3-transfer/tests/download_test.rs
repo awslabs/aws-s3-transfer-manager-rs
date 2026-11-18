@@ -1,0 +1,1879 @@
+/*
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+mod common;
+#[path = "download_test/test_util/mod.rs"]
+mod test_util;
+
+#[cfg(unix)]
+use test_util::retention::await_shutdown;
+#[cfg(any(unix, windows))]
+use test_util::retention::{
+    assert_download_releases_destination, drop_and_await_shutdown, Destination, Ending,
+    OpenFileProbe,
+};
+use test_util::{
+    get_first_object_connector_with_checksum_headers, head_event, object_connector,
+    object_connector_with_checksum_headers,
+    object_connector_with_object_and_range_checksum_headers,
+};
+
+use aws_s3_transfer::config::RuntimeConfig;
+use aws_s3_transfer::types::ByteSize;
+use aws_s3_transfer::{
+    error::{BoxError, ErrorKind},
+    types::{
+        ChecksumAlgorithm, ChecksumMode, ChecksumValidation, IntegrityChecks, NotValidatedReason,
+        TransferStatus,
+    },
+};
+use aws_smithy_runtime_api::client::http::{
+    http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector,
+};
+use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
+use aws_smithy_runtime_api::client::result::ConnectorError;
+use aws_smithy_runtime_api::http::StatusCode;
+use pin_project_lite::pin_project;
+use std::{
+    cmp,
+    iter::{self, repeat_with},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    task::Poll,
+    time::Duration,
+};
+use tokio::sync::Semaphore;
+
+use aws_s3_transfer::config::{ConcurrencyMode, PartSize};
+use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
+use aws_smithy_types::body::SdkBody;
+use bytes::Bytes;
+use test_common::drain;
+
+// Replay fixtures use HEAD-first discovery for validated whole-object downloads.
+// Caller ranges and validation-off downloads use their respective discovery paths.
+
+fn rand_data(size: usize) -> Bytes {
+    iter::repeat_with(fastrand::alphanumeric)
+        .take(size)
+        .map(|x| x as u8)
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// create a dummy placeholder request for StaticReplayClient. This is used when we don't
+/// want to use `assert_requests()` and make our own assertions about the actually captured
+/// requests. Useful when you don't want to mock up the entire http request that is expected.
+fn dummy_expected_request() -> http::Request<SdkBody> {
+    http::Request::builder()
+        .uri("https://not-used")
+        .body(SdkBody::from(&b""[..]))
+        .unwrap()
+}
+
+fn simple_test_tm(data: &Bytes, part_size: usize) -> (aws_s3_transfer::Client, StaticReplayClient) {
+    let http_client = object_connector(data, part_size);
+    let tm = test_tm(http_client.clone(), part_size);
+    (tm, http_client)
+}
+
+fn test_tm(http_client: StaticReplayClient, part_size: usize) -> aws_s3_transfer::Client {
+    let config = aws_s3_transfer::Config::builder()
+        .s3_config(common::s3_config(http_client))
+        .part_size(PartSize::Target(ByteSize::new(part_size as u64)))
+        .concurrency(ConcurrencyMode::Explicit(1))
+        .build()
+        .expect("valid config");
+
+    aws_s3_transfer::Client::new(config)
+}
+
+/// Test the object ranges are expected and we get all the data
+#[tokio::test]
+async fn test_download_ranges() {
+    let data = rand_data(ByteSize::mib(12).as_usize());
+    let part_size = ByteSize::mib(5).as_usize();
+
+    let (tm, http_client) = simple_test_tm(&data, part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+
+    let body = drain(&mut handle).await.unwrap();
+
+    assert_eq!(data.len(), body.len());
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert_eq!(4, requests.len());
+    assert_eq!(requests[0].method(), "HEAD");
+
+    assert_eq!(requests[1].headers().get("Range"), Some("bytes=0-5242879"));
+    assert_eq!(
+        requests[2].headers().get("Range"),
+        Some("bytes=5242880-10485759")
+    );
+    assert_eq!(
+        requests[3].headers().get("Range"),
+        Some("bytes=10485760-12582911")
+    );
+}
+
+/// Test body not consumed which should not prevent the handle from being dropped
+#[tokio::test]
+async fn test_body_not_consumed() {
+    let data = rand_data(ByteSize::mib(12).as_usize());
+    let part_size = ByteSize::mib(5).as_usize();
+
+    let (tm, _) = simple_test_tm(&data, part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+
+    let _ = handle.body_mut().next().await;
+}
+
+/// Connector answering the discovery GET with S3's `NoSuchKey` error, so
+/// discovery fails immediately.
+fn no_such_key_connector() -> StaticReplayClient {
+    StaticReplayClient::new(vec![ReplayEvent::new(
+        dummy_expected_request(),
+        http::Response::builder()
+            .status(404)
+            .header("Content-Type", "application/xml")
+            .body(SdkBody::from(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>test-object</Key><RequestId>test-request-id</RequestId></Error>"#,
+            ))
+            .unwrap(),
+    )])
+}
+
+/// `object_meta()` called after discovery has already failed must return
+/// `ObjectNotDiscoverable` rather than wait for a discovery notification that
+/// was delivered before the caller started waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_object_meta_after_discovery_failure() {
+    let part_size = ByteSize::mib(5).as_usize();
+    let http_client = no_such_key_connector();
+    let tm = test_tm(http_client.clone(), part_size);
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+
+    // Force the ordering where discovery fails before `object_meta()` is called.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while handle.status() != TransferStatus::Failed {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("discovery did not fail on NoSuchKey");
+
+    let kind = tokio::time::timeout(Duration::from_secs(1), handle.object_meta())
+        .await
+        .expect("object_meta() did not return after discovery failed")
+        .expect_err("object_meta() must fail when discovery failed")
+        .kind()
+        .clone();
+    assert_eq!(ErrorKind::ObjectNotDiscoverable, kind);
+
+    tokio::time::timeout(Duration::from_secs(1), handle.abort())
+        .await
+        .expect("abort hung after discovery failed");
+
+    assert_eq!(1, http_client.actual_requests().count());
+}
+
+/// Connector modelling a ranged-GET object store for an object of `total`
+/// bytes.
+///
+/// HEAD reports the object's metadata. The first GET to arrive, whichever range
+/// it requests, is answered with that range, its body taken from `first_range`.
+/// Every later GET stays in flight until its future is dropped; each one adds a
+/// permit to `parked_started` when it begins.
+#[derive(Debug)]
+struct ParkAfterFirstGetConnector {
+    total: usize,
+    /// Bytes for the first GET's body, at least one part long, built before the
+    /// download so `call()` does no work.
+    first_range: Bytes,
+    requests: Arc<AtomicUsize>,
+    parked_started: Arc<Semaphore>,
+}
+
+impl ParkAfterFirstGetConnector {
+    fn first_range_response(&self, request: &HttpRequest) -> HttpResponse {
+        let total = self.total;
+        let range = request
+            .headers()
+            .get("Range")
+            .expect("range GET must be ranged");
+        let (start, end) = range
+            .strip_prefix("bytes=")
+            .and_then(|r| r.split_once('-'))
+            .map(|(s, e)| (s.parse::<usize>().unwrap(), e.parse::<usize>().unwrap()))
+            .unwrap_or_else(|| panic!("unexpected Range header: {range}"));
+        let end = cmp::min(end, total - 1);
+        let len = end - start + 1;
+        // With two requests in flight, either of the first two ranges can arrive first.
+        assert!(
+            len <= self.first_range.len(),
+            "range longer than a part: {range}"
+        );
+
+        let mut response = HttpResponse::new(
+            StatusCode::try_from(206).unwrap(),
+            SdkBody::from(self.first_range.slice(..len)),
+        );
+        let headers = response.headers_mut();
+        headers.insert("Content-Length", len.to_string());
+        headers.insert("Content-Range", format!("bytes {start}-{end}/{total}"));
+        headers.insert("ETag", "my-etag");
+        response
+    }
+}
+
+impl HttpConnector for ParkAfterFirstGetConnector {
+    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+        if request.method() == "HEAD" {
+            let mut response =
+                HttpResponse::new(StatusCode::try_from(200).unwrap(), SdkBody::empty());
+            response
+                .headers_mut()
+                .insert("Content-Length", self.total.to_string());
+            response.headers_mut().insert("ETag", "my-etag");
+            return HttpConnectorFuture::ready(Ok(response));
+        }
+        assert_eq!("GET", request.method());
+        let seq = self.requests.fetch_add(1, Ordering::SeqCst);
+        if seq == 0 {
+            let response = self.first_range_response(&request);
+            return HttpConnectorFuture::ready(Ok(response));
+        }
+
+        let parked_started = self.parked_started.clone();
+        HttpConnectorFuture::new(async move {
+            parked_started.add_permits(1);
+            std::future::pending::<Result<HttpResponse, ConnectorError>>().await
+        })
+    }
+}
+
+/// `abort()` must return once ranged GETs following the first are executing,
+/// without waiting for those requests to complete on their own.
+///
+/// The body is never consumed.
+async fn abort_download_with_executing_gets(runtime_config: RuntimeConfig) {
+    let total = ByteSize::mib(25).as_usize();
+    let part_size = ByteSize::mib(5).as_usize();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let parked_started = Arc::new(Semaphore::new(0));
+    let connector = SharedHttpConnector::new(ParkAfterFirstGetConnector {
+        total,
+        // The body is never read, so its contents don't matter.
+        first_range: Bytes::from(vec![b'x'; part_size]),
+        requests: requests.clone(),
+        parked_started: parked_started.clone(),
+    });
+    let config = aws_s3_transfer::Config::builder()
+        .s3_config(common::s3_config(http_client_fn(move |_, _| {
+            connector.clone()
+        })))
+        .part_size(PartSize::Target(ByteSize::new(part_size as u64)))
+        .concurrency(ConcurrencyMode::Explicit(2))
+        .runtime_config(runtime_config)
+        .build()
+        .expect("valid config");
+    let tm = aws_s3_transfer::Client::new(config);
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), parked_started.acquire())
+        .await
+        .expect("no GET after the first started")
+        .expect("start semaphore closed")
+        .forget();
+
+    // The first range GET can still be collecting its body alongside the parked
+    // one, and the managed runtime's abort() waits for it. Under the thread
+    // sanitizer that collection alone can take more than a second.
+    let abort_limit = Duration::from_secs(if cfg!(s3_tm_tsan) { 10 } else { 1 });
+    tokio::time::timeout(abort_limit, handle.abort())
+        .await
+        .expect("abort hung while a ranged GET was executing");
+
+    let requests = requests.load(Ordering::SeqCst);
+    assert!(
+        requests < total / part_size,
+        "expected fewer requests than parts, got {requests}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_abort_download_on_tokio_runtime() {
+    abort_download_with_executing_gets(RuntimeConfig::multi_thread_tokio()).await;
+}
+
+#[tokio::test]
+async fn test_abort_download_on_managed_runtime() {
+    abort_download_with_executing_gets(RuntimeConfig::default()).await;
+}
+
+pin_project! {
+    #[derive(Debug)]
+    struct FailingBody {
+        data: Bytes,
+        fail_after_byte: usize,
+        frame_size: usize,
+        idx: usize,
+    }
+}
+
+impl FailingBody {
+    fn new(data: Bytes, fail_after: usize, frame_size: usize) -> Self {
+        Self {
+            data,
+            fail_after_byte: fail_after,
+            frame_size,
+            idx: 0,
+        }
+    }
+}
+
+impl http_body_1x::Body for FailingBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body_1x::Frame<Self::Data>, Self::Error>>> {
+        let this = self.project();
+        let result = if this.idx >= this.fail_after_byte {
+            // fail forevermore
+            Err(BoxError::from("simulated body read failure"))
+        } else {
+            let end = cmp::min(*this.fail_after_byte, *this.idx + *this.frame_size - 1);
+            let data = this.data.slice(*this.idx..end);
+            *this.idx = end + 1;
+            let frame = http_body_1x::Frame::data(data);
+            Ok(frame)
+        };
+
+        Poll::Ready(Some(result))
+    }
+}
+
+/// Test chunk/part failure is retried
+#[tokio::test]
+async fn test_retry_failed_chunk() {
+    let data = rand_data(ByteSize::mib(12).as_usize());
+    let part_size = ByteSize::mib(8).as_usize();
+    let frame_size = ByteSize::kib(16).as_usize();
+    let fail_after_byte = frame_size * 4;
+
+    let http_client = StaticReplayClient::new(vec![
+        head_event(data.len(), None),
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http::Response::builder()
+                .status(200)
+                .header("Content-Length", format!("{}", part_size))
+                .header(
+                    "Content-Range",
+                    format!("bytes 0-{}/{}", part_size - 1, data.len()),
+                )
+                .body(SdkBody::from(data.slice(0..part_size)))
+                .unwrap(),
+        ),
+        // fail the second chunk after reading some of it
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http::Response::builder()
+                .status(200)
+                .header("Content-Length", format!("{}", data.len() - part_size))
+                .header(
+                    "Content-Range",
+                    format!("bytes {}-{}/{}", part_size, data.len() - 1, data.len()),
+                )
+                .body(SdkBody::from_body_1_x(FailingBody::new(
+                    data.slice(part_size..),
+                    fail_after_byte,
+                    frame_size,
+                )))
+                .unwrap(),
+        ),
+        // request for second chunk should be retried
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http::Response::builder()
+                .status(200)
+                .header("Content-Length", format!("{}", data.len() - part_size))
+                .header(
+                    "Content-Range",
+                    format!("bytes {}-{}/{}", part_size, data.len() - 1, data.len()),
+                )
+                .body(SdkBody::from(data.slice(part_size..)))
+                .unwrap(),
+        ),
+    ]);
+
+    let tm = test_tm(http_client.clone(), part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+
+    let body = drain(&mut handle).await.unwrap();
+
+    assert_eq!(data.len(), body.len());
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert_eq!(4, requests.len());
+}
+
+const ERROR_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <Error>
+            <Code>ExpiredToken</Code>
+            <Message>The provided token has expired</Message>
+            <RequestId>K2H6N7ZGQT6WHCEG</RequestId>
+            <HostId>WWoZlnK4pTjKCYn6eNV7GgOurabfqLkjbSyqTvDMGBaI9uwzyNhSaDhOCPs8paFGye7S6b/AB3A=</HostId>
+        </Error>
+"#;
+
+/// Test non retryable SdkError
+#[tokio::test]
+async fn test_non_retryable_error() {
+    let data = rand_data(ByteSize::mib(20).as_usize());
+    let part_size = ByteSize::mib(8).as_usize();
+
+    let http_client = StaticReplayClient::new(vec![
+        head_event(data.len(), None),
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http::Response::builder()
+                .status(200)
+                .header("Content-Length", format!("{}", part_size))
+                .header(
+                    "Content-Range",
+                    format!("bytes 0-{}/{}", part_size - 1, data.len()),
+                )
+                .body(SdkBody::from(data.slice(0..part_size)))
+                .unwrap(),
+        ),
+        // fail chunk with non-retryable error
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http::Response::builder()
+                .status(400)
+                .body(SdkBody::from(ERROR_RESPONSE))
+                .unwrap(),
+        ),
+    ]);
+
+    let tm = test_tm(http_client.clone(), part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+
+    let _ = drain(&mut handle).await.unwrap_err();
+
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert_eq!(3, requests.len());
+}
+
+/// Test max attempts exhausted reading a stream
+#[tokio::test]
+async fn test_retry_max_attempts() {
+    let data = rand_data(ByteSize::mib(12).as_usize());
+    let part_size = ByteSize::mib(8).as_usize();
+    let frame_size = 16 * 1024;
+    let fail_after_byte = frame_size * 4;
+
+    let mut failures = repeat_with(|| {
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http::Response::builder()
+                .status(200)
+                .header("Content-Length", format!("{}", part_size))
+                .header(
+                    "Content-Range",
+                    format!("bytes {}-{}/{}", part_size, data.len() - 1, data.len()),
+                )
+                .body(SdkBody::from_body_1_x(FailingBody::new(
+                    data.slice(part_size..),
+                    fail_after_byte,
+                    frame_size,
+                )))
+                .unwrap(),
+        )
+    })
+    .take(3)
+    .collect::<Vec<_>>();
+
+    let mut events = vec![
+        head_event(data.len(), None),
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http::Response::builder()
+                .status(200)
+                .header("Content-Length", format!("{}", part_size))
+                .header(
+                    "Content-Range",
+                    format!("bytes 0-{}/{}", part_size - 1, data.len()),
+                )
+                .body(SdkBody::from(data.slice(0..part_size)))
+                .unwrap(),
+        ),
+    ];
+
+    events.append(&mut failures);
+
+    let http_client = StaticReplayClient::new(events);
+    let tm = test_tm(http_client.clone(), part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+
+    let _ = drain(&mut handle).await.unwrap_err();
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert_eq!(5, requests.len());
+}
+
+/// Test the if_match header was added correctly based on the response from server.
+#[tokio::test]
+async fn test_download_if_match() {
+    let data = rand_data(ByteSize::mib(12).as_usize());
+    let part_size = ByteSize::mib(5).as_usize();
+
+    let (tm, http_client) = simple_test_tm(&data, part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+
+    let _ = drain(&mut handle).await.unwrap();
+
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert_eq!(4, requests.len());
+    assert_eq!(requests[0].method(), "HEAD");
+
+    // The first request is to discover the object meta data and should not have any if-match
+    assert_eq!(requests[0].headers().get("If-Match"), None);
+    // All the following requests should have the if-match header
+    assert_eq!(requests[1].headers().get("If-Match"), Some("my-etag"));
+    assert_eq!(requests[2].headers().get("If-Match"), Some("my-etag"));
+    assert_eq!(requests[3].headers().get("If-Match"), Some("my-etag"));
+}
+
+const OBJECT_MODIFIED_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+    <Error>
+        <Code>PreconditionFailed</Code>
+        <Message>At least one of the pre-conditions you specified did not hold</Message>
+        <Condition>If-Match</Condition>
+    </Error>
+"#;
+
+/// Test that if the object modified during download.
+#[tokio::test]
+async fn test_download_object_modified() {
+    let _logs = show_test_logs();
+    let data = rand_data(ByteSize::mib(12).as_usize());
+    let part_size = ByteSize::mib(5).as_usize();
+
+    // Create a static replay client (http connector) to mock the S3 response when object modified during download.
+    //
+    // Assumptions:
+    //     1. First request for discovery, succeed with etag
+    //     2. Followed requests fail to mock the object changed during download.
+    let events = std::iter::once(head_event(data.len(), None))
+        .chain(data.chunks(part_size).enumerate().map(|(idx, chunk)| {
+            let start = idx * part_size;
+            let end = std::cmp::min(start + part_size, data.len()) - 1;
+            let mut response = http::Response::builder()
+                .status(206)
+                .header("Content-Length", format!("{}", end - start + 1))
+                .header(
+                    "Content-Range",
+                    format!("bytes {start}-{end}/{}", data.len()),
+                )
+                .header("ETag", "my-etag")
+                .body(SdkBody::from(chunk))
+                .unwrap();
+            if idx > 0 {
+                response = http::Response::builder()
+                    .status(412)
+                    .header("Date", "Thu, 12 Jan 2023 00:04:21 GMT")
+                    .body(SdkBody::from(OBJECT_MODIFIED_RESPONSE))
+                    .unwrap();
+            }
+            ReplayEvent::new(
+                // NOTE: Rather than try to recreate all the expected requests we just put in placeholders and
+                // make our own assertions against the captured requests.
+                dummy_expected_request(),
+                response,
+            )
+        }))
+        .collect();
+
+    let http_client = StaticReplayClient::new(events);
+    let tm = test_tm(http_client.clone(), part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+
+    // drain() sees the transfer failed — body returns an error when channel closes
+    let _drain_err = drain(&mut handle).await.unwrap_err();
+    // drain again to exhaust the body
+    let _ = drain(&mut handle).await;
+    // join() returns the actual SDK error with full context
+    let error = handle.join().await.unwrap_err();
+    assert!(
+        format!("{:?}", error).contains("PreconditionFailed"),
+        "expected PreconditionFailed, got: {:?}",
+        error
+    );
+}
+
+/// Test download via `write_to_path` writes all data and cleans up temp files.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_path() {
+    let data = rand_data(ByteSize::mib(10).as_usize());
+    let part_size = ByteSize::mib(5).as_usize();
+    let (tm, _http_client) = simple_test_tm(&data, part_size);
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("output.dat");
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .write_to_path(&dest_path)
+        .await
+        .unwrap();
+
+    handle.join().await.unwrap();
+
+    let written = std::fs::read(&dest_path).unwrap();
+    assert_eq!(data.as_ref(), written.as_slice());
+
+    // No .s3tmp files should remain
+    let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().to_string_lossy().contains(".s3tmp"))
+        .collect();
+    assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
+}
+
+// ref: RUST-1202
+/// A `write_to_path` destination whose parent directory does not exist fails with an
+/// `IOError` that names what failed and the destination path, with the operating system's
+/// error as its source.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_path_missing_parent_error_names_action_and_path() {
+    let data = rand_data(16);
+    let (tm, _http_client) = simple_test_tm(&data, ByteSize::mib(5).as_usize());
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("missing").join("output.dat");
+
+    let error = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .write_to_path(&dest_path)
+        .await
+        .expect_err("a destination in a missing directory must fail");
+
+    assert_eq!(&ErrorKind::IOError, error.kind());
+    assert_eq!(
+        format!(
+            "I/O error creating temporary file for \"{}\"",
+            dest_path.display()
+        ),
+        error.to_string()
+    );
+    let io_error = std::error::Error::source(&error)
+        .and_then(|s| s.downcast_ref::<std::io::Error>())
+        .expect("the source is the operating system's error");
+    assert_eq!(std::io::ErrorKind::NotFound, io_error.kind());
+}
+
+macro_rules! download_releases_destination_tests {
+    ($($(#[$attr:meta])* $name:ident: $destination:ident, $ending:ident, $runtime:expr;)*) => {$(
+        $(#[$attr])*
+        #[tokio::test(flavor = "multi_thread")]
+        async fn $name() {
+            assert_download_releases_destination(
+                Destination::$destination,
+                Ending::$ending,
+                $runtime,
+            )
+            .await;
+        }
+    )*};
+}
+
+// ref: awslabs/aws-s3-transfer-manager-rs#228, V2429410200
+// Windows probes by path, so `write_to_path` endings that remove the
+// temporary file are covered on Unix only.
+download_releases_destination_tests! {
+    #[cfg(any(unix, windows))]
+    write_to_path_success_releases_destination: Path, Success, RuntimeConfig::default();
+    #[cfg(any(unix, windows))]
+    write_to_path_success_on_tokio_runtime_releases_destination: Path, Success, RuntimeConfig::multi_thread_tokio();
+    #[cfg(unix)]
+    write_to_path_body_failure_releases_temporary_file: Path, BodyFailure, RuntimeConfig::default();
+    #[cfg(unix)]
+    write_to_path_abort_releases_temporary_file: Path, Abort, RuntimeConfig::default();
+    #[cfg(unix)]
+    write_to_path_dropped_handle_releases_temporary_file: Path, DropHandle, RuntimeConfig::default();
+    #[cfg(any(unix, windows))]
+    write_to_file_success_releases_caller_file: File, Success, RuntimeConfig::default();
+    #[cfg(any(unix, windows))]
+    write_to_file_body_failure_releases_caller_file: File, BodyFailure, RuntimeConfig::default();
+    #[cfg(any(unix, windows))]
+    write_to_file_abort_releases_caller_file: File, Abort, RuntimeConfig::default();
+    #[cfg(any(unix, windows))]
+    write_to_file_dropped_handle_releases_caller_file: File, DropHandle, RuntimeConfig::default();
+}
+
+// ref: V2429410200
+/// Completed `download_objects` children release their destination files
+/// through ordinary retirement, with the client still alive.
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn download_objects_releases_destination_files() {
+    const LIST_ONE_KEY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+    <Name>test-bucket</Name>
+    <KeyCount>1</KeyCount>
+    <MaxKeys>1000</MaxKeys>
+    <IsTruncated>false</IsTruncated>
+    <Contents>
+        <Key>key1</Key>
+        <Size>8</Size>
+    </Contents>
+</ListBucketResult>"#;
+    let data = rand_data(8);
+    let list = ReplayEvent::new(
+        dummy_expected_request(),
+        http::Response::builder()
+            .status(200)
+            .body(SdkBody::from(LIST_ONE_KEY))
+            .unwrap(),
+    );
+    let get = ReplayEvent::new(
+        dummy_expected_request(),
+        http::Response::builder()
+            .status(200)
+            .header("Content-Length", "8")
+            .header("Content-Range", "bytes 0-7/8")
+            .header("ETag", "my-etag")
+            .body(SdkBody::from(data.clone()))
+            .unwrap(),
+    );
+    let config = aws_s3_transfer::Config::builder()
+        .s3_config(common::s3_config(StaticReplayClient::new(vec![
+            list,
+            head_event(data.len(), None),
+            get,
+        ])))
+        .concurrency(ConcurrencyMode::Explicit(1))
+        .build()
+        .expect("valid config");
+    let tm = aws_s3_transfer::Client::new(config);
+
+    let dir = tempfile::tempdir().unwrap();
+    let output = tm
+        .download_objects()
+        .bucket("test-bucket")
+        .destination(dir.path())
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .unwrap();
+    assert_eq!(output.objects_downloaded(), 1);
+    let path = dir.path().join("key1");
+    assert_eq!(std::fs::read(&path).unwrap(), data.as_ref());
+    OpenFileProbe::new(&path).assert_released().await;
+    drop_and_await_shutdown(tm).await;
+}
+
+// ref: V2429410200
+/// A completed download releases its destination after both clients are
+/// dropped and the destination is unlinked.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn write_to_path_drop_clients_then_unlink_releases_destination() {
+    let data = Bytes::from_static(b"snapshot");
+    let response = ReplayEvent::new(
+        dummy_expected_request(),
+        http::Response::builder()
+            .status(200)
+            .header("Content-Length", data.len().to_string())
+            .header(
+                "Content-Range",
+                format!("bytes 0-{}/{}", data.len() - 1, data.len()),
+            )
+            .header("ETag", "my-etag")
+            .body(SdkBody::from(data.clone()))
+            .unwrap(),
+    );
+    let shared = common::shared_config(StaticReplayClient::new(vec![
+        head_event(data.len(), None),
+        response,
+    ]));
+    // Reproduce the reported drop sequence with both clients sharing SDK configuration.
+    let s3 = aws_sdk_s3::Client::new(&shared);
+    let tm = aws_s3_transfer::Client::new(
+        aws_s3_transfer::Config::builder()
+            .s3_config(&shared)
+            .build()
+            .expect("valid config"),
+    );
+    let completion = tm.shutdown_completion();
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("snapshot.bin");
+    tm.download()
+        .bucket("bucket")
+        .key("key")
+        .write_to_path(&destination)
+        .await
+        .unwrap()
+        .join()
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&destination).unwrap(), data.as_ref());
+    let probe = OpenFileProbe::new(&destination);
+    drop(tm);
+    drop(s3);
+    drop(shared);
+    std::fs::remove_file(&destination).unwrap();
+    assert!(!destination.exists());
+    probe.assert_released().await;
+    await_shutdown(completion).await;
+}
+
+/// A file already at the temporary name `write_to_path` draws is left
+/// untouched, and the download writes through another name. Seeding
+/// `fastrand` on the polling thread, which draws the name, makes the first
+/// name predictable.
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "current_thread")]
+async fn test_download_write_to_path_leaves_existing_temp_file() {
+    const SEED: u64 = 0x5eed_0042;
+    let data = rand_data(ByteSize::mib(10).as_usize());
+    let part_size = ByteSize::mib(5).as_usize();
+    let (tm, _http_client) = simple_test_tm(&data, part_size);
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("output.dat");
+    let first_suffix = fastrand::Rng::with_seed(SEED).u32(..);
+    let sentinel_path = dir
+        .path()
+        .join(format!("output.dat.s3tmp.{first_suffix:08x}"));
+    std::fs::write(&sentinel_path, b"SENTINEL").unwrap();
+
+    let download = tm.download().bucket("test-bucket").key("test-object");
+    fastrand::seed(SEED);
+    let handle = download.write_to_path(&dest_path).await.unwrap();
+    handle.join().await.unwrap();
+
+    assert_eq!(std::fs::read(&sentinel_path).unwrap(), b"SENTINEL");
+    assert_eq!(std::fs::read(&dest_path).unwrap(), data.as_ref());
+    let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|path| path.to_string_lossy().contains(".s3tmp"))
+        .collect();
+    assert_eq!(tmp_files, vec![sentinel_path]);
+}
+
+/// Test that aborting a download-to-file cleans up both temp and dest files.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_path_abort_cleans_up() {
+    let data = rand_data(ByteSize::mib(10).as_usize());
+    let part_size = ByteSize::mib(5).as_usize();
+    let (tm, _http_client) = simple_test_tm(&data, part_size);
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("output.dat");
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .write_to_path(&dest_path)
+        .await
+        .unwrap();
+
+    handle.abort().await;
+
+    assert!(
+        !dest_path.exists(),
+        "dest file should not exist after abort"
+    );
+
+    let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().to_string_lossy().contains(".s3tmp"))
+        .collect();
+    assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
+}
+
+/// Test that a mid-transfer error cleans up temp and destination files.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_path_error_cleans_up() {
+    let _logs = show_test_logs();
+    let data = rand_data(ByteSize::mib(20).as_usize());
+    let part_size = ByteSize::mib(5).as_usize();
+
+    // Discovery succeeds, second request fails with 412 PreconditionFailed.
+    let http_client = StaticReplayClient::new(vec![
+        head_event(data.len(), None),
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http::Response::builder()
+                .status(200)
+                .header("Content-Length", format!("{}", part_size))
+                .header(
+                    "Content-Range",
+                    format!("bytes 0-{}/{}", part_size - 1, data.len()),
+                )
+                .header("ETag", "my-etag")
+                .body(SdkBody::from(data.slice(0..part_size)))
+                .unwrap(),
+        ),
+        ReplayEvent::new(
+            dummy_expected_request(),
+            http::Response::builder()
+                .status(412)
+                .body(SdkBody::from(
+                    r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>PreconditionFailed</Code></Error>"#,
+                ))
+                .unwrap(),
+        ),
+    ]);
+
+    let tm = test_tm(http_client, part_size);
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest_path = dir.path().join("should_not_exist.dat");
+
+    let handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .write_to_path(&dest_path)
+        .await
+        .unwrap();
+
+    let result = handle.join().await;
+    assert!(result.is_err(), "expected error from failed transfer");
+
+    assert!(
+        !dest_path.exists(),
+        "destination file should not exist after error"
+    );
+
+    let tmp_files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().to_string_lossy().contains(".s3tmp"))
+        .collect();
+    assert!(tmp_files.is_empty(), "leftover temp files: {:?}", tmp_files);
+}
+
+/// `write_to_file` rejects a destination opened in append mode before sending
+/// any request, and leaves the file's contents as they were.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn test_download_write_to_file_rejects_append_mode() {
+    let data = rand_data(ByteSize::mib(10).as_usize());
+    let part_size = ByteSize::mib(5).as_usize();
+    let (tm, http_client) = simple_test_tm(&data, part_size);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("output.dat");
+    let header = rand_data(4096);
+    std::fs::write(&path, &header).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+
+    let error = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .write_to_file(file)
+        .expect_err("an append-mode destination must be rejected");
+
+    assert_eq!(error.kind(), &ErrorKind::InputInvalid);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), header.len() as u64);
+    assert_eq!(std::fs::read(&path).unwrap(), header.as_ref());
+    assert_eq!(http_client.actual_requests().count(), 0);
+}
+
+/// Download requests carry `x-amz-checksum-mode: ENABLED` by default. The SDK's
+/// GetObject operation auto-enables it when the client resolves
+/// `ResponseChecksumValidation` to `WHEN_SUPPORTED` (the default), so the TM gets
+/// response validation without setting the mode itself. This guards against a
+/// regression (SDK change or client config) that would silently stop requesting
+/// the stored checksum and therefore stop validating downloads.
+#[tokio::test]
+async fn test_checksum_mode_enabled_by_default() {
+    // Multipart object so the assertion covers discovery HEAD and every range GET.
+    let data = rand_data(ByteSize::mib(20).as_usize());
+    let part_size = ByteSize::mib(8).as_usize();
+    let (tm, http_client) = simple_test_tm(&data, part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    let _ = drain(&mut handle).await.unwrap();
+
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert!(requests.len() > 1, "expected multiple GETs (multipart)");
+    for (i, req) in requests.iter().enumerate() {
+        assert_eq!(
+            req.headers().get("x-amz-checksum-mode"),
+            Some("ENABLED"),
+            "request #{i} must carry x-amz-checksum-mode=ENABLED by default"
+        );
+    }
+}
+
+fn single_part_connector(data: &Bytes, crc32: Option<&str>) -> StaticReplayClient {
+    object_connector_with_checksum_headers(data, data.len(), |_, _| {
+        crc32.map(|value| ("x-amz-checksum-crc32", value.to_owned()))
+    })
+}
+
+// "hello world" has CRC32 `DUoRhQ==`. Using a correct value lets the SDK's
+// default validation pass so we exercise the success path.
+const HELLO: &[u8] = b"hello world";
+const HELLO_CRC32: &str = "DUoRhQ==";
+
+/// The base64 checksum of `bytes` under `algorithm`, as S3 reports it.
+fn checksum_value(algorithm: aws_smithy_checksums::ChecksumAlgorithm, bytes: &[u8]) -> String {
+    let mut checksum = algorithm.into_impl();
+    checksum.update(bytes);
+    aws_smithy_types::base64::encode(checksum.finalize())
+}
+
+/// An algorithm the SDK validates: the SDK's algorithm, the transfer manager's,
+/// the response header S3 reports it in, and the getter for the object's value.
+type ChecksumCase = (
+    aws_smithy_checksums::ChecksumAlgorithm,
+    ChecksumAlgorithm,
+    &'static str,
+    fn(&IntegrityChecks) -> Option<&str>,
+);
+
+/// Every algorithm the SDK validates.
+fn checksum_cases() -> [ChecksumCase; 5] {
+    use aws_smithy_checksums::ChecksumAlgorithm as Sdk;
+    [
+        (
+            Sdk::Crc32,
+            ChecksumAlgorithm::Crc32,
+            "x-amz-checksum-crc32",
+            IntegrityChecks::checksum_crc32,
+        ),
+        (
+            Sdk::Crc32c,
+            ChecksumAlgorithm::Crc32C,
+            "x-amz-checksum-crc32c",
+            IntegrityChecks::checksum_crc32c,
+        ),
+        (
+            Sdk::Crc64Nvme,
+            ChecksumAlgorithm::Crc64Nvme,
+            "x-amz-checksum-crc64nvme",
+            IntegrityChecks::checksum_crc64_nvme,
+        ),
+        (
+            Sdk::Sha1,
+            ChecksumAlgorithm::Sha1,
+            "x-amz-checksum-sha1",
+            IntegrityChecks::checksum_sha1,
+        ),
+        (
+            Sdk::Sha256,
+            ChecksumAlgorithm::Sha256,
+            "x-amz-checksum-sha256",
+            IntegrityChecks::checksum_sha256,
+        ),
+    ]
+}
+
+/// A transfer manager whose S3 client sets `ResponseChecksumValidation` to
+/// `WhenRequired`, so a download validates only when its request enables it.
+fn when_required_tm(http_client: StaticReplayClient, part_size: usize) -> aws_s3_transfer::Client {
+    let shared = common::shared_config(http_client)
+        .into_builder()
+        .response_checksum_validation(
+            aws_smithy_types::checksum_config::ResponseChecksumValidation::WhenRequired,
+        )
+        .build();
+    let config = aws_s3_transfer::Config::builder()
+        .s3_config(aws_s3_transfer::config::S3ClientConfig::new(&shared))
+        .part_size(PartSize::Target(ByteSize::new(part_size as u64)))
+        .concurrency(ConcurrencyMode::Explicit(1))
+        .build()
+        .expect("valid config");
+    aws_s3_transfer::Client::new(config)
+}
+
+/// Downloads `test-object` through `tm`, with `checksum_mode` if set, and returns
+/// the download's checksum verdict.
+async fn download_checksum_validation(
+    tm: &aws_s3_transfer::Client,
+    checksum_mode: Option<ChecksumMode>,
+) -> ChecksumValidation {
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .set_checksum_mode(checksum_mode)
+        .initiate()
+        .unwrap();
+    let _ = drain(&mut handle).await.unwrap();
+    let output = handle.join().await.unwrap();
+    output.integrity_checks().checksum_validation().clone()
+}
+
+fn assert_validated(validation: &ChecksumValidation, expected: ChecksumAlgorithm) {
+    match validation {
+        ChecksumValidation::Validated { algorithm, .. } => assert_eq!(*algorithm, expected),
+        other => panic!("expected Validated{{{expected:?}}}, got {other:?}"),
+    }
+}
+
+fn assert_not_validated(validation: &ChecksumValidation, expected: NotValidatedReason) {
+    match validation {
+        ChecksumValidation::NotValidated { reason, .. } => assert_eq!(*reason, expected),
+        other => panic!("expected NotValidated{{{expected:?}}}, got {other:?}"),
+    }
+}
+
+/// Default checksum_mode (unset): the SDK auto-enables validation when the client
+/// resolves ResponseChecksumValidation to WhenSupported (the default), so a
+/// response whose CRC32 matches reads Validated, NOT Disabled. See
+/// `test_integrity_checks_disabled_when_validation_when_required` for the only
+/// genuinely-disabled case.
+#[tokio::test]
+async fn test_integrity_checks_default_mode_validates() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = ByteSize::mib(5).as_usize();
+    let tm = test_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
+
+    let validation = download_checksum_validation(&tm, None).await;
+    assert_validated(&validation, ChecksumAlgorithm::Crc32);
+}
+
+/// Client ResponseChecksumValidation=WhenRequired with no request override: the
+/// SDK does not auto-enable ChecksumMode, so validation is genuinely off and the
+/// verdict is Disabled.
+#[tokio::test]
+async fn test_integrity_checks_disabled_when_validation_when_required() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = ByteSize::mib(5).as_usize();
+    let http_client =
+        get_first_object_connector_with_checksum_headers(&data, data.len(), |_, _| {
+            Some(("x-amz-checksum-crc32", HELLO_CRC32.to_owned()))
+        });
+    let tm = when_required_tm(http_client, part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    let _ = drain(&mut handle).await.unwrap();
+    let output = handle.join().await.unwrap();
+
+    match output.integrity_checks().checksum_validation() {
+        ChecksumValidation::NotValidated { reason, .. } => {
+            assert_eq!(*reason, NotValidatedReason::Disabled);
+        }
+        other => panic!("expected NotValidated{{Disabled}}, got {other:?}"),
+    }
+}
+
+/// checksum_mode on, and the response's CRC32 matches the delivered bytes: the
+/// verdict is Validated{Crc32}.
+#[tokio::test]
+async fn test_integrity_checks_enabled_validates() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = ByteSize::mib(5).as_usize();
+    let tm = test_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
+
+    let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
+    assert_validated(&validation, ChecksumAlgorithm::Crc32);
+}
+
+/// A response that carries only a part-level checksum (`<base64>-<parts>`), which
+/// the SDK cannot validate, reads NotValidated{CompositeChecksum}.
+#[tokio::test]
+async fn test_integrity_checks_part_level_only_reads_composite_checksum() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = ByteSize::mib(5).as_usize();
+    let tm = test_tm(single_part_connector(&data, Some("DUoRhQ==-3")), part_size);
+
+    let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
+    assert_not_validated(&validation, NotValidatedReason::CompositeChecksum);
+}
+
+/// HEAD reports a COMPOSITE checksum. The first chunk's response carries its CRC32
+/// and the second's only a part-level checksum. The verdict is NotValidated{PartialCoverage}.
+#[tokio::test]
+async fn test_integrity_checks_validated_and_part_level_read_partial_coverage() {
+    let part_size = ByteSize::mib(5).as_usize();
+    let data = rand_data(part_size + 1024);
+    let http_client = object_connector_with_object_and_range_checksum_headers(
+        &data,
+        part_size,
+        Some(("x-amz-checksum-crc32", "AAAAAA==-2".to_owned())),
+        |index, chunk| {
+            let value = match index {
+                0 => checksum_value(aws_smithy_checksums::ChecksumAlgorithm::Crc32, chunk),
+                _ => "AAAAAA==-2".to_owned(),
+            };
+            Some(("x-amz-checksum-crc32", value))
+        },
+    );
+    let tm = test_tm(http_client, part_size);
+
+    let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
+    assert_not_validated(&validation, NotValidatedReason::PartialCoverage);
+}
+
+/// A response with no checksum header, with validation requested, reads
+/// NotValidated{Unavailable}.
+#[tokio::test]
+async fn test_integrity_checks_no_checksum_reads_unavailable() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = ByteSize::mib(5).as_usize();
+    let tm = test_tm(single_part_connector(&data, None), part_size);
+
+    let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
+    assert_not_validated(&validation, NotValidatedReason::Unavailable);
+}
+
+/// A response whose only checksum is MD5, which the SDK does not compute, reads
+/// `NotValidated { reason: UnsupportedAlgorithm }`.
+#[tokio::test]
+async fn test_integrity_checks_md5_only_reads_unsupported_algorithm() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = ByteSize::mib(5).as_usize();
+    let http_client = object_connector_with_checksum_headers(&data, data.len(), |_, _| {
+        Some(("x-amz-checksum-md5", "XrY7u+Ae7tCTyyK7j1rNww==".to_owned()))
+    });
+    let tm = test_tm(http_client, part_size);
+
+    let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
+    assert_not_validated(&validation, NotValidatedReason::UnsupportedAlgorithm);
+}
+
+/// Client ResponseChecksumValidation=WhenRequired, with checksum_mode Enabled on
+/// the request: the request turns validation on, so a response whose CRC32
+/// matches reads Validated{Crc32}.
+#[tokio::test]
+async fn test_integrity_checks_enabled_validates_when_validation_when_required() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = ByteSize::mib(5).as_usize();
+    let tm = when_required_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
+
+    let validation = download_checksum_validation(&tm, Some(ChecksumMode::Enabled)).await;
+    assert_validated(&validation, ChecksumAlgorithm::Crc32);
+}
+
+/// Each algorithm the SDK validates: a response whose checksum matches its body
+/// delivers the body, reads Validated with that algorithm, and reports the value
+/// as the object's checksum.
+#[tokio::test]
+async fn test_integrity_checks_each_algorithm_validates() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = ByteSize::mib(5).as_usize();
+    for (sdk_algorithm, tm_algorithm, header, object_value) in checksum_cases() {
+        let value = checksum_value(sdk_algorithm, HELLO);
+        let http_client = object_connector_with_checksum_headers(&data, part_size, |_, _| {
+            Some((header, value.clone()))
+        });
+        let tm = test_tm(http_client, part_size);
+
+        let mut handle = tm
+            .download()
+            .bucket("test-bucket")
+            .key("test-object")
+            .checksum_mode(ChecksumMode::Enabled)
+            .initiate()
+            .unwrap();
+        let body = drain(&mut handle).await.unwrap();
+        let output = handle.join().await.unwrap();
+
+        assert_eq!(body, data, "{tm_algorithm:?}");
+        assert_validated(
+            output.integrity_checks().checksum_validation(),
+            tm_algorithm.clone(),
+        );
+        assert_eq!(
+            object_value(output.integrity_checks()),
+            Some(value.as_str()),
+            "{tm_algorithm:?}"
+        );
+    }
+}
+
+/// Each algorithm the SDK validates: a response whose checksum does not match its
+/// body fails the body and `join` with IntegrityError, carrying the algorithm and
+/// both values, after one HEAD and one GET.
+#[tokio::test]
+async fn test_integrity_checks_each_algorithm_mismatch_is_integrity_error() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = ByteSize::mib(5).as_usize();
+    for (sdk_algorithm, tm_algorithm, header, _) in checksum_cases() {
+        let expected = checksum_value(sdk_algorithm, b"other object");
+        let computed = checksum_value(sdk_algorithm, HELLO);
+        let http_client = object_connector_with_checksum_headers(&data, part_size, |_, _| {
+            Some((header, expected.clone()))
+        });
+        let tm = test_tm(http_client.clone(), part_size);
+
+        let mut handle = tm
+            .download()
+            .bucket("test-bucket")
+            .key("test-object")
+            .checksum_mode(ChecksumMode::Enabled)
+            .initiate()
+            .unwrap();
+        let body_error = handle.body_mut().next().await.unwrap().unwrap_err();
+        let join_error = handle.join().await.unwrap_err();
+
+        for error in [&body_error, &join_error] {
+            let ErrorKind::IntegrityError(details) = error.kind() else {
+                panic!("{tm_algorithm:?}: expected IntegrityError, got {error:?}");
+            };
+            assert_eq!(details.algorithm(), Some(&tm_algorithm));
+            assert_eq!(details.expected(), Some(expected.as_str()));
+            assert_eq!(details.computed(), Some(computed.as_str()));
+        }
+        assert_eq!(http_client.actual_requests().count(), 2, "{tm_algorithm:?}");
+    }
+}
+
+/// A range with no end is discovered with HeadObject, so every delivered byte
+/// comes from a ranged GET. When that response's CRC32 matches, the verdict is
+/// Validated{Crc32}.
+#[tokio::test]
+async fn test_integrity_checks_head_discovery_validates() {
+    let part_size = ByteSize::mib(5).as_usize();
+    let tail = Bytes::from_static(&HELLO[6..]);
+    let content_range = format!("bytes 6-{}/{}", HELLO.len() - 1, HELLO.len());
+    let response = || {
+        http::Response::builder()
+            .status(206)
+            .header("Content-Length", format!("{}", tail.len()))
+            .header("Content-Range", content_range.as_str())
+            .header("ETag", "my-etag")
+    };
+    let http_client = StaticReplayClient::new(vec![
+        ReplayEvent::new(
+            dummy_expected_request(),
+            response().body(SdkBody::empty()).unwrap(),
+        ),
+        ReplayEvent::new(
+            dummy_expected_request(),
+            response()
+                .header(
+                    "x-amz-checksum-crc32",
+                    checksum_value(aws_smithy_checksums::ChecksumAlgorithm::Crc32, &tail),
+                )
+                .body(SdkBody::from(tail.clone()))
+                .unwrap(),
+        ),
+    ]);
+    let tm = test_tm(http_client.clone(), part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .range("bytes=6-")
+        .checksum_mode(ChecksumMode::Enabled)
+        .initiate()
+        .unwrap();
+    let body = drain(&mut handle).await.unwrap();
+    let output = handle.join().await.unwrap();
+
+    let methods: Vec<_> = http_client
+        .actual_requests()
+        .map(|request| request.method().to_owned())
+        .collect();
+    assert_eq!(methods, ["HEAD", "GET"]);
+    assert_eq!(body, tail);
+    assert_validated(
+        output.integrity_checks().checksum_validation(),
+        ChecksumAlgorithm::Crc32,
+    );
+}
+
+/// Whole object in the discovery chunk → the response checksum IS the object's,
+/// surfaced on the value members and retained in the object metadata.
+#[tokio::test]
+async fn test_integrity_checks_surfaces_whole_object_checksum() {
+    let data = Bytes::from_static(HELLO);
+    let part_size = ByteSize::mib(5).as_usize();
+    let tm = test_tm(single_part_connector(&data, Some(HELLO_CRC32)), part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    let _ = drain(&mut handle).await.unwrap();
+    let output = handle.join().await.unwrap();
+
+    assert_eq!(
+        output.integrity_checks().checksum_crc32(),
+        Some(HELLO_CRC32)
+    );
+    assert_eq!(
+        output.object_meta.checksum_crc32.as_deref(),
+        Some(HELLO_CRC32)
+    );
+}
+
+/// A server that ignores `Range` answers a GET for the whole object with `200 OK`,
+/// the complete object and no `Content-Range`. HEAD gave the object's length, so
+/// those are exactly the requested bytes.
+#[tokio::test]
+async fn test_whole_object_download_accepts_a_complete_response_without_content_range() {
+    let data = Bytes::from_static(HELLO);
+    let complete = http::Response::builder()
+        .status(200)
+        .header("Content-Length", data.len().to_string())
+        .header("ETag", "\"my-etag\"")
+        .body(SdkBody::from(data.clone()))
+        .unwrap();
+    let http_client = StaticReplayClient::new(vec![
+        head_with_headers(data.len(), "\"my-etag\"", &[]),
+        ReplayEvent::new(dummy_expected_request(), complete),
+    ]);
+    let tm = test_tm(http_client.clone(), ByteSize::mib(5).as_usize());
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    assert_eq!(drain(&mut handle).await.unwrap(), data);
+    handle.join().await.expect("download");
+    let methods: Vec<_> = http_client
+        .actual_requests()
+        .map(|request| request.method().to_owned())
+        .collect();
+    assert_eq!(methods, ["HEAD", "GET"]);
+}
+
+/// A server that ignores `Range` returns the complete object for a request of part of
+/// it. Those aren't the requested bytes, so the download fails with a service error
+/// that names the operation and the response's request id.
+#[tokio::test]
+async fn test_range_response_without_content_range_fails_with_service_error() {
+    let part_size = ByteSize::mib(5).as_usize();
+    let data = rand_data(part_size + 1024);
+    let complete = || {
+        http::Response::builder()
+            .status(200)
+            .header("Content-Length", data.len().to_string())
+            .header("ETag", "\"my-etag\"")
+            .header("x-amz-request-id", "range-ignoring-request")
+            .body(SdkBody::from(data.clone()))
+            .unwrap()
+    };
+    let http_client = StaticReplayClient::new(vec![
+        head_with_headers(data.len(), "\"my-etag\"", &[]),
+        ReplayEvent::new(dummy_expected_request(), complete()),
+        ReplayEvent::new(dummy_expected_request(), complete()),
+    ]);
+    let tm = test_tm(http_client, part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    let _ = drain(&mut handle).await;
+    let error = handle.join().await.unwrap_err();
+    assert_eq!(error.kind(), &ErrorKind::ServiceError, "{error:?}");
+    assert_eq!(error.operation_name(), Some("GetObject"));
+    assert_eq!(error.request_id(), Some("range-ignoring-request"));
+    assert_eq!(error.code(), None);
+}
+
+/// S3 answers a failed HEAD with its status and request ids only, with no body to
+/// carry the error code. A status that identifies a single S3 code reports that code;
+/// any other reports the code the SDK assigned, if any.
+#[tokio::test]
+async fn test_failed_head_reports_the_code_its_status_identifies() {
+    for (status, range, expected) in [
+        (412, None, Some("PreconditionFailed")),
+        (304, None, Some("NotModified")),
+        (416, Some("bytes=100-"), Some("InvalidRange")),
+        (404, None, Some("NotFound")),
+        (403, None, None),
+        (400, None, None),
+    ] {
+        let response = http::Response::builder()
+            .status(status)
+            .header("x-amz-request-id", "head-request")
+            .body(SdkBody::empty())
+            .unwrap();
+        let http_client =
+            StaticReplayClient::new(vec![ReplayEvent::new(dummy_expected_request(), response)]);
+        let tm = test_tm(http_client.clone(), ByteSize::mib(5).as_usize());
+
+        let mut request = tm
+            .download()
+            .bucket("test-bucket")
+            .key("test-object")
+            .if_match("\"stale-etag\"");
+        if let Some(range) = range {
+            request = request.range(range);
+        }
+        let mut handle = request.initiate().unwrap();
+        let _ = drain(&mut handle).await;
+        let error = handle.join().await.unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            &ErrorKind::ServiceError,
+            "{status}: {error:?}"
+        );
+        assert_eq!(error.operation_name(), Some("HeadObject"), "{status}");
+        assert_eq!(error.code(), expected, "{status}: {error:?}");
+        assert_eq!(error.request_id(), Some("head-request"), "{status}");
+        let methods: Vec<_> = http_client
+            .actual_requests()
+            .map(|request| request.method().to_owned())
+            .collect();
+        assert_eq!(methods, ["HEAD"], "{status}: no other request is sent");
+    }
+}
+
+/// A checksum-mode HEAD response for `len` bytes with `etag` and `headers`.
+fn head_with_headers(len: usize, etag: &str, headers: &[(&str, &str)]) -> ReplayEvent {
+    let mut response = http::Response::builder()
+        .status(200)
+        .header("Content-Length", len.to_string())
+        .header("ETag", etag);
+    for (name, value) in headers {
+        response = response.header(*name, *value);
+    }
+    ReplayEvent::new(
+        dummy_expected_request(),
+        response.body(SdkBody::empty()).unwrap(),
+    )
+}
+
+/// A one-part multipart object with a composite checksum: HEAD reports its `-1`
+/// value, a checksum of part checksums. Neither `integrity_checks()` nor
+/// `object_meta` reports the value; both keep the checksum type.
+#[tokio::test]
+async fn test_integrity_checks_one_part_composite_has_no_object_value() {
+    use aws_s3_transfer::types::ChecksumType;
+
+    let data = Bytes::from_static(HELLO);
+    let part_size = ByteSize::mib(5).as_usize();
+    let composite = [
+        ("x-amz-checksum-crc32", "AAAAAA==-1"),
+        ("x-amz-checksum-type", "COMPOSITE"),
+    ];
+    let head = head_with_headers(data.len(), "\"my-etag-1\"", &composite);
+    let response = http::Response::builder()
+        .status(200)
+        .header("Content-Length", format!("{}", data.len()))
+        .header(
+            "Content-Range",
+            format!("bytes 0-{}/{}", data.len() - 1, data.len()),
+        )
+        .header("ETag", "\"my-etag-1\"")
+        .header("x-amz-checksum-crc32", "AAAAAA==-1")
+        .header("x-amz-checksum-type", "COMPOSITE")
+        .body(SdkBody::from(data.clone()))
+        .unwrap();
+    let http_client = StaticReplayClient::new(vec![
+        head,
+        ReplayEvent::new(dummy_expected_request(), response),
+    ]);
+    let tm = test_tm(http_client, part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    assert_eq!(drain(&mut handle).await.unwrap(), data);
+    let output = handle.join().await.unwrap();
+
+    assert_eq!(output.integrity_checks().checksum_crc32(), None);
+    assert_eq!(
+        output.integrity_checks().checksum_type(),
+        Some(&ChecksumType::Composite)
+    );
+    assert_eq!(output.object_meta.checksum_crc32, None);
+    assert_eq!(
+        output.object_meta.checksum_type,
+        Some(ChecksumType::Composite)
+    );
+}
+
+// ref: RUST-1676
+/// A validated download of a COMPOSITE multipart object with an Auto part size
+/// fetches stored part 1 by `partNumber=1` to learn the part size. That response
+/// carries part 1's checksum. It describes only the part, so neither
+/// `integrity_checks()` nor `object_meta()` reports it as the object's checksum;
+/// both report HEAD's COMPOSITE type and no value.
+#[tokio::test]
+async fn test_part_one_checksum_from_part_get_is_not_an_object_value() {
+    use aws_s3_transfer::types::ChecksumType;
+
+    // Two stored parts, "hello" and "world"; CRC32("hello") is `NhCmhg==`.
+    const PART1_CRC32: &str = "NhCmhg==";
+    let data = Bytes::from_static(b"helloworld");
+    let response = |range: &str, body: &'static [u8]| {
+        http::Response::builder()
+            .status(206)
+            .header("Content-Length", format!("{}", body.len()))
+            .header("Content-Range", format!("bytes {range}/{}", data.len()))
+            .header("ETag", "\"my-etag-2\"")
+    };
+    let http_client = StaticReplayClient::new(vec![
+        head_with_headers(
+            data.len(),
+            "\"my-etag-2\"",
+            &[
+                ("x-amz-checksum-crc32", "AAAAAA==-2"),
+                ("x-amz-checksum-type", "COMPOSITE"),
+            ],
+        ),
+        // partNumber=1: part 1 with its own checksum.
+        ReplayEvent::new(
+            dummy_expected_request(),
+            response("0-4", b"hello")
+                .header("x-amz-mp-parts-count", "2")
+                .header("x-amz-checksum-crc32", PART1_CRC32)
+                .header("x-amz-checksum-type", "COMPOSITE")
+                .body(SdkBody::from(&b"hello"[..]))
+                .unwrap(),
+        ),
+        // Part 2, fetched as a range aligned to the stored part size.
+        ReplayEvent::new(
+            dummy_expected_request(),
+            response("5-9", b"world")
+                .body(SdkBody::from(&b"world"[..]))
+                .unwrap(),
+        ),
+    ]);
+    // No part size, so discovery aligns ranges to the stored part size.
+    let config = aws_s3_transfer::Config::builder()
+        .s3_config(common::s3_config(http_client.clone()))
+        .concurrency(ConcurrencyMode::Explicit(1))
+        .build()
+        .expect("valid config");
+    let tm = aws_s3_transfer::Client::new(config);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    assert_eq!(drain(&mut handle).await.unwrap(), data);
+    let object_meta = handle.object_meta().await.unwrap().clone();
+    let output = handle.join().await.unwrap();
+
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method(), "HEAD");
+    assert!(
+        requests[1].uri().contains("partNumber=1"),
+        "discovery fetched stored part 1: {}",
+        requests[1].uri()
+    );
+
+    assert_eq!(output.integrity_checks().checksum_crc32(), None);
+    assert_eq!(
+        output.integrity_checks().checksum_type(),
+        Some(&ChecksumType::Composite)
+    );
+    for meta in [&object_meta, &output.object_meta] {
+        assert_eq!(meta.checksum_crc32, None);
+        assert_eq!(meta.checksum_type, Some(ChecksumType::Composite));
+        // A plain HEAD reports no part count; the part-1 response supplies it.
+        assert_eq!(meta.parts_count, Some(2));
+    }
+}
+
+// ref: RUST-1676
+/// With an explicit part size equal to the stored part size, each ranged GET
+/// covers exactly one stored part, so no `partNumber` request is made. A
+/// directory bucket answers a range that matches a stored part of a
+/// `FULL_OBJECT` multipart object with that part's checksum and the object's
+/// `FULL_OBJECT` type. That value describes 5 MiB of a 10 MiB object, so
+/// `integrity_checks()` and `object_meta` report HEAD's object checksum, never
+/// the part's.
+#[tokio::test]
+async fn test_integrity_checks_part_aligned_range_checksum_is_not_an_object_value() {
+    use aws_s3_transfer::types::ChecksumType;
+
+    let part_size = ByteSize::mib(5).as_usize();
+    let data = Bytes::from(vec![b'a'; 2 * part_size]);
+    // CRC32 of 5 MiB of `a`: the checksum of either stored part.
+    const PART_CRC32: &str = "r/zBbw==";
+    let part = |start: usize| {
+        http::Response::builder()
+            .status(206)
+            .header("Content-Length", format!("{part_size}"))
+            .header(
+                "Content-Range",
+                format!("bytes {start}-{}/{}", start + part_size - 1, data.len()),
+            )
+            .header("ETag", "\"my-etag-2\"")
+            .header("x-amz-checksum-crc32", PART_CRC32)
+            .header("x-amz-checksum-type", "FULL_OBJECT")
+            .body(SdkBody::from(data.slice(start..start + part_size)))
+            .unwrap()
+    };
+    let object_crc32 = checksum_value(aws_smithy_checksums::ChecksumAlgorithm::Crc32, &data);
+    let http_client = StaticReplayClient::new(vec![
+        head_with_headers(
+            data.len(),
+            "\"my-etag-2\"",
+            &[
+                ("x-amz-checksum-crc32", &object_crc32),
+                ("x-amz-checksum-type", "FULL_OBJECT"),
+            ],
+        ),
+        ReplayEvent::new(dummy_expected_request(), part(0)),
+        ReplayEvent::new(dummy_expected_request(), part(part_size)),
+    ]);
+    let tm = test_tm(http_client.clone(), part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    assert_eq!(drain(&mut handle).await.unwrap(), data);
+    let object_meta = handle.object_meta().await.unwrap().clone();
+    let output = handle.join().await.unwrap();
+
+    let requests = http_client.actual_requests().collect::<Vec<_>>();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method(), "HEAD");
+    assert!(
+        requests.iter().all(|r| !r.uri().contains("partNumber")),
+        "an explicit part size downloads by range only"
+    );
+    assert_ne!(object_crc32, PART_CRC32);
+    assert_eq!(
+        output.integrity_checks().checksum_crc32(),
+        Some(object_crc32.as_str())
+    );
+    for meta in [&object_meta, &output.object_meta] {
+        assert_eq!(meta.checksum_crc32.as_deref(), Some(object_crc32.as_str()));
+        assert_eq!(meta.checksum_type, Some(ChecksumType::FullObject));
+        // No request named a part number, so the part count is unknown.
+        assert_eq!(meta.parts_count, None);
+    }
+}
+
+/// Range-response checksums must not be surfaced as object values when HEAD
+/// has no stored checksum.
+#[tokio::test]
+async fn test_integrity_checks_multipart_does_not_surface_part_checksum() {
+    let data = rand_data(ByteSize::mib(12).as_usize());
+    let part_size = ByteSize::mib(5).as_usize();
+    let http_client = object_connector_with_checksum_headers(&data, part_size, |_, bytes| {
+        (bytes.len() <= part_size).then(|| {
+            (
+                "x-amz-checksum-crc32",
+                checksum_value(aws_smithy_checksums::ChecksumAlgorithm::Crc32, bytes),
+            )
+        })
+    });
+    let tm = test_tm(http_client, part_size);
+
+    let mut handle = tm
+        .download()
+        .bucket("test-bucket")
+        .key("test-object")
+        .initiate()
+        .unwrap();
+    let _ = drain(&mut handle).await.unwrap();
+    let output = handle.join().await.unwrap();
+
+    assert_eq!(output.integrity_checks().checksum_crc32(), None);
+    assert_eq!(output.integrity_checks().checksum_type(), None);
+}

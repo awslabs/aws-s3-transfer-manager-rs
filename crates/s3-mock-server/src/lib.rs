@@ -1,0 +1,46 @@
+/*
+ * Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+//! S3 Mock Server
+//!
+//! A mock S3 server for testing and benchmarking Transfer Manager for Amazon S3.
+//! This crate provides a local HTTP server that implements the S3 API operations
+//! required by the transfer manager, allowing for comprehensive testing of
+//! concurrent operations, error handling, and performance characteristics.
+
+mod bucket;
+mod error;
+mod express;
+mod faults;
+mod journal;
+mod list;
+mod operation;
+mod rename;
+mod s3s;
+mod server;
+mod socket_fault;
+mod storage;
+mod streaming;
+mod throttle;
+mod types;
+
+pub use bucket::BucketType;
+pub use error::Error;
+pub use error::Result;
+pub use error::ServerError;
+pub use faults::{BodyCadence, FaultTarget, FaultType, Occurrence};
+pub use journal::{BodyEnd, BodyEnding, ChecksumScope, HoldEnd, RequestRecord, SentChecksum};
+pub use operation::Operation;
+pub use server::{
+    AddObjectRequest, MultipartUploadEntry, ObjectData, ObjectListEntry, S3MockServer,
+    S3MockServerBuilder, ServerConfig, ServerHandle,
+};
+pub use storage::models::RestoreStatus;
+pub use types::composite_checksum;
+
+/// Compiles the package README's examples as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

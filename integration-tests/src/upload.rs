@@ -7,25 +7,22 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef;
-use aws_sdk_s3::config::{ConfigBag, Intercept, RuntimeComponents};
-use aws_sdk_s3::types::ChecksumAlgorithm;
-use aws_sdk_s3_transfer_manager::config::PartSize;
-use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
-use aws_sdk_s3_transfer_manager::config::S3ClientConfig;
-use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
-use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
-use aws_sdk_s3_transfer_manager::types::ByteSize;
-use aws_smithy_runtime_api::client::orchestrator::Metadata;
+use aws_s3_transfer::config::PartSize;
+use aws_s3_transfer::config::RuntimeConfig;
+use aws_s3_transfer::config::S3ClientConfig;
+use aws_s3_transfer::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
+use aws_s3_transfer::types::ByteSize;
+use aws_s3_transfer::types::ChecksumAlgorithm;
+use aws_s3_transfer::types::{checksum::Crc32, ChecksumStrategy};
 use s3_mock_server::S3MockServer;
 use tokio::sync::mpsc;
 
 use crate::assertions::assert_same_content;
 use crate::harness::{mock_tm, mock_tm_with, MockTm};
 use crate::test_data::{deterministic_data, deterministic_data_seeded};
+use crate::test_util::recorder::OperationRecorder;
 
 async fn setup() -> MockTm {
     mock_tm(RuntimeConfig::default()).await
@@ -510,8 +507,8 @@ async fn test_part_checksum_over_different_bytes_fails_before_complete() {
             .build();
         aws_sdk_s3::Client::from_conf(conf)
     };
-    let tm = aws_sdk_s3_transfer_manager::Client::new(
-        aws_sdk_s3_transfer_manager::Config::builder()
+    let tm = aws_s3_transfer::Client::new(
+        aws_s3_transfer::Config::builder()
             .s3_config(S3ClientConfig::new(s3.config().to_builder()))
             .build()
             .expect("valid config"),
@@ -527,7 +524,7 @@ async fn test_part_checksum_over_different_bytes_fails_before_complete() {
         .upload()
         .bucket("test-bucket")
         .key("mismatched-checksum")
-        .checksum_strategy(ChecksumStrategy::with_calculated_crc32())
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32))
         .body(InputStream::from_part_stream(SinglePart {
             part: Some(part),
             size_hint: SizeHint::exact(sent.len() as u64),
