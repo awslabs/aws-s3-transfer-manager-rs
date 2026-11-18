@@ -46,7 +46,8 @@ use crate::error::{Error, ErrorKind};
 use crate::io::part_reader::{Builder as PartReaderBuilder, PartReadStart};
 use crate::io::{InputStream, PartData, SizeHint};
 use crate::operation::upload::context::{
-    apply_content_length, validate_content_md5_for_multipart, validate_distinct_part_numbers,
+    apply_content_length, validate_composite_expected_value_for_multipart,
+    validate_content_md5_for_multipart, validate_distinct_part_numbers,
     validate_part_checksum_has_strategy, validate_part_number, validate_size_hint,
     AbortMpuProgress, MultipartCompletion, PartPlan, PartReadWake, PartTransferState,
     PendingPartRead, UploadFailure, UploadPartWork, UploadState,
@@ -236,6 +237,8 @@ impl UploadTransfer {
             ctx.handle.mpu_threshold_bytes(),
         ) {
             validate_content_md5_for_multipart(&request).map_err(crate::error::invalid_input)?;
+            validate_composite_expected_value_for_multipart(&request)
+                .map_err(crate::error::invalid_input)?;
         }
         let observability =
             UploadObservability::new(ctx.handle.config.diagnostics().transfer(), size_hint);

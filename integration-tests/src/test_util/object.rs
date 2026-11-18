@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 
 use aws_sdk_s3::types::{ChecksumMode, ChecksumType};
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
-use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
+use aws_sdk_s3_transfer_manager::types::{ChecksumAlgorithm, ChecksumStrategy};
 
 use crate::assertions::{describe_error, describe_sdk_error};
 use crate::harness::{ClientOptions, TmTestClient};
@@ -210,19 +210,21 @@ impl Object {
         Some(match (self.layout, self.alg) {
             (_, Alg::NoChecksum) => return None,
             (Layout::Composite, Alg::Crc32) => {
-                ChecksumStrategy::with_calculated_crc32_composite_if_multipart()
+                ChecksumStrategy::composite(ChecksumAlgorithm::Crc32).unwrap()
             }
             (Layout::Composite, Alg::Crc32c) => {
-                ChecksumStrategy::with_calculated_crc32_c_composite_if_multipart()
+                ChecksumStrategy::composite(ChecksumAlgorithm::Crc32C).unwrap()
             }
-            (_, Alg::Crc32) => ChecksumStrategy::with_calculated_crc32(),
-            (_, Alg::Crc32c) => ChecksumStrategy::with_calculated_crc32_c(),
-            (_, Alg::Crc64Nvme) => ChecksumStrategy::with_calculated_crc64_nvme(),
+            (_, Alg::Crc32) => ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap(),
+            (_, Alg::Crc32c) => ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32C).unwrap(),
+            (_, Alg::Crc64Nvme) => {
+                ChecksumStrategy::full_object(ChecksumAlgorithm::Crc64Nvme).unwrap()
+            }
             (Layout::FullObject, Alg::Sha1 | Alg::Sha256) => {
                 panic!("S3 has no FULL_OBJECT SHA checksum: {self:?}")
             }
-            (_, Alg::Sha1) => ChecksumStrategy::with_calculated_sha1_composite_if_multipart(),
-            (_, Alg::Sha256) => ChecksumStrategy::with_calculated_sha256_composite_if_multipart(),
+            (_, Alg::Sha1) => ChecksumStrategy::composite(ChecksumAlgorithm::Sha1).unwrap(),
+            (_, Alg::Sha256) => ChecksumStrategy::composite(ChecksumAlgorithm::Sha256).unwrap(),
         })
     }
 

@@ -8,6 +8,9 @@ use std::ops;
 use std::str::FromStr;
 use std::time::Duration;
 
+mod checksum_strategy;
+pub use checksum_strategy::ChecksumStrategy;
+
 pub use crate::model::builders;
 pub use crate::model::{
     ArchiveStatus, ChecksumAlgorithm, ChecksumMode, ChecksumType, ChunkMetadata, DownloadInput,

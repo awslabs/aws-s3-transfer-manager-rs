@@ -113,9 +113,9 @@ use crate::assertions::{
 };
 use crate::harness::{BucketKind, Target};
 use aws_sdk_s3_transfer_manager::config::PartSize;
-use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_sdk_s3_transfer_manager::types::ByteSize;
 use aws_sdk_s3_transfer_manager::types::ChecksumMode;
+use aws_sdk_s3_transfer_manager::types::ChecksumStrategy;
 use aws_sdk_s3_transfer_manager::types::{ChecksumAlgorithm, NotValidatedReason};
 use s3_mock_server::{FaultType, Occurrence};
 
@@ -202,7 +202,7 @@ async fn single_part_mode_default(target: Target) {
     t.put(
         "obj",
         data.clone(),
-        ChecksumStrategy::with_calculated_crc32(),
+        ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap(),
     )
     .await;
 
@@ -241,7 +241,7 @@ async fn single_part_when_required_disabled(target: Target) {
     t.put(
         "obj",
         data.clone(),
-        ChecksumStrategy::with_calculated_crc32(),
+        ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap(),
     )
     .await;
 
@@ -265,7 +265,7 @@ async fn single_part_mode_on(target: Target) {
     t.put(
         "obj",
         data.clone(),
-        ChecksumStrategy::with_calculated_crc32(),
+        ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap(),
     )
     .await;
 
@@ -307,7 +307,7 @@ async fn multipart_full_object(target: Target) {
     t.put(
         "obj",
         data.clone(),
-        ChecksumStrategy::with_calculated_crc32(),
+        ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap(),
     )
     .await;
 
@@ -387,7 +387,7 @@ async fn multipart_composite(target: Target) {
     t.put(
         "obj",
         data.clone(),
-        ChecksumStrategy::with_calculated_sha256_composite_if_multipart(),
+        ChecksumStrategy::composite(ChecksumAlgorithm::Sha256).unwrap(),
     )
     .await;
 
@@ -558,8 +558,12 @@ async fn mpu_composite_value_matches_expected_real_gp() {
 async fn tampered_single_part_errors(target: Target) {
     let t = target.connect().await;
     let data = small();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap(),
+    )
+    .await;
 
     let mock = t.mock().expect("tamper faults require the mock backend");
     mock.insert_fault(
@@ -587,8 +591,12 @@ async fn tampered_single_part_errors_mock_gp() {
 async fn integrity_error_carries_extracted_fields_mock_gp() {
     let t = Target::mock_gp().connect().await;
     let data = small();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap(),
+    )
+    .await;
 
     let mock = t.mock().expect("tamper faults require the mock backend");
     mock.insert_fault(
@@ -635,8 +643,12 @@ async fn integrity_error_carries_extracted_fields_mock_gp() {
 async fn tampered_single_part_file_errors(target: Target) {
     let t = target.connect().await;
     let data = small();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap(),
+    )
+    .await;
 
     let mock = t.mock().expect("tamper faults require the mock backend");
     mock.insert_fault(
@@ -683,7 +695,7 @@ async fn file_download_round_trips(target: Target) {
     t.put(
         "obj",
         data.clone(),
-        ChecksumStrategy::with_calculated_crc32(),
+        ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap(),
     )
     .await;
 
@@ -753,8 +765,12 @@ async fn many_part_file_download_round_trips(target: Target) {
     let len = many_part_len();
     let src_digest = write_pattern_file(&src, len);
 
-    t.put_from_path("obj", &src, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put_from_path(
+        "obj",
+        &src,
+        ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap(),
+    )
+    .await;
     t.download_to_path("obj", &dest, Some(ChecksumMode::Enabled))
         .await
         .expect("file download");
@@ -802,7 +818,7 @@ async fn tampered_many_part_file_cleans_up(target: Target) {
     t.put_from_path(
         "obj",
         &src,
-        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+        ChecksumStrategy::composite(ChecksumAlgorithm::Crc32).unwrap(),
     )
     .await;
 
@@ -883,7 +899,7 @@ async fn large_object_file_download_validates(target: Target) {
     t.put_from_path(
         "large-obj",
         &src,
-        ChecksumStrategy::with_calculated_crc64_nvme(),
+        ChecksumStrategy::full_object(ChecksumAlgorithm::Crc64Nvme).unwrap(),
     )
     .await;
     // The source is not needed past upload; remove it before the download
@@ -925,7 +941,7 @@ async fn tampered_multipart_errors(target: Target) {
     t.put(
         "obj",
         data,
-        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+        ChecksumStrategy::composite(ChecksumAlgorithm::Crc32).unwrap(),
     )
     .await;
 
@@ -960,7 +976,7 @@ async fn multipart_aligned_round_trips(target: Target) {
     t.put(
         "obj",
         data.clone(),
-        ChecksumStrategy::with_calculated_crc32(),
+        ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap(),
     )
     .await;
 
@@ -999,7 +1015,7 @@ async fn multipart_auto_part_size_validated_mock_gp() {
     t.put(
         "obj",
         data.clone(),
-        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+        ChecksumStrategy::composite(ChecksumAlgorithm::Crc32).unwrap(),
     )
     .await;
 
@@ -1023,7 +1039,7 @@ async fn multipart_default_tamper_caught(target: Target) {
     t.put(
         "obj",
         data,
-        ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+        ChecksumStrategy::composite(ChecksumAlgorithm::Crc32).unwrap(),
     )
     .await;
 
@@ -1056,8 +1072,12 @@ async fn multipart_default_tamper_caught_mock_gp() {
 async fn single_put_split_tamper_caught_mock_gp() {
     let t = Target::mock_gp().connect().await; // default part sizes
     let data = large_single_put();
-    t.put("obj", data, ChecksumStrategy::with_calculated_crc32())
-        .await;
+    t.put(
+        "obj",
+        data,
+        ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap(),
+    )
+    .await;
 
     let mock = t.mock().expect("requires the mock backend");
     mock.insert_fault(

@@ -11,8 +11,8 @@
 use aws_sdk_s3::types::ChecksumMode;
 use aws_sdk_s3_transfer_manager::config::PartSize;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
-use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_sdk_s3_transfer_manager::types::ByteSize;
+use aws_sdk_s3_transfer_manager::types::{ChecksumAlgorithm, ChecksumStrategy};
 use aws_smithy_runtime::test_util::capture_test_logs::show_test_logs;
 use std::pin::Pin;
 use std::task::Poll;
@@ -159,7 +159,7 @@ async fn checksum_test_helper(size_mb: usize, key_suffix: &str, is_multi_part: b
             &s3_client,
             bucket,
             &object_key,
-            ChecksumStrategy::with_calculated_crc32(),
+            ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap(),
             file_size,
         )
         .await;
@@ -170,7 +170,9 @@ async fn checksum_test_helper(size_mb: usize, key_suffix: &str, is_multi_part: b
             &s3_client,
             bucket,
             &object_key,
-            ChecksumStrategy::with_crc32(&checksum),
+            ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32)
+                .unwrap()
+                .with_expected_value(&checksum),
             file_size,
         )
         .await;
@@ -182,7 +184,7 @@ async fn checksum_test_helper(size_mb: usize, key_suffix: &str, is_multi_part: b
             &s3_client,
             bucket,
             &composite_key,
-            ChecksumStrategy::with_calculated_crc32_composite_if_multipart(),
+            ChecksumStrategy::composite(ChecksumAlgorithm::Crc32).unwrap(),
             file_size,
         )
         .await;
@@ -683,7 +685,7 @@ async fn test_upload_unknown_content_length_empty() {
     for checksum in [
         None,
         Some(ChecksumStrategy::default()),
-        Some(ChecksumStrategy::with_calculated_crc32()),
+        Some(ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap()),
     ] {
         let key = generate_key("unknown-content-length-empty");
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -746,7 +748,7 @@ async fn test_upload_unknown_content_length_with_checksum() {
         .upload()
         .bucket(bucket_name.as_str())
         .key(key.as_str())
-        .checksum_strategy(ChecksumStrategy::with_calculated_crc32())
+        .checksum_strategy(ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap())
         .body(InputStream::from_part_stream(UnknownLengthStream::new(rx)))
         .initiate()
         .unwrap();

@@ -708,16 +708,16 @@ fn modeled_checksum_values_do_not_enable_unsupported_execution_algorithms() {
             checksum_algorithm_from_sdk(&checksum_algorithm_to_sdk(&algorithm)),
             algorithm
         );
-        assert!(crate::operation::upload::ChecksumStrategy::builder()
-            .algorithm(algorithm)
-            .build()
-            .is_err());
+        assert!(crate::types::ChecksumStrategy::full_object(algorithm.clone()).is_err());
+        assert!(crate::types::ChecksumStrategy::composite(algorithm).is_err());
     }
     for name in ["CRC32", "CRC32C", "CRC64NVME", "SHA1", "SHA256"] {
-        assert!(crate::operation::upload::ChecksumStrategy::builder()
-            .algorithm(model::ChecksumAlgorithm::from(name))
-            .build()
-            .is_ok());
+        let algorithm = model::ChecksumAlgorithm::from(name);
+        assert!(
+            crate::types::ChecksumStrategy::full_object(algorithm.clone())
+                .or_else(|_| crate::types::ChecksumStrategy::composite(algorithm))
+                .is_ok()
+        );
     }
 }
 

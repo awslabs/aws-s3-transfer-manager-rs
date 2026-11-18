@@ -21,8 +21,9 @@ use aws_sdk_s3::operation::{
 use aws_sdk_s3_transfer_manager::io::{PartData, PartStream, SizeHint, StreamContext};
 use aws_sdk_s3_transfer_manager::{
     io::InputStream,
-    operation::upload::{self, ChecksumStrategy},
-    types, Client, Config,
+    operation::upload,
+    types::{self, ChecksumStrategy},
+    Client, Config,
 };
 #[cfg(feature = "sdk-v1")]
 use aws_smithy_mocks::{mock, mock_client, RuleMode};

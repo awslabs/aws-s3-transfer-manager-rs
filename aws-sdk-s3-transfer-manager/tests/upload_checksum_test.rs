@@ -14,8 +14,8 @@ use aws_sdk_s3::operation::{
 use aws_sdk_s3_transfer_manager::config::{ConcurrencyMode, PartSize};
 use aws_sdk_s3_transfer_manager::{
     io::{InputStream, PartData, PartStream, SizeHint},
-    operation::upload::{ChecksumStrategy, UploadOutput},
-    types::{ChecksumAlgorithm, ChecksumType},
+    operation::upload::UploadOutput,
+    types::{ChecksumAlgorithm, ChecksumStrategy, ChecksumType},
 };
 use aws_smithy_mocks::{mock, mock_client, Rule, RuleMode};
 use bytes::Bytes;
@@ -156,10 +156,10 @@ impl TestStream {
             // assert this test is set up in a valid way
             let checksum_strategy = checksum_strategy.as_ref().unwrap();
             assert_eq!(
-                checksum_strategy.type_if_multipart(),
+                checksum_strategy.multipart_checksum_type(),
                 &ChecksumType::FullObject
             );
-            assert!(checksum_strategy.full_object_checksum().is_none());
+            assert!(checksum_strategy.expected_value().is_none());
 
             Some(calculate_full_object_checksum(
                 checksum_strategy.algorithm(),
@@ -270,7 +270,7 @@ fn multipart_upload_rules(
                         input.checksum_type().map(|v| v.as_str()),
                         request_strategy
                             .as_ref()
-                            .map(|s| s.type_if_multipart().as_str())
+                            .map(|s| s.multipart_checksum_type().as_str())
                     );
                     true
                 }
@@ -375,18 +375,18 @@ fn multipart_upload_rules(
                     if let Some(request_strategy) = &request_strategy {
                         assert_eq!(
                             input.checksum_type().map(|v| v.as_str()),
-                            Some(request_strategy.type_if_multipart().as_str())
+                            Some(request_strategy.multipart_checksum_type().as_str())
                         );
 
                         if let Some((field_algorithm, field_value)) = &input_checksum_field {
                             assert_eq!(field_algorithm, request_strategy.algorithm());
                             assert_eq!(field_value, &multipart_checksum);
                             assert!(
-                                request_strategy.full_object_checksum().is_some()
+                                request_strategy.expected_value().is_some()
                                     || expect_full_object_checksum_from_part_stream
                             );
                         } else {
-                            assert!(request_strategy.full_object_checksum().is_none());
+                            assert!(request_strategy.expected_value().is_none());
                             assert!(!expect_full_object_checksum_from_part_stream);
                         }
                     } else {
@@ -466,7 +466,7 @@ fn mock_s3_client_for_put_object(
                 move |input| {
                     if let Some(request_strategy) = &request_strategy {
                         // Transfer Manager is doing checksums.
-                        if let Some(provided_checksum) = &request_strategy.full_object_checksum() {
+                        if let Some(provided_checksum) = &request_strategy.expected_value() {
                             // Full-object checksum provided up front. Assert it was used
                             let (input_checksum_algorithm, input_checksum_value) =
                                 get_checksum_value!(input).unwrap();
@@ -581,7 +581,7 @@ async fn run_test(config: TestConfig) -> UploadOutput {
         None => (ChecksumAlgorithm::Crc64Nvme, ChecksumType::FullObject),
         Some(request_checksum_strategy) => (
             request_checksum_strategy.algorithm().clone(),
-            request_checksum_strategy.type_if_multipart().clone(),
+            request_checksum_strategy.multipart_checksum_type().clone(),
         ),
     };
 
@@ -668,7 +668,9 @@ async fn test_mpu_provided_full_object_crc32() {
         Bytes::from("abcdefghijklm".as_bytes()),
     ];
     let full_object_checksum = calculate_full_object_checksum(&ChecksumAlgorithm::Crc32, &parts);
-    let strategy = ChecksumStrategy::with_crc32(&full_object_checksum);
+    let strategy = ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32)
+        .unwrap()
+        .with_expected_value(&full_object_checksum);
     let output = test_mpu(Some(strategy), parts).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert_eq!(output.checksum_crc32(), Some(full_object_checksum.as_ref()));
@@ -681,7 +683,9 @@ async fn test_mpu_provided_full_object_crc32_c() {
         Bytes::from("abcdefghijklm".as_bytes()),
     ];
     let full_object_checksum = calculate_full_object_checksum(&ChecksumAlgorithm::Crc32C, &parts);
-    let strategy = ChecksumStrategy::with_crc32_c(&full_object_checksum);
+    let strategy = ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32C)
+        .unwrap()
+        .with_expected_value(&full_object_checksum);
     let output = test_mpu(Some(strategy), parts).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert_eq!(
@@ -698,7 +702,9 @@ async fn test_mpu_provided_full_object_crc64_nvme() {
     ];
     let full_object_checksum =
         calculate_full_object_checksum(&ChecksumAlgorithm::Crc64Nvme, &parts);
-    let strategy = ChecksumStrategy::with_crc64_nvme(&full_object_checksum);
+    let strategy = ChecksumStrategy::full_object(ChecksumAlgorithm::Crc64Nvme)
+        .unwrap()
+        .with_expected_value(&full_object_checksum);
     let output = test_mpu(Some(strategy), parts).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert_eq!(
@@ -716,7 +722,7 @@ async fn test_mpu_calculated_full_object_crc32() {
         Bytes::from(vec![b'a'; PART_SIZE]),
         Bytes::from("abcdefghijklm".as_bytes()),
     ];
-    let strategy = ChecksumStrategy::with_calculated_crc32();
+    let strategy = ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap();
     let output = test_mpu(Some(strategy), parts).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert!(output.checksum_crc32().is_some());
@@ -728,7 +734,7 @@ async fn test_mpu_calculated_full_object_crc32_c() {
         Bytes::from(vec![b'a'; PART_SIZE]),
         Bytes::from("abcdefghijklm".as_bytes()),
     ];
-    let strategy = ChecksumStrategy::with_calculated_crc32_c();
+    let strategy = ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32C).unwrap();
     let output = test_mpu(Some(strategy), parts).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert!(output.checksum_crc32_c().is_some());
@@ -740,7 +746,7 @@ async fn test_mpu_calculated_full_object_crc64_nvme() {
         Bytes::from(vec![b'a'; PART_SIZE]),
         Bytes::from("abcdefghijklm".as_bytes()),
     ];
-    let strategy = ChecksumStrategy::with_calculated_crc64_nvme();
+    let strategy = ChecksumStrategy::full_object(ChecksumAlgorithm::Crc64Nvme).unwrap();
     let output = test_mpu(Some(strategy), parts).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert!(output.checksum_crc64_nvme().is_some());
@@ -754,7 +760,7 @@ async fn test_mpu_calculated_composite_crc32() {
         Bytes::from(vec![b'a'; PART_SIZE]),
         Bytes::from("abcdefghijklm".as_bytes()),
     ];
-    let strategy = ChecksumStrategy::with_calculated_crc32_composite_if_multipart();
+    let strategy = ChecksumStrategy::composite(ChecksumAlgorithm::Crc32).unwrap();
     let output = test_mpu(Some(strategy), parts).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::Composite));
     assert!(output.checksum_crc32().is_some());
@@ -766,7 +772,7 @@ async fn test_mpu_calculated_composite_crc32_c() {
         Bytes::from(vec![b'a'; PART_SIZE]),
         Bytes::from("abcdefghijklm".as_bytes()),
     ];
-    let strategy = ChecksumStrategy::with_calculated_crc32_c_composite_if_multipart();
+    let strategy = ChecksumStrategy::composite(ChecksumAlgorithm::Crc32C).unwrap();
     let output = test_mpu(Some(strategy), parts).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::Composite));
     assert!(output.checksum_crc32_c().is_some());
@@ -780,7 +786,7 @@ async fn test_mpu_calculated_composite_sha1() {
         Bytes::from(vec![b'a'; PART_SIZE]),
         Bytes::from("abcdefghijklm".as_bytes()),
     ];
-    let strategy = ChecksumStrategy::with_calculated_sha1_composite_if_multipart();
+    let strategy = ChecksumStrategy::composite(ChecksumAlgorithm::Sha1).unwrap();
     let output = test_mpu(Some(strategy), parts).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::Composite));
     assert!(output.checksum_sha1().is_some());
@@ -792,7 +798,7 @@ async fn test_mpu_calculated_composite_sha256() {
         Bytes::from(vec![b'a'; PART_SIZE]),
         Bytes::from("abcdefghijklm".as_bytes()),
     ];
-    let strategy = ChecksumStrategy::with_calculated_sha256_composite_if_multipart();
+    let strategy = ChecksumStrategy::composite(ChecksumAlgorithm::Sha256).unwrap();
     let output = test_mpu(Some(strategy), parts).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::Composite));
     assert!(output.checksum_sha256().is_some());
@@ -842,7 +848,9 @@ async fn test_mpu_no_strategy() {
 async fn test_put_object_provided_full_object_crc32() {
     let body = Bytes::from("abcdefghijklm".as_bytes());
     let full_object_checksum = calculate_checksum(&ChecksumAlgorithm::Crc32, &body);
-    let strategy = ChecksumStrategy::with_crc32(&full_object_checksum);
+    let strategy = ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32)
+        .unwrap()
+        .with_expected_value(&full_object_checksum);
     let output = test_put_object(Some(strategy), body).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert_eq!(output.checksum_crc32(), Some(full_object_checksum.as_ref()));
@@ -852,7 +860,9 @@ async fn test_put_object_provided_full_object_crc32() {
 async fn test_put_object_provided_full_object_crc32_c() {
     let body = Bytes::from("abcdefghijklm".as_bytes());
     let full_object_checksum = calculate_checksum(&ChecksumAlgorithm::Crc32C, &body);
-    let strategy = ChecksumStrategy::with_crc32_c(&full_object_checksum);
+    let strategy = ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32C)
+        .unwrap()
+        .with_expected_value(&full_object_checksum);
     let output = test_put_object(Some(strategy), body).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert_eq!(
@@ -865,7 +875,9 @@ async fn test_put_object_provided_full_object_crc32_c() {
 async fn test_put_object_provided_full_object_crc64_nvme() {
     let body = Bytes::from("abcdefghijklm".as_bytes());
     let full_object_checksum = calculate_checksum(&ChecksumAlgorithm::Crc64Nvme, &body);
-    let strategy = ChecksumStrategy::with_crc64_nvme(&full_object_checksum);
+    let strategy = ChecksumStrategy::full_object(ChecksumAlgorithm::Crc64Nvme)
+        .unwrap()
+        .with_expected_value(&full_object_checksum);
     let output = test_put_object(Some(strategy), body).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert_eq!(
@@ -880,7 +892,7 @@ async fn test_put_object_provided_full_object_crc64_nvme() {
 #[tokio::test]
 async fn test_put_object_calculated_full_object_crc32() {
     let body = Bytes::from("abcdefghijklm".as_bytes());
-    let strategy = ChecksumStrategy::with_calculated_crc32();
+    let strategy = ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap();
     let output = test_put_object(Some(strategy), body).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert!(output.checksum_crc32().is_some());
@@ -889,7 +901,7 @@ async fn test_put_object_calculated_full_object_crc32() {
 #[tokio::test]
 async fn test_put_object_calculated_full_object_crc32_c() {
     let body = Bytes::from("abcdefghijklm".as_bytes());
-    let strategy = ChecksumStrategy::with_calculated_crc32_c();
+    let strategy = ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32C).unwrap();
     let output = test_put_object(Some(strategy), body).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert!(output.checksum_crc32_c().is_some());
@@ -898,7 +910,7 @@ async fn test_put_object_calculated_full_object_crc32_c() {
 #[tokio::test]
 async fn test_put_object_calculated_full_object_crc64_nvme() {
     let body = Bytes::from("abcdefghijklm".as_bytes());
-    let strategy = ChecksumStrategy::with_calculated_crc64_nvme();
+    let strategy = ChecksumStrategy::full_object(ChecksumAlgorithm::Crc64Nvme).unwrap();
     let output = test_put_object(Some(strategy), body).await;
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
     assert!(output.checksum_crc64_nvme().is_some());
@@ -907,7 +919,7 @@ async fn test_put_object_calculated_full_object_crc64_nvme() {
 #[tokio::test]
 async fn test_put_object_calculated_crc32_composite_if_multipart() {
     let body = Bytes::from("abcdefghijklm".as_bytes());
-    let strategy = ChecksumStrategy::with_calculated_crc32_composite_if_multipart();
+    let strategy = ChecksumStrategy::composite(ChecksumAlgorithm::Crc32).unwrap();
     let output = test_put_object(Some(strategy), body).await;
     // NOTE: since it wasn't multipart, the checksum isn't composite
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
@@ -917,7 +929,7 @@ async fn test_put_object_calculated_crc32_composite_if_multipart() {
 #[tokio::test]
 async fn test_put_object_calculated_crc32_c_composite_if_multipart() {
     let body = Bytes::from("abcdefghijklm".as_bytes());
-    let strategy = ChecksumStrategy::with_calculated_crc32_c_composite_if_multipart();
+    let strategy = ChecksumStrategy::composite(ChecksumAlgorithm::Crc32C).unwrap();
     let output = test_put_object(Some(strategy), body).await;
     // NOTE: since it wasn't multipart, the checksum isn't composite
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
@@ -929,7 +941,7 @@ async fn test_put_object_calculated_crc32_c_composite_if_multipart() {
 #[tokio::test]
 async fn test_put_object_calculated_sha1_composite_if_multipart() {
     let body = Bytes::from("abcdefghijklm".as_bytes());
-    let strategy = ChecksumStrategy::with_calculated_sha1_composite_if_multipart();
+    let strategy = ChecksumStrategy::composite(ChecksumAlgorithm::Sha1).unwrap();
     let output = test_put_object(Some(strategy), body).await;
     // NOTE: since it wasn't multipart, the checksum isn't composite
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
@@ -939,7 +951,7 @@ async fn test_put_object_calculated_sha1_composite_if_multipart() {
 #[tokio::test]
 async fn test_put_object_calculated_sha256_composite_if_multipart() {
     let body = Bytes::from("abcdefghijklm".as_bytes());
-    let strategy = ChecksumStrategy::with_calculated_sha256_composite_if_multipart();
+    let strategy = ChecksumStrategy::composite(ChecksumAlgorithm::Sha256).unwrap();
     let output = test_put_object(Some(strategy), body).await;
     // NOTE: since it wasn't multipart, the checksum isn't composite
     assert_eq!(output.checksum_type(), Some(&ChecksumType::FullObject));
@@ -983,7 +995,9 @@ async fn test_mpu_checksums_from_part_stream() {
             Bytes::from(vec![b'a'; PART_SIZE]),
             Bytes::from("abcdefghijklm".as_bytes()),
         ],
-        user_checksum_strategy: Some(ChecksumStrategy::with_calculated_crc32()),
+        user_checksum_strategy: Some(
+            ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32).unwrap(),
+        ),
         send_as_multipart: true,
         send_checksums_from_part_stream: true,
         send_full_object_checksum_from_part_stream: true,
@@ -1110,7 +1124,7 @@ async fn test_mpu_content_md5_is_rejected() {
     let rules = multipart_upload_rules(
         Some(strategy.clone()),
         strategy.algorithm().clone(),
-        strategy.type_if_multipart().clone(),
+        strategy.multipart_checksum_type().clone(),
         &vec![body.slice(..PART_SIZE), body.slice(PART_SIZE..)],
         false,
         false,
@@ -1169,4 +1183,140 @@ async fn test_put_object_content_md5_is_sent() {
         .expect("a single-request upload sends content_md5");
 
     assert_eq!(put_object.num_calls(), 1);
+}
+
+#[tokio::test]
+async fn test_put_object_composite_expected_value_is_sent() {
+    // A single-request upload's checksum is a full object checksum, so a composite strategy's
+    // expected value is sent in its algorithm's PutObject header in place of a calculated one.
+    let body = Bytes::from("abcdefghijklm".as_bytes());
+    let expected_value = calculate_checksum(&ChecksumAlgorithm::Sha256, &body);
+
+    let put_object = mock!(aws_sdk_s3::Client::put_object)
+        .match_requests({
+            let expected_value = expected_value.clone();
+            move |input| {
+                input.checksum_algorithm().is_none()
+                    && get_checksum_value!(input)
+                        == Some((ChecksumAlgorithm::Sha256, expected_value.clone()))
+            }
+        })
+        .then_output({
+            let etag = calculate_etag(&body);
+            let expected_value = expected_value.clone();
+            move || {
+                PutObjectOutput::builder()
+                    .e_tag(&etag)
+                    .checksum_sha256(&expected_value)
+                    .checksum_type(aws_sdk_s3::types::ChecksumType::FullObject)
+                    .build()
+            }
+        });
+    let tm = helper_create_transfer_manager(
+        mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&put_object]),
+        aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported,
+    );
+    let output = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .checksum_strategy(
+            ChecksumStrategy::composite(ChecksumAlgorithm::Sha256)
+                .unwrap()
+                .with_expected_value(&expected_value),
+        )
+        .body(InputStream::from(body))
+        .initiate()
+        .unwrap()
+        .join()
+        .await
+        .expect("a single-request upload sends a composite strategy's expected value");
+
+    assert_eq!(put_object.num_calls(), 1);
+    assert_eq!(output.checksum_sha256(), Some(expected_value.as_str()));
+}
+
+/// A `PartStream` whose size has no upper bound and that yields no parts.
+#[derive(Debug)]
+struct UnboundedEmptyStream;
+
+impl PartStream for UnboundedEmptyStream {
+    fn poll_part(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _stream_cx: &aws_sdk_s3_transfer_manager::io::StreamContext,
+    ) -> Poll<Option<std::io::Result<PartData>>> {
+        Poll::Ready(None)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+/// Asserts that uploading `body`, which is sent as a multipart upload, with a composite strategy
+/// that has an expected value fails at `initiate` with an input error and sends no request.
+fn assert_composite_expected_value_rejected(body: InputStream) {
+    let put_object =
+        mock!(aws_sdk_s3::Client::put_object).then_output(|| PutObjectOutput::builder().build());
+    let create = mock!(aws_sdk_s3::Client::create_multipart_upload).then_output(|| {
+        CreateMultipartUploadOutput::builder()
+            .upload_id("test-upload-id")
+            .build()
+    });
+    let upload_part =
+        mock!(aws_sdk_s3::Client::upload_part).then_output(|| UploadPartOutput::builder().build());
+    let complete = mock!(aws_sdk_s3::Client::complete_multipart_upload)
+        .then_output(|| CompleteMultipartUploadOutput::builder().build());
+    let rules = [put_object, create, upload_part, complete];
+    let tm = helper_create_transfer_manager(
+        mock_client!(aws_sdk_s3, RuleMode::MatchAny, &rules),
+        aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported,
+    );
+    let error = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("test-key")
+        .checksum_strategy(
+            ChecksumStrategy::composite(ChecksumAlgorithm::Sha256)
+                .unwrap()
+                .with_expected_value("ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0="),
+        )
+        .body(body)
+        .initiate()
+        .expect_err("a composite expected value on a multipart upload must fail the upload");
+
+    assert_input_invalid(
+        &error,
+        "a composite ChecksumStrategy with an expected value is not supported for multipart uploads",
+    );
+    assert!(
+        rules.iter().all(|rule| rule.num_calls() == 0),
+        "no request may be sent"
+    );
+}
+
+#[tokio::test]
+async fn test_mpu_composite_expected_value_is_rejected_at_threshold() {
+    // An in-memory body one byte over the multipart threshold.
+    assert_composite_expected_value_rejected(InputStream::from(Bytes::from(vec![
+        b'a';
+        PART_SIZE + 1
+    ])));
+}
+
+#[tokio::test]
+async fn test_mpu_composite_expected_value_is_rejected_for_part_stream() {
+    // A `PartStream` is always sent as a multipart upload, even with an exact size below the
+    // multipart threshold.
+    let parts = vec![Bytes::from("abcdefghijklm".as_bytes())];
+    assert_composite_expected_value_rejected(InputStream::from_part_stream(TestStream::new(
+        parts, None, false, false,
+    )));
+}
+
+#[tokio::test]
+async fn test_mpu_composite_expected_value_is_rejected_without_upper_bound() {
+    // Only a `PartStream` can declare a size with no upper bound.
+    assert_composite_expected_value_rejected(InputStream::from_part_stream(UnboundedEmptyStream));
 }

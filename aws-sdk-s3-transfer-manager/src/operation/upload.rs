@@ -23,16 +23,21 @@
 //!   [`PartStream`](crate::io::PartStream), or its upper bound is at least the multipart
 //!   threshold. A Content-MD5 covers the whole object, which only a single-request upload
 //!   carries. `initiate` returns this error, and no request is sent.
+//! - The upload's [checksum strategy](crate::types::ChecksumStrategy) is
+//!   [composite](crate::types::ChecksumStrategy::composite) and has an
+//!   [expected value](crate::types::ChecksumStrategy::with_expected_value), and the upload is sent
+//!   as a multipart upload, under the same conditions as for Content-MD5. The expected value covers
+//!   the whole object, which no composite multipart request carries. `initiate` returns this
+//!   error, and no request is sent.
 //! - A [`PartStream`](crate::io::PartStream) part carries a
 //!   [checksum](crate::io::PartData::with_checksum), but the upload has no
-//!   [checksum strategy](crate::operation::upload::ChecksumStrategy) to name its algorithm.
+//!   [checksum strategy](crate::types::ChecksumStrategy) to name its algorithm.
 //!   [`UploadHandle::join`](crate::operation::upload::UploadHandle::join) returns this error.
 //!   The part is not sent; earlier parts may have been, and the multipart upload is then
 //!   handled as for any failed part.
 
 /// Operation builders
 pub mod builders;
-mod checksum_strategy;
 mod request;
 
 mod context;
@@ -42,7 +47,6 @@ mod observability;
 mod part_body;
 mod transfer;
 
-pub use checksum_strategy::{ChecksumStrategy, ChecksumStrategyBuilder};
 pub(crate) use transfer::UploadTransfer;
 
 use crate::config::user_agent::OperationFeatures;
@@ -54,7 +58,7 @@ pub use crate::model::UploadInput;
 /// Response type for uploads to Amazon S3
 pub use crate::model::UploadOutput;
 use crate::transfer::TransferContext;
-use crate::types::BucketType;
+use crate::types::{BucketType, ChecksumStrategy};
 use aws_runtime::sdk_feature::AwsSdkFeature;
 pub use handle::UploadHandle;
 

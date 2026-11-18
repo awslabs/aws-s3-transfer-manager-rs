@@ -13,6 +13,7 @@ use smallvec::SmallVec;
 
 use crate::io::part_reader::{NextPartFuture, PartReader};
 use crate::io::{InputStream, PartData, SizeHint};
+use crate::model::ChecksumType;
 #[cfg(test)]
 use crate::operation::upload::observability::MultipartTransferSummary;
 use crate::operation::upload::observability::{
@@ -303,6 +304,10 @@ pub(crate) enum UploadChecksumViolation {
     /// The request carries `content_md5` and is sent as a multipart upload. The value covers the
     /// whole object, and no multipart request carries it.
     ContentMd5WithMultipart,
+    /// The request's `ChecksumStrategy` is composite, carries an expected value, and is sent as a
+    /// multipart upload. The value covers the whole object, and no composite multipart request
+    /// carries it.
+    CompositeExpectedValueWithMultipart,
     /// A part carries a checksum, but the upload has no `ChecksumStrategy` to name its algorithm.
     PartChecksumWithoutStrategy { part_number: u64 },
 }
@@ -315,6 +320,12 @@ impl fmt::Display for UploadChecksumViolation {
                 "upload content_md5 is not supported for multipart uploads; use a \
                  ChecksumStrategy to verify the upload, or keep the object below the multipart \
                  threshold"
+            ),
+            Self::CompositeExpectedValueWithMultipart => write!(
+                formatter,
+                "a composite ChecksumStrategy with an expected value is not supported for \
+                 multipart uploads; use a full object ChecksumStrategy, or keep the object below \
+                 the multipart threshold"
             ),
             Self::PartChecksumWithoutStrategy { part_number } => write!(
                 formatter,
@@ -334,6 +345,21 @@ pub(crate) fn validate_content_md5_for_multipart(
 ) -> Result<(), UploadChecksumViolation> {
     if upload_input.content_md5.is_some() {
         return Err(UploadChecksumViolation::ContentMd5WithMultipart);
+    }
+    Ok(())
+}
+
+/// Checks that `upload_input`, sent as a multipart upload, has no composite `ChecksumStrategy`
+/// with an expected value.
+pub(crate) fn validate_composite_expected_value_for_multipart(
+    upload_input: &UploadInput,
+) -> Result<(), UploadChecksumViolation> {
+    if let Some(strategy) = &upload_input.checksum_strategy {
+        if strategy.multipart_checksum_type() == &ChecksumType::Composite
+            && strategy.expected_value().is_some()
+        {
+            return Err(UploadChecksumViolation::CompositeExpectedValueWithMultipart);
+        }
     }
     Ok(())
 }

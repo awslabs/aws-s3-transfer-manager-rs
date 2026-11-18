@@ -140,7 +140,9 @@ class MemberPolicy(private val source: Model, private val sourceSymbols: RustSym
                 "Required: building an upload without a body fails. To upload an empty object, pass an " +
                     "empty body such as [`InputStream::from_static(b\"\")`]"
                     + "(crate::io::InputStream::from_static).").copy(sourceMember = body),
-            runtime("checksum_strategy", checksum, Construction.OPTIONAL, "Checksum calculation or precalculated checksum policy."),
+            runtime("checksum_strategy", checksum, Construction.OPTIONAL, "The checksums the upload sends: algorithm, multipart checksum type and an optional expected value. "
+                + "Without one, the upload uses [`ChecksumStrategy::default`](crate::types::ChecksumStrategy::default) "
+                + "when the S3 client's request checksum calculation is `WhenSupported`."),
             runtime("failed_multipart_upload_policy", failedUpload, Construction.OPTIONAL, "How to handle a failed multipart upload."),
             // S3 documents ContentLength as a hint; a transfer holds the body to it exactly.
             modeled(put.getMember("ContentLength").orElseThrow(), "content_length").copy(

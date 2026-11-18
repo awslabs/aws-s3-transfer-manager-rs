@@ -850,9 +850,13 @@ mod tests {
                     .upload()
                     .bucket("test-bucket")
                     .key("file")
-                    .checksum_strategy(crate::operation::upload::ChecksumStrategy::with_crc32(
-                        &checksum,
-                    ))
+                    .checksum_strategy(
+                        crate::types::ChecksumStrategy::full_object(
+                            crate::types::ChecksumAlgorithm::Crc32,
+                        )
+                        .unwrap()
+                        .with_expected_value(&checksum),
+                    )
                     .body(crate::io::InputStream::from_path(file.path()).unwrap())
                     .initiate()
                     .unwrap();

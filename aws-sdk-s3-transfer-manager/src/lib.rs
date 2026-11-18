@@ -92,8 +92,10 @@
 //! # Integrity
 //!
 //! Uploads send the checksums selected by
-//! [`ChecksumStrategy`](crate::operation::upload::ChecksumStrategy), which S3
-//! verifies against the bytes it receives.
+//! [`ChecksumStrategy`](crate::types::ChecksumStrategy), which S3
+//! verifies against the bytes it receives. An expected value set with
+//! [`ChecksumStrategy::with_expected_value`](crate::types::ChecksumStrategy::with_expected_value)
+//! has S3 check the uploaded object against its source.
 //!
 //! A completed download reports whether the bytes it delivered were validated
 //! against S3's checksums:

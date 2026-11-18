@@ -20,15 +20,16 @@ pub(crate) fn copy_fields_to_put_object_request(
         crate::sdk_v1::copy_upload_input_fields_to_put_object(upload_input, put_object_builder);
 
     if let Some(checksum_strategy) = &upload_input.checksum_strategy {
-        if let Some(value) = checksum_strategy.full_object_checksum() {
-            // We have the full-object checksum value, so set it
+        if let Some(value) = checksum_strategy.expected_value() {
+            // A single-request upload's checksum is a full object checksum for either type, so an
+            // expected value is sent in its algorithm's header.
             put_object_builder = match checksum_strategy.algorithm() {
                 ChecksumAlgorithm::Crc32 => put_object_builder.checksum_crc32(value),
                 ChecksumAlgorithm::Crc32C => put_object_builder.checksum_crc32_c(value),
                 ChecksumAlgorithm::Crc64Nvme => put_object_builder.checksum_crc64_nvme(value),
                 ChecksumAlgorithm::Sha1 => put_object_builder.checksum_sha1(value),
                 ChecksumAlgorithm::Sha256 => put_object_builder.checksum_sha256(value),
-                algo => unreachable!("unexpected algorithm `{algo}` for full object checksum"),
+                algo => unreachable!("unexpected algorithm `{algo}` for an expected value"),
             }
         } else {
             // Set checksum algorithm, which tells SDK to calculate and add checksum value
@@ -57,7 +58,7 @@ pub(crate) fn copy_fields_to_mpu_request(
                 checksum_strategy.algorithm(),
             ))
             .checksum_type(crate::sdk_v1::checksum_type_to_sdk(
-                checksum_strategy.type_if_multipart(),
+                checksum_strategy.multipart_checksum_type(),
             ));
     }
 
@@ -128,13 +129,14 @@ where
 
     if let Some(checksum_strategy) = &upload_input.checksum_strategy {
         complete_mpu_builder = complete_mpu_builder.checksum_type(
-            crate::sdk_v1::checksum_type_to_sdk(checksum_strategy.type_if_multipart()),
+            crate::sdk_v1::checksum_type_to_sdk(checksum_strategy.multipart_checksum_type()),
         );
 
-        // check for user-provided full-object checksum...
-        if checksum_strategy.type_if_multipart() == &ChecksumType::FullObject {
-            // it might have been passed via ChecksumStrategy or PartStream
-            let full_object_checksum = match checksum_strategy.full_object_checksum() {
+        // A composite upload's object checksum is derived by S3 from the part checksums, so only a
+        // full object strategy sends an object-level value: the strategy's expected value, or
+        // else the one the `PartStream` returns.
+        if checksum_strategy.multipart_checksum_type() == &ChecksumType::FullObject {
+            let full_object_checksum = match checksum_strategy.expected_value() {
                 Some(checksum) => Some(checksum.into()),
                 None => part_stream_full_object_checksum().await,
             };
@@ -164,7 +166,7 @@ mod tests {
         ObjectCannedAcl, ObjectLockLegalHoldStatus, ObjectLockMode, RequestPayer,
         ServerSideEncryption, StorageClass,
     };
-    use crate::operation::upload::ChecksumStrategy;
+    use crate::types::ChecksumStrategy;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::operation::upload_part::UploadPartOutput;
     use aws_sdk_s3::{Client, Config};
@@ -179,7 +181,11 @@ mod tests {
             .bucket("test-bucket")
             .bucket_key_enabled(true)
             .cache_control("max-age=3600")
-            .checksum_strategy(ChecksumStrategy::with_crc32("0xebe6c6e6"))
+            .checksum_strategy(
+                ChecksumStrategy::full_object(ChecksumAlgorithm::Crc32)
+                    .unwrap()
+                    .with_expected_value("0xebe6c6e6"),
+            )
             .content_disposition("attachment; filename=test.txt")
             .content_encoding("gzip")
             .content_language("en-US")

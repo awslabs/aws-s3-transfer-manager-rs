@@ -523,7 +523,7 @@ impl TmTestClient {
         &self,
         key: &str,
         data: Vec<u8>,
-        strategy: aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy,
+        strategy: aws_sdk_s3_transfer_manager::types::ChecksumStrategy,
     ) {
         self.tm
             .upload()
@@ -545,7 +545,7 @@ impl TmTestClient {
         &self,
         key: &str,
         path: &std::path::Path,
-        strategy: aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy,
+        strategy: aws_sdk_s3_transfer_manager::types::ChecksumStrategy,
     ) {
         let body = aws_sdk_s3_transfer_manager::io::InputStream::from_path(path)
             .expect("open upload source file");
