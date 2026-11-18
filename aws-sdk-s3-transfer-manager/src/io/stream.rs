@@ -75,10 +75,18 @@ impl InputStream {
     /// Create a new `InputStream` that reads data from a given `path`.
     ///
     /// ## Warning
-    /// The contents of the file MUST not change. The length & checksum of the file
-    /// will be cached. If the contents of the file change, the operation will almost certainly fail.
+    /// The file must not be modified until the upload completes. The stream records the file's
+    /// length when it is built and reads the contents as the upload proceeds. Each attempt of a
+    /// single-request upload reads the file again and calculates its checksum from the bytes read.
+    /// A multipart upload reads each part from the file once, and every attempt of that part sends
+    /// the same bytes.
     ///
-    /// Furthermore, a partial write MAY seek in the file and resume from the previous location.
+    /// A change during the upload is not detected: a file shortened below the recorded length
+    /// fails the upload, bytes past the recorded length are not uploaded, and bytes rewritten in
+    /// place are uploaded with checksums that match the rewritten data. To have S3 reject an object
+    /// that doesn't match the file as it was before the upload, calculate the file's checksum
+    /// first and supply it with
+    /// [`ChecksumStrategy::with_expected_value`](crate::types::ChecksumStrategy::with_expected_value).
     ///
     /// The path must name a regular file, directly or through symbolic links.
     /// Upload pipes and devices with [`InputStream::from_part_stream`] and
@@ -383,18 +391,14 @@ impl PartData {
         }
     }
 
-    /// Set this part's checksum, if you've calculated it yourself
-    /// (base64 encoding of the big-endian checksum value for this part's data
-    /// using the algorithm specified in the
-    /// [`ChecksumStrategy`](crate::operation::upload::ChecksumStrategy)).
+    /// Sets this part's checksum: the base64 encoding of the big-endian checksum of this part's
+    /// data in the upload's [`ChecksumStrategy`](crate::types::ChecksumStrategy) algorithm.
     ///
-    /// The value is sent with the part only if the upload has a checksum
-    /// strategy, either set on the upload or applied by default. Otherwise the
-    /// upload fails with [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid).
-    /// If you don't set it, the SDK calculates the part's checksum as it sends
-    /// the part, when the S3 client's `request_checksum_calculation` is
-    /// `WhenSupported` (the default). See
-    /// [`ChecksumStrategy`](crate::operation::upload::ChecksumStrategy).
+    /// The value is sent with the part when the upload has a checksum strategy, set on the upload
+    /// or applied by default. Otherwise the upload fails with
+    /// [`ErrorKind::InputInvalid`](crate::error::ErrorKind::InputInvalid). Without a value, the
+    /// transfer manager calculates the part's checksum as the part is sent, when the upload has a
+    /// checksum strategy.
     pub fn with_checksum(mut self, checksum: impl Into<String>) -> Self {
         self.checksum = Some(checksum.into());
         self
@@ -417,9 +421,13 @@ pub trait PartStream {
     /// Polls for the next complete upload part.
     ///
     /// Returns [`Poll::Ready(Some(Ok(part)))`](std::task::Poll::Ready) when one part is available.
-    /// Parts should contain [`StreamContext::part_size`] bytes except for the final part, which may
-    /// be shorter. Returns [`Poll::Ready(None)`](std::task::Poll::Ready) at end-of-stream. The
-    /// transfer manager does not poll the stream again after end-of-stream or an error.
+    /// Returns [`Poll::Ready(None)`](std::task::Poll::Ready) at end-of-stream. The transfer manager
+    /// does not poll the stream again after end-of-stream or an error.
+    ///
+    /// The transfer manager does not check part sizes. S3 requires every part except the
+    /// highest-numbered one to be at least 5 MiB; a smaller part is uploaded, and the upload fails
+    /// when S3 rejects `CompleteMultipartUpload`. [`StreamContext::part_size`] is the size the
+    /// transfer manager uses for its own parts.
     ///
     /// Each part's number is its position in the object, between 1 and 10,000, unique within the
     /// upload, and best numbered 1 to N without gaps. Parts may be returned in any order (see
@@ -445,23 +453,19 @@ pub trait PartStream {
     /// it must describe the complete sequence of parts returned before end-of-stream.
     fn size_hint(&self) -> crate::io::SizeHint;
 
-    /// If you calculated the full object checksum while streaming, return it.
-    /// This will be sent to S3 for validation against the checksum it calculated server side.
+    /// Returns the object's expected checksum, if the stream has one.
     ///
-    /// If None is returned (the default implementation), S3 will not do this additional validation.
+    /// The value is sent on `CompleteMultipartUpload`, and S3 rejects the upload unless the object
+    /// matches it. `None` (the default implementation) sends no expected value.
     ///
-    /// This function is called once, after [`PartStream::poll_part()`] yields the final part,
-    /// if and only if you used a
-    /// [`ChecksumStrategy`](crate::operation::upload::ChecksumStrategy) with
-    /// [`ChecksumType::FullObject`](crate::model::ChecksumType) and didn't set its
-    /// [`full_object_checksum`](crate::operation::upload::ChecksumStrategy::full_object_checksum)
-    /// value up front.
+    /// Called once, after [`PartStream::poll_part()`] yields the final part, and only when the
+    /// upload's [`ChecksumStrategy`](crate::types::ChecksumStrategy) is
+    /// [full object](crate::types::ChecksumStrategy::full_object) and has no value set with
+    /// [`ChecksumStrategy::with_expected_value`](crate::types::ChecksumStrategy::with_expected_value).
     ///
-    /// Return the base64 encoding of the big-endian checksum value of the full object's data,
-    /// using the algorithm specified in the
-    /// [`ChecksumStrategy`](crate::operation::upload::ChecksumStrategy)).
-    /// The value must cover the object's bytes in part-number order, which is the order S3
-    /// assembles them in, not necessarily the order the parts were returned.
+    /// Return the base64 encoding of the big-endian checksum of the object's data in the
+    /// strategy's algorithm. The value must cover the object's bytes in part-number order, which
+    /// is the order S3 assembles them in, not necessarily the order the parts were returned.
     fn full_object_checksum(&self) -> Option<String> {
         None
     }

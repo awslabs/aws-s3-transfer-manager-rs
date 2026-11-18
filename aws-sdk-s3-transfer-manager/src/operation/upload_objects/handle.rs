@@ -18,14 +18,17 @@ use crate::transfer::StateMachineTerminalReceiver;
 /// **Handles should be kept until the transfer completes or is explicitly cancelled.**
 /// The recommended pattern is to call [`join`](Self::join) to wait for completion:
 ///
-/// ```ignore
-/// let handle = tm.upload_objects()
+/// ```no_run
+/// # async fn example(client: &aws_sdk_s3_transfer_manager::Client) -> Result<(), aws_sdk_s3_transfer_manager::error::Error> {
+/// let handle = client
+///     .upload_objects()
 ///     .bucket("my-bucket")
 ///     .source("/path/to/dir")
 ///     .initiate()?;
 ///
 /// let output = handle.join().await?;
 /// println!("uploaded {} objects", output.objects_uploaded());
+/// # Ok(()) }
 /// ```
 ///
 /// # Cancellation

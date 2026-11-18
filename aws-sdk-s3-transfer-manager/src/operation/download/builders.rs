@@ -42,6 +42,10 @@ impl DownloadFluentBuilder {
     /// is deleted on failure, cancellation, or drop. The destination has the
     /// exact downloaded length.
     ///
+    /// A file already at `path` is replaced when the download succeeds. It is
+    /// unchanged until then, and left unchanged when the download fails or is
+    /// cancelled.
+    ///
     /// Successful completion means every byte was accepted by the operating
     /// system and the temporary file was renamed. It does not call `sync_data`,
     /// `sync_all`, or synchronize the parent directory, and therefore does not

@@ -6,8 +6,9 @@
 //! Version-coupled integrations with managed execution.
 //!
 //! Available with the non-default `__unstable_ext` feature. This module's contract
-//! is experimental and may change independently of the ordinary TM API. Use
-//! an adapter release constrained to the supported TM and execution versions.
+//! is experimental and may change independently of the ordinary transfer
+//! manager API. Use an adapter release constrained to the supported transfer
+//! manager and execution versions.
 
 /// Transfers an existing managed runtime into transfer-manager configuration.
 ///

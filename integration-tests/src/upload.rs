@@ -13,8 +13,8 @@ use aws_sdk_s3_transfer_manager::config::PartSize;
 use aws_sdk_s3_transfer_manager::config::RuntimeConfig;
 use aws_sdk_s3_transfer_manager::config::S3ClientConfig;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
-use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
 use aws_sdk_s3_transfer_manager::types::ByteSize;
+use aws_sdk_s3_transfer_manager::types::{checksum::Crc32, ChecksumStrategy};
 use s3_mock_server::S3MockServer;
 use tokio::sync::mpsc;
 
@@ -346,7 +346,7 @@ async fn test_part_checksum_over_different_bytes_fails_before_complete() {
         .upload()
         .bucket("test-bucket")
         .key("mismatched-checksum")
-        .checksum_strategy(ChecksumStrategy::with_calculated_crc32())
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32))
         .body(InputStream::from_part_stream(SinglePart {
             part: Some(part),
             size_hint: SizeHint::exact(sent.len() as u64),

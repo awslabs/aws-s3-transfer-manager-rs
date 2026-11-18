@@ -21,6 +21,10 @@ use super::{DownloadObjectsHandle, DownloadObjectsInputBuilder};
 /// objects, and each object is written at its full key under the destination.
 /// See [`DownloadObjectsInput`](super::DownloadObjectsInput) for the full
 /// rules.
+///
+/// See [`Client::download_objects`](crate::Client::download_objects) for how
+/// each object is written to its destination and what a successful `join`
+/// does and does not guarantee about persistence.
 #[derive(Debug)]
 pub struct DownloadObjectsFluentBuilder {
     handle: Arc<crate::client::Handle>,

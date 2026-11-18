@@ -40,27 +40,38 @@ pub enum PartSize {
     Target(ByteSize),
 }
 
-/// How far a download may prefetch ahead of the consumer.
+/// How far a download fetches ahead of the data its consumer has taken.
 ///
-/// Read-ahead is speculative issuance: parts fetched before the consumer has read
-/// up to them. This bounds that speculation. It does not gate in-order delivery or
-/// override the memory budget; those are separate bounds.
+/// A download fetches parts concurrently and holds each one until the consumer
+/// takes it: a streamed body reads it, or a file destination writes it.
+/// Read-ahead limits how many parts one download fetches and holds before the
+/// consumer takes them. When the consumer falls that far behind, the download
+/// stops fetching new parts until the consumer takes more. The client's memory
+/// budget applies across all transfers in addition to this limit.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ReadAhead {
-    /// Read ahead as far as available memory allows.
+    /// A limit that doesn't slow a consumer that keeps pace, so the memory
+    /// budget is the bound in practice. This is the default.
     #[default]
     Auto,
 
-    /// Read ahead at most `n` parts beyond the consumer's position. `0` fetches only
-    /// the part the consumer is waiting on (no speculation). Still bounded by memory.
+    /// At most `n` parts beyond the one the consumer is waiting for; `0`
+    /// fetches only that part, one at a time.
+    ///
+    /// Use a small value when a consumer may stop reading early or reads
+    /// slowly. Change it while a download runs with
+    /// [`DownloadIoCtl::set_read_ahead`](crate::operation::download::DownloadIoCtl::set_read_ahead).
     Parts(usize),
 }
 
 /// S3 client configuration for the transfer manager.
 ///
-/// The transfer manager builds its S3 client from shared AWS configuration,
-/// preserving configured HTTP and supplying managed transport when HTTP is absent.
+/// The transfer manager builds its S3 client from this configuration and keeps
+/// any HTTP client the configuration sets. With no HTTP client configured, managed execution
+/// supplies the transfer manager's transport and
+/// [`RuntimeConfig::multi_thread_tokio`] uses the SDK default; see
+/// [`RuntimeConfig`](RuntimeConfig#http-transport).
 ///
 /// With the `sdk-v1` feature, this also converts from
 /// `aws_sdk_s3::config::Builder` for S3-specific configuration.

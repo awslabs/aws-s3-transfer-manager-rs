@@ -16,7 +16,7 @@
 
 use aws_sdk_s3::types::ChecksumType;
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData};
-use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
+use aws_sdk_s3_transfer_manager::types::{checksum::Crc32, ChecksumStrategy};
 
 use crate::assertions::describe_error;
 use crate::harness::{target_tests, ClientOptions, Target, TmTestClient};
@@ -133,7 +133,9 @@ async fn provided_full_object_put(target: Target) {
         .upload()
         .bucket(t.bucket())
         .key(t.key(KEY))
-        .checksum_strategy(ChecksumStrategy::with_crc32(provided.value.clone()))
+        .checksum_strategy(
+            ChecksumStrategy::full_object(Crc32).with_expected_value(provided.value.clone()),
+        )
         .body(InputStream::from(object_bytes(SEED, object.len as usize)))
         .initiate()
         .expect("initiate upload")
@@ -164,7 +166,9 @@ async fn provided_full_object_mpu(target: Target) {
         .upload()
         .bucket(t.bucket())
         .key(t.key(KEY))
-        .checksum_strategy(ChecksumStrategy::with_crc32(provided.value.clone()))
+        .checksum_strategy(
+            ChecksumStrategy::full_object(Crc32).with_expected_value(provided.value.clone()),
+        )
         .body(InputStream::from(object_bytes(SEED, object.len as usize)))
         .initiate()
         .expect("initiate upload")
@@ -198,7 +202,7 @@ async fn part_checksum_mismatch_aborts_upload(target: Target) {
         .upload()
         .bucket(t.bucket())
         .key(t.key(KEY))
-        .checksum_strategy(ChecksumStrategy::with_calculated_crc32())
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32))
         .body(InputStream::from_part_stream(PrebuiltParts::new(
             parts,
             6 * PART,
@@ -257,11 +261,13 @@ async fn provided_full_object_mismatch_put(target: Target) {
         .upload()
         .bucket(t.bucket())
         .key(t.key(KEY))
-        .checksum_strategy(ChecksumStrategy::with_crc32(checksum_of(
-            Alg::Crc32,
-            OTHER_SEED,
-            len,
-        )))
+        .checksum_strategy(
+            ChecksumStrategy::full_object(Crc32).with_expected_value(checksum_of(
+                Alg::Crc32,
+                OTHER_SEED,
+                len,
+            )),
+        )
         .body(InputStream::from(object_bytes(SEED, len as usize)))
         .initiate()
         .expect("initiate upload")
@@ -287,11 +293,13 @@ async fn provided_full_object_mismatch_mpu(target: Target) {
         .upload()
         .bucket(t.bucket())
         .key(t.key(KEY))
-        .checksum_strategy(ChecksumStrategy::with_crc32(checksum_of(
-            Alg::Crc32,
-            OTHER_SEED,
-            len,
-        )))
+        .checksum_strategy(
+            ChecksumStrategy::full_object(Crc32).with_expected_value(checksum_of(
+                Alg::Crc32,
+                OTHER_SEED,
+                len,
+            )),
+        )
         .body(InputStream::from(object_bytes(SEED, len as usize)))
         .initiate()
         .expect("initiate upload")

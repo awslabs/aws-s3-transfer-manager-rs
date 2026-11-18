@@ -120,3 +120,8 @@ pub use error::{BindError, BindErrorKind, DetectError};
 pub use placement::Placement;
 pub use resource::{LogicalProcessor, LogicalProcessorId, NumaNode, NumaNodeId};
 pub use topology::Topology;
+
+/// Compiles the package README's examples as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

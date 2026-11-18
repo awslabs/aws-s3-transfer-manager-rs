@@ -76,8 +76,6 @@ impl DirEntry {
 
 type FilterFn = Arc<dyn Fn(&DirEntry) -> bool + Send + Sync>;
 
-/// Configuration for walking a local filesystem directory.
-///
 /// Configuration for walking a local directory tree.
 ///
 /// Describes what to look for and how (depth, symlink policy, sorting,
@@ -306,14 +304,10 @@ impl FsWalkerBuilder {
     /// Enable lexicographic sorting of entries within each directory.
     ///
     /// When `true`, files and subdirectories from each directory read are
-    /// sorted by full path. Entries are sorted *within* a directory level
-    /// but not globally. Depth-first traversal produces entries
-    /// level-by-level.
+    /// sorted by full path. The walk is breadth-first, so entries are produced
+    /// one directory level at a time and are not sorted globally.
     ///
     /// When `false` (default), entries are returned in OS-native order.
-    ///
-    /// Sort is required for `sync`-style operations that merge-join against
-    /// `ListObjectsV2` results (which are UTF-8 binary sorted by key).
     #[must_use]
     pub fn sort(mut self, sort: bool) -> Self {
         self.sort = sort;
@@ -348,6 +342,8 @@ impl FsWalkerBuilder {
     /// walker to descend into and stat every file in that subtree. For
     /// performance on trees with large excludable subtrees (e.g. `.git/`,
     /// `node_modules/`), compose multiple walks rooted at smaller subtrees.
+    ///
+    /// Each call replaces any previously set filter.
     #[must_use]
     pub fn filter(mut self, f: impl Fn(&DirEntry) -> bool + Send + Sync + 'static) -> Self {
         self.filter = Some(Arc::new(f));
@@ -1214,7 +1210,7 @@ mod tests {
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
-    async fn test_walk_recursive_sort_is_depth_first_per_dir() {
+    async fn test_walk_recursive_sort_is_breadth_first_per_dir() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("c-file.txt"), "").unwrap();
         fs::write(dir.path().join("b-file.txt"), "").unwrap();

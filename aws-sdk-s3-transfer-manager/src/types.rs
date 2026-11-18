@@ -8,6 +8,10 @@ use std::ops;
 use std::str::FromStr;
 use std::time::Duration;
 
+pub mod checksum;
+mod checksum_strategy;
+pub use checksum_strategy::ChecksumStrategy;
+
 pub use crate::model::builders;
 pub use crate::model::{
     ArchiveStatus, ChecksumAlgorithm, ChecksumMode, ChecksumType, ChunkMetadata, DownloadInput,
@@ -50,7 +54,13 @@ pub struct AbortedUpload {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AbortOutcome {
-    /// The upload was stopped before S3 completes the object.
+    /// The abort stopped the upload, and the transfer manager did not observe S3 store the
+    /// object.
+    ///
+    /// S3 may still have stored it: a PutObject interrupted by the abort may have completed in
+    /// S3, and a CompleteMultipartUpload retried after an earlier attempt committed can be
+    /// answered with `NoSuchUpload`. Check for the object, for example with HeadObject, when
+    /// this matters.
     #[default]
     Cancelled,
     /// S3 finished storing the object before the abort took effect. The object is not
@@ -100,8 +110,8 @@ pub enum FailedTransferPolicy {
     /// Abort the transfer on any individual failure to upload or download an object
     #[default]
     Abort,
-    /// Continue the transfer. Any failure will be logged and the details of all failed
-    /// objects will be available in the output after the transfer completes.
+    /// Continue the transfer. The details of each failed object are available in the output
+    /// after the transfer completes.
     Continue,
 }
 
@@ -243,6 +253,11 @@ pub struct IntegrityChecks {
     checksum_crc64_nvme: Option<String>,
     checksum_sha1: Option<String>,
     checksum_sha256: Option<String>,
+    checksum_sha512: Option<String>,
+    checksum_md5: Option<String>,
+    checksum_xxhash64: Option<String>,
+    checksum_xxhash3: Option<String>,
+    checksum_xxhash128: Option<String>,
     checksum_type: Option<crate::model::ChecksumType>,
     checksum_validation: ChecksumValidation,
 }
@@ -276,6 +291,31 @@ impl IntegrityChecks {
     /// The base64-encoded SHA-256 checksum reported by S3, if present.
     pub fn checksum_sha256(&self) -> Option<&str> {
         self.checksum_sha256.as_deref()
+    }
+
+    /// The base64-encoded SHA-512 checksum reported by S3, if present.
+    pub fn checksum_sha512(&self) -> Option<&str> {
+        self.checksum_sha512.as_deref()
+    }
+
+    /// The base64-encoded MD5 checksum reported by S3, if present.
+    pub fn checksum_md5(&self) -> Option<&str> {
+        self.checksum_md5.as_deref()
+    }
+
+    /// The base64-encoded XXHASH64 checksum reported by S3, if present.
+    pub fn checksum_xxhash64(&self) -> Option<&str> {
+        self.checksum_xxhash64.as_deref()
+    }
+
+    /// The base64-encoded XXHASH3 checksum reported by S3, if present.
+    pub fn checksum_xxhash3(&self) -> Option<&str> {
+        self.checksum_xxhash3.as_deref()
+    }
+
+    /// The base64-encoded XXHASH128 checksum reported by S3, if present.
+    pub fn checksum_xxhash128(&self) -> Option<&str> {
+        self.checksum_xxhash128.as_deref()
     }
 
     /// The object's checksum type (full-object vs composite), if reported.
@@ -339,22 +379,27 @@ pub enum NotValidatedReason {
 }
 
 impl IntegrityChecks {
-    /// Build from the object's reported checksum fields and a resolved verdict.
+    /// Build from the checksum values of `values`, the object's reported checksum
+    /// type and a resolved verdict. `None` reports no checksum values.
     pub(crate) fn new(
-        checksum_crc32: Option<String>,
-        checksum_crc32c: Option<String>,
-        checksum_crc64_nvme: Option<String>,
-        checksum_sha1: Option<String>,
-        checksum_sha256: Option<String>,
+        values: Option<&crate::model::ObjectMetadata>,
         checksum_type: Option<crate::model::ChecksumType>,
         checksum_validation: ChecksumValidation,
     ) -> Self {
+        let value = |f: fn(&crate::model::ObjectMetadata) -> &Option<String>| {
+            values.and_then(|m| f(m).clone())
+        };
         Self {
-            checksum_crc32,
-            checksum_crc32c,
-            checksum_crc64_nvme,
-            checksum_sha1,
-            checksum_sha256,
+            checksum_crc32: value(|m| &m.checksum_crc32),
+            checksum_crc32c: value(|m| &m.checksum_crc32_c),
+            checksum_crc64_nvme: value(|m| &m.checksum_crc64_nvme),
+            checksum_sha1: value(|m| &m.checksum_sha1),
+            checksum_sha256: value(|m| &m.checksum_sha256),
+            checksum_sha512: value(|m| &m.checksum_sha512),
+            checksum_md5: value(|m| &m.checksum_md5),
+            checksum_xxhash64: value(|m| &m.checksum_xxhash64),
+            checksum_xxhash3: value(|m| &m.checksum_xxhash3),
+            checksum_xxhash128: value(|m| &m.checksum_xxhash128),
             checksum_type,
             checksum_validation,
         }

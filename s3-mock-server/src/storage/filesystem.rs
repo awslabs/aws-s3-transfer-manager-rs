@@ -98,15 +98,15 @@ where
 /// ```text
 /// root/
 /// ├── my-bucket/
-/// │   ├── objects/
-/// │   │   ├── my-file.txt              # Object data
-/// │   │   └── my-file.txt.metadata     # Object metadata (JSON)
-/// │   └── uploads/
-/// │       ├── upload-123/
-/// │       │   ├── metadata.json        # Upload metadata
-/// │       │   ├── part-1.dat          # Part data
-/// │       │   └── part-1.metadata     # Part metadata
-/// │       └── ...
+/// │   └── objects/
+/// │       ├── my-file.txt              # Object data
+/// │       └── my-file.txt.metadata     # Object metadata (JSON)
+/// └── uploads/
+///     ├── upload-123/
+///     │   ├── metadata.json            # Upload metadata
+///     │   ├── part-1.dat               # Part data
+///     │   └── part-1.metadata          # Part metadata
+///     └── ...
 /// ```
 #[derive(Debug)]
 pub(crate) struct FilesystemStorage {

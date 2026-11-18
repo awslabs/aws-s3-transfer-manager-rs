@@ -10,7 +10,8 @@ use std::task::{Context, Poll};
 
 use aws_sdk_s3::types::{ChecksumMode, ChecksumType};
 use aws_sdk_s3_transfer_manager::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
-use aws_sdk_s3_transfer_manager::operation::upload::ChecksumStrategy;
+use aws_sdk_s3_transfer_manager::types::checksum::{Crc32, Crc32C, Crc64Nvme, Sha1, Sha256};
+use aws_sdk_s3_transfer_manager::types::ChecksumStrategy;
 
 use crate::assertions::{describe_error, describe_sdk_error};
 use crate::harness::{ClientOptions, TmTestClient};
@@ -209,20 +210,16 @@ impl Object {
     fn strategy(&self) -> Option<ChecksumStrategy> {
         Some(match (self.layout, self.alg) {
             (_, Alg::NoChecksum) => return None,
-            (Layout::Composite, Alg::Crc32) => {
-                ChecksumStrategy::with_calculated_crc32_composite_if_multipart()
-            }
-            (Layout::Composite, Alg::Crc32c) => {
-                ChecksumStrategy::with_calculated_crc32_c_composite_if_multipart()
-            }
-            (_, Alg::Crc32) => ChecksumStrategy::with_calculated_crc32(),
-            (_, Alg::Crc32c) => ChecksumStrategy::with_calculated_crc32_c(),
-            (_, Alg::Crc64Nvme) => ChecksumStrategy::with_calculated_crc64_nvme(),
+            (Layout::Composite, Alg::Crc32) => ChecksumStrategy::composite(Crc32),
+            (Layout::Composite, Alg::Crc32c) => ChecksumStrategy::composite(Crc32C),
+            (_, Alg::Crc32) => ChecksumStrategy::full_object(Crc32),
+            (_, Alg::Crc32c) => ChecksumStrategy::full_object(Crc32C),
+            (_, Alg::Crc64Nvme) => ChecksumStrategy::full_object(Crc64Nvme),
             (Layout::FullObject, Alg::Sha1 | Alg::Sha256) => {
                 panic!("S3 has no FULL_OBJECT SHA checksum: {self:?}")
             }
-            (_, Alg::Sha1) => ChecksumStrategy::with_calculated_sha1_composite_if_multipart(),
-            (_, Alg::Sha256) => ChecksumStrategy::with_calculated_sha256_composite_if_multipart(),
+            (_, Alg::Sha1) => ChecksumStrategy::composite(Sha1),
+            (_, Alg::Sha256) => ChecksumStrategy::composite(Sha256),
         })
     }
 

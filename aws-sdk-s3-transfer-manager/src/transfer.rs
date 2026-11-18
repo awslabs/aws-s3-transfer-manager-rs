@@ -1234,43 +1234,37 @@ impl TransferContext {
 
 /// Scheduling controls for a transfer.
 ///
-/// Provides methods to adjust how this transfer is scheduled relative to others.
-/// Obtained via [`UploadHandle::scheduling()`] or [`DownloadHandle::scheduling()`].
-///
-/// [`UploadHandle::scheduling()`]: crate::operation::upload::UploadHandle::scheduling
-/// [`DownloadHandle::scheduling()`]: crate::operation::download::DownloadHandle::scheduling
+/// Adjusts how this transfer is scheduled relative to other transfers.
+/// Obtained from the `scheduling` method of a transfer handle.
 #[derive(Debug)]
 pub struct SchedulingCtl<'a> {
     ctx: &'a TransferContext,
 }
 
 impl SchedulingCtl<'_> {
-    /// Set the priority of this transfer.
+    /// Sets the priority of this transfer.
     ///
-    /// Priority affects how work is scheduled relative to other transfers:
-    /// - Higher priority (255) = more work share, runs more often
-    /// - Lower priority (1) = less work share, runs less often
-    /// - Default priority is 128
-    ///
-    /// The scheduler uses CFS-style fair scheduling. Priority affects how fast
-    /// "virtual runtime" accumulates - higher priority transfers accumulate slower,
-    /// so they stay ahead in scheduling and get more work done.
+    /// Concurrent transfers receive work in proportion to their priorities.
+    /// The default is 128; 255 is the highest. `0` is treated as `1`. Applies
+    /// to work scheduled after the call.
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// let handle = tm.download()
+    /// ```no_run
+    /// # async fn example(client: &aws_sdk_s3_transfer_manager::Client) -> Result<(), aws_sdk_s3_transfer_manager::error::Error> {
+    /// let handle = client
+    ///     .download()
     ///     .bucket("my-bucket")
     ///     .key("my-key")
-    ///     .initiate()
-    ///     .await?;
+    ///     .initiate()?;
     ///
-    /// // Start as lower priority background transfer
+    /// // Start as a low-priority background transfer.
     /// handle.scheduling().set_priority(64);
     ///
-    /// // ...
-    /// // User requests this data - boost priority
+    /// // The data is now needed sooner; raise the priority.
     /// handle.scheduling().set_priority(255);
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn set_priority(&self, priority: u8) {
         self.ctx

@@ -848,23 +848,21 @@ impl crate::operation::upload::builders::UploadFluentBuilder {
     pub fn get_body(&self) -> &::std::option::Option<crate::io::InputStream> {
         self.inner.get_body()
     }
-    /// Checksum calculation or precalculated checksum policy.
-    pub fn checksum_strategy(mut self, input: crate::operation::upload::ChecksumStrategy) -> Self {
+    /// The checksums the upload sends: algorithm, multipart checksum type and an optional expected value. Without one, the upload uses [`ChecksumStrategy::default`](crate::types::ChecksumStrategy::default) when the S3 client's request checksum calculation is `WhenSupported`.
+    pub fn checksum_strategy(mut self, input: crate::types::ChecksumStrategy) -> Self {
         self.inner = self.inner.checksum_strategy(input);
         self
     }
-    /// Checksum calculation or precalculated checksum policy.
+    /// The checksums the upload sends: algorithm, multipart checksum type and an optional expected value. Without one, the upload uses [`ChecksumStrategy::default`](crate::types::ChecksumStrategy::default) when the S3 client's request checksum calculation is `WhenSupported`.
     pub fn set_checksum_strategy(
         mut self,
-        input: ::std::option::Option<crate::operation::upload::ChecksumStrategy>,
+        input: ::std::option::Option<crate::types::ChecksumStrategy>,
     ) -> Self {
         self.inner = self.inner.set_checksum_strategy(input);
         self
     }
-    /// Checksum calculation or precalculated checksum policy.
-    pub fn get_checksum_strategy(
-        &self,
-    ) -> &::std::option::Option<crate::operation::upload::ChecksumStrategy> {
+    /// The checksums the upload sends: algorithm, multipart checksum type and an optional expected value. Without one, the upload uses [`ChecksumStrategy::default`](crate::types::ChecksumStrategy::default) when the S3 client's request checksum calculation is `WhenSupported`.
+    pub fn get_checksum_strategy(&self) -> &::std::option::Option<crate::types::ChecksumStrategy> {
         self.inner.get_checksum_strategy()
     }
     /// How to handle a failed multipart upload.

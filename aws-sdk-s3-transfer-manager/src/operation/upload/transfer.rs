@@ -46,7 +46,8 @@ use crate::error::{Error, ErrorKind};
 use crate::io::part_reader::{Builder as PartReaderBuilder, PartReadStart};
 use crate::io::{InputStream, PartData, SizeHint};
 use crate::operation::upload::context::{
-    apply_content_length, validate_content_md5_for_multipart, validate_distinct_part_numbers,
+    apply_content_length, validate_composite_expected_value_for_multipart,
+    validate_content_md5_for_multipart, validate_distinct_part_numbers,
     validate_part_checksum_has_strategy, validate_part_number, validate_size_hint,
     AbortMpuProgress, MultipartCompletion, PartPlan, PartReadWake, PartTransferState,
     PendingPartRead, UploadFailure, UploadPartWork, UploadState,
@@ -236,6 +237,8 @@ impl UploadTransfer {
             ctx.handle.mpu_threshold_bytes(),
         ) {
             validate_content_md5_for_multipart(&request).map_err(crate::error::invalid_input)?;
+            validate_composite_expected_value_for_multipart(&request)
+                .map_err(crate::error::invalid_input)?;
         }
         let observability =
             UploadObservability::new(ctx.handle.config.diagnostics().transfer(), size_hint);
@@ -1685,11 +1688,12 @@ impl UploadTransfer {
     /// Handles a CompleteMultipartUpload error, or an error that stopped
     /// Complete from being sent.
     ///
-    /// During a caller's abort, `NoSuchUpload` means the abort won and no
-    /// object exists: S3 returns `NoSuchUpload` to a Complete sent after
-    /// AbortMultipartUpload, and 200 to a Complete retried after an earlier
-    /// one committed. Every other error, and any error outside an abort, fails
-    /// the transfer, which aborts the upload.
+    /// During a caller's abort, `NoSuchUpload` is taken to mean the abort won,
+    /// and the upload ends `Cancelled`: S3 returns `NoSuchUpload` to a Complete
+    /// sent after AbortMultipartUpload. It does not prove that no object
+    /// exists: a Complete retried after an earlier attempt committed can also
+    /// be answered with `NoSuchUpload`. Every other error, and any error
+    /// outside an abort, fails the transfer, which aborts the upload.
     fn complete_mpu_failed(&self, error: Error) -> WorkOutcome {
         let no_such_upload = error.code() == Some("NoSuchUpload");
         let mut state = self.inner.state.lock().expect("lock poisoned");

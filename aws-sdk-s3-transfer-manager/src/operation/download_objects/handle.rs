@@ -31,6 +31,11 @@ impl DownloadObjectsHandle {
     /// [`FailedTransferPolicy::Abort`](crate::types::FailedTransferPolicy::Abort),
     /// returns the error that triggered the abort. When cancelled, returns
     /// `ErrorKind::OperationCancelled`.
+    ///
+    /// Objects renamed into place before a failure or cancellation remain, as
+    /// do directories the transfer created. See
+    /// [`Client::download_objects`](crate::Client::download_objects) for how
+    /// objects are written and what success guarantees.
     pub async fn join(mut self) -> Result<DownloadObjectsOutput, Error> {
         if let Some(rx) = self.completion_rx.take() {
             let _ = rx.await;

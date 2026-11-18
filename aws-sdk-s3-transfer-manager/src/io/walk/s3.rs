@@ -17,7 +17,7 @@ type FilterFn = Arc<dyn Fn(&Object) -> bool + Send + Sync>;
 enum S3WalkServiceClient {
     /// Standalone walks retain the transfer manager and its managed runtime.
     TransferManager(crate::Client),
-    /// SDK client without a TM owner. Internal transfers use this to avoid a
+    /// SDK client without a transfer manager owner. Internal transfers use this to avoid a
     /// cycle through the scheduler; SDK interoperability callers own any
     /// custom transport's runtime separately.
     Provided(aws_sdk_s3::Client),
@@ -229,9 +229,11 @@ impl S3WalkerBuilder {
 
     /// Set a filter predicate applied to each discovered object.
     ///
-    /// The predicate receives a [`crate::model::Object`] containing the
-    /// metadata returned by `ListObjectsV2`. Returning `false` drops the
-    /// object silently.
+    /// The predicate receives an [`Object`] containing the metadata returned
+    /// by `ListObjectsV2`. Returning `false` drops the object silently.
+    ///
+    /// The filter applies only to objects; with a delimiter set, the walker
+    /// still lists every common prefix.
     ///
     /// Each call replaces any previously set filter. 0-byte folder markers
     /// (keys ending in `/`) are skipped before the filter runs.
@@ -340,7 +342,7 @@ impl S3WalkContextBuilder {
         self.sdk_client(client)
     }
 
-    // Directory transfers already belong to a TM handle. Retaining that handle
+    // Directory transfers already belong to a transfer manager handle. Retaining that handle
     // here would form a cycle through the scheduler and transfer.
     pub(crate) fn sdk_client(mut self, client: aws_sdk_s3::Client) -> Self {
         self.client = Some(S3WalkServiceClient::Provided(client));
@@ -374,7 +376,7 @@ impl S3WalkContextBuilder {
 /// A running S3 walk, yielding objects from a bucket listing.
 ///
 /// Created by [`S3Walker::walk`]. The walk pages through the bucket,
-/// buffering [`crate::model::Object`] values and yielding them via
+/// buffering [`Object`] values and yielding them via
 /// [`next`](Self::next).
 pub struct S3Walk {
     config: S3Walker,
@@ -401,7 +403,7 @@ impl std::fmt::Debug for S3Walk {
 }
 
 impl S3Walk {
-    /// Return the next [`crate::model::Object`] from the walk.
+    /// Return the next [`Object`] from the walk.
     ///
     /// Returns:
     /// - `Some(Ok(object))` for an object that passed the filter.

@@ -53,7 +53,7 @@ class MemberPolicyTest {
         val runtimeFields = listOf(
             Triple("download_input", "read_ahead", "crate::config::ReadAhead"),
             Triple("upload_input", "body", "crate::io::InputStream"),
-            Triple("upload_input", "checksum_strategy", "crate::operation::upload::ChecksumStrategy"),
+            Triple("upload_input", "checksum_strategy", "crate::types::ChecksumStrategy"),
             Triple("upload_input", "failed_multipart_upload_policy", "crate::types::FailedMultipartUploadPolicy"),
             Triple("upload_output", "metrics", "crate::metrics::TransferMetrics"),
         )

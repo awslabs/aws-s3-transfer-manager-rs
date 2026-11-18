@@ -129,9 +129,12 @@ impl ConfigLoader {
     ///
     /// Without [`s3_config`](Self::s3_config), the S3 client configuration is
     /// loaded from the shared AWS configuration sources with the latest
-    /// behavior version. Machine detection always runs. Where local DMI does
-    /// not identify the host, it makes one EC2 instance metadata (IMDS)
-    /// request with a short timeout, unless `AWS_EC2_METADATA_DISABLED` is `true`.
+    /// behavior version. Machine detection always runs. Where local DMI can't
+    /// identify the host, as on every non-Linux host and in containers without
+    /// DMI, `load` makes one EC2 instance metadata (IMDS) lookup: a single
+    /// attempt with 500 ms connect and read timeouts. Setting
+    /// `AWS_EC2_METADATA_DISABLED` to `true`, `1`, `yes` or `on`
+    /// (case-insensitive) suppresses it.
     pub async fn load(self) -> Config {
         let s3_config = match self.s3_config {
             Some(config) => config,

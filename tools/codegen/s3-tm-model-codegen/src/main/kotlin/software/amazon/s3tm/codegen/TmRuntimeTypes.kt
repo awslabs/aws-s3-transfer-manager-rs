@@ -10,7 +10,7 @@ import software.amazon.smithy.rust.codegen.core.smithy.RuntimeType
 object TmRuntimeTypes {
     val inputStream = RuntimeType("crate::io::InputStream")
     val readAhead = RuntimeType("crate::config::ReadAhead")
-    val checksumStrategy = RuntimeType("crate::operation::upload::ChecksumStrategy")
+    val checksumStrategy = RuntimeType("crate::types::ChecksumStrategy")
     val failedMultipartUploadPolicy = RuntimeType("crate::types::FailedMultipartUploadPolicy")
     val transferMetrics = RuntimeType("crate::metrics::TransferMetrics")
     val uploadFluentBuilder = RuntimeType("crate::operation::upload::builders::UploadFluentBuilder")

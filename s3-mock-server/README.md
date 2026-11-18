@@ -1,18 +1,18 @@
 # S3 Mock Server
 
-A mock S3 server for testing and benchmarking the AWS S3 Transfer Manager.
+A mock S3 server for testing and benchmarking Transfer Manager for Amazon S3.
 
 ## Overview
 
-The S3 Mock Server provides a local HTTP server that implements the S3 API operations required by the Transfer Manager, allowing for comprehensive testing of concurrent operations, error handling, and performance characteristics.
+The S3 Mock Server provides a local HTTP server that implements the S3 API operations required by the transfer manager, allowing for comprehensive testing of concurrent operations, error handling, and performance characteristics.
 
 ## Features
 
-- Support for all S3 API operations used by the Transfer Manager
+- Support for all S3 API operations used by the transfer manager
 - Multiple storage backends (in-memory and filesystem)
 - Object and upload inspection capabilities
 - Network simulation options
-- Integration with AWS S3 Transfer Manager
+- Integration with Transfer Manager for Amazon S3
 
 ## Usage
 
@@ -33,32 +33,34 @@ address buckets path-style.
 
 ### Basic Setup
 
-```rust
-use s3_mock_server::S3MockServer;
+```rust,no_run
 use aws_sdk_s3::primitives::ByteStream;
+use s3_mock_server::S3MockServer;
 
 #[tokio::test]
 async fn test_with_mock_server() -> Result<(), Box<dyn std::error::Error>> {
     // Create a mock S3 server with in-memory storage
     let server = S3MockServer::builder()
         .with_in_memory_store()
-        .with_port(9000)  // Optional: specify port
+        .with_port(9000) // Optional: specify port
         .build()?;
 
     // Start the server, and create the bucket the test uses
     let handle = server.start().await?;
-    server.create_bucket("test-bucket").await?;
-    
+    let bucket = "test-bucket";
+    let key = "test-key";
+    server.create_bucket(bucket).await?;
+
     // Get an S3 client configured for the mock server
     let s3_client = handle.client().await;
-    
+
     let content = "Hello mock S3";
-    
+
     // Use the client with AWS SDK to upload an object
     s3_client
         .put_object()
-        .bucket("test-bucket")
-        .key("test-key")
+        .bucket(bucket)
+        .key(key)
         .body(ByteStream::from_static(content.as_bytes()))
         .send()
         .await?;
@@ -80,38 +82,34 @@ async fn test_with_mock_server() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### With Transfer Manager
+### With the Transfer Manager
 
-```rust
+```rust,ignore
+use aws_sdk_s3_transfer_manager::io::InputStream;
+use aws_sdk_s3_transfer_manager::{Client, Config};
 use s3_mock_server::S3MockServer;
-use aws_sdk_s3_transfer_manager::{Config, Client};
-use std::path::Path;
 
 #[tokio::test]
 async fn test_transfer_manager_integration() -> Result<(), Box<dyn std::error::Error>> {
     // Create mock server
-    let server = S3MockServer::builder()
-        .with_in_memory_store()
-        .build()?;
-    
+    let server = S3MockServer::builder().with_in_memory_store().build()?;
+
     let handle = server.start().await?;
     server.create_bucket("test-bucket").await?;
-    let s3_client = handle.client().await;
 
-    // Create Transfer Manager with mock server client
+    // Create a transfer manager client for the mock server
     let tm_config = Config::builder()
-        .client(s3_client)
+        .s3_config(&handle.shared_config().await)
         .build()?;
     let tm = Client::new(tm_config);
 
-    // Use Transfer Manager for uploads/downloads
+    // Use the transfer manager for uploads/downloads
     let upload_handle = tm
         .upload()
         .bucket("test-bucket")
         .key("large-file.dat")
-        .body(Path::new("/path/to/large/file"))
-        .send()
-        .await?;
+        .body(InputStream::from_path("/path/to/large/file")?)
+        .initiate()?;
 
     upload_handle.join().await?;
 
@@ -121,25 +119,24 @@ async fn test_transfer_manager_integration() -> Result<(), Box<dyn std::error::E
 
 ### Filesystem Storage
 
-```rust
+```rust,no_run
 use s3_mock_server::S3MockServer;
 use tempfile::TempDir;
 
 #[tokio::test]
 async fn test_filesystem_storage() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new()?;
-    
+
     let server = S3MockServer::builder()
         .with_local_dir_store(temp_dir.path())
         .await?
         .build()?;
-    
-    let handle = server.start().await?;
-    let s3_client = handle.client().await;
+
+    let _handle = server.start().await?;
 
     // Objects will be persisted to the filesystem
-    // Directory structure: temp_dir/objects/, temp_dir/uploads/
-    
+    // Directory structure: temp_dir/<bucket>/objects/, temp_dir/uploads/
+
     Ok(())
 }
 ```
@@ -237,20 +234,24 @@ checksum algorithms. `list_multipart_uploads` reports the multipart uploads in p
 The server counts the requests it receives per operation, and can fail or reshape the requests a
 `FaultTarget` matches:
 
-```rust
-use s3_mock_server::{Error, FaultTarget, FaultType, Occurrence, Operation};
+```rust,no_run
+use s3_mock_server::{Error, FaultTarget, FaultType, Occurrence, Operation, S3MockServer};
 
-// Fail the second HeadObject request for `key` that the target sees with 403 AccessDenied.
-server.insert_fault_for(
-    FaultTarget::operation(Operation::HeadObject).bucket("test-bucket").key("key"),
-    FaultType::Error(Error::AccessDenied),
-    1,
-    Occurrence::Once,
-);
+fn fail_second_head_object(server: &S3MockServer) {
+    // Fail the second HeadObject request for `key` that the target sees with 403 AccessDenied.
+    server.insert_fault_for(
+        FaultTarget::operation(Operation::HeadObject)
+            .bucket("test-bucket")
+            .key("key"),
+        FaultType::Error(Error::AccessDenied),
+        1,
+        Occurrence::Once,
+    );
 
-// ... run the code under test ...
+    // ... run the code under test ...
 
-assert_eq!(server.request_count(Operation::HeadObject), 2);
+    assert_eq!(server.request_count(Operation::HeadObject), 2);
+}
 ```
 
 `insert_fault(bucket, key, ..)` targets the GetObject, PutObject and UploadPart requests for one

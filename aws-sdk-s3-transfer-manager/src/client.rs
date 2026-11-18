@@ -449,7 +449,7 @@ impl Client {
     ///
     ///     // initiate() will return before the transfer is complete.
     ///     // Call the `join()` method on the returned handle to drive the transfer to completion.
-    ///     // The handle can also be used to get progress, pause, or cancel the transfer, etc.
+    ///     // The handle also reports status and metrics, adjusts scheduling, and aborts the transfer.
     ///     let response = handle.join().await?;
     ///     // ... do something with response
     ///     Ok(())
@@ -484,7 +484,8 @@ impl Client {
     ///
     ///     // initiate() will return before the transfer is complete.
     ///     // Call the `join()` method on the returned handle to drive the transfer to completion.
-    ///     // The handle can also be used to get progress, pause, or cancel the transfer, etc.
+    ///     // The handle also exposes the object metadata and body, reports status and metrics,
+    ///     // adjusts scheduling and read-ahead, and aborts the transfer.
     ///     let response = handle.join().await?;
     ///     // ... do something with response
     ///     Ok(())
@@ -501,6 +502,15 @@ impl Client {
     /// paths. See [`DownloadObjectsInput`](crate::operation::download_objects::DownloadObjectsInput)
     /// for how keys map to paths.
     ///
+    /// Each object is written to a temporary file beside its destination path
+    /// and renamed into place when that object's download succeeds, replacing
+    /// any file already at that path. A successful `join` means the operating
+    /// system accepted every byte of each downloaded object and completed each
+    /// rename. The transfer manager does not call `sync_data` or `sync_all` on
+    /// the files, or synchronize any directory, including the directories it
+    /// creates, so success does not promise persistence across a system crash
+    /// or power loss.
+    ///
     /// Constructs a fluent builder for the
     /// [`DownloadObjects`](crate::operation::download_objects::builders::DownloadObjectsFluentBuilder) operation.
     ///
@@ -508,8 +518,9 @@ impl Client {
     /// ```no_run
     /// use std::path::PathBuf;
     /// use aws_sdk_s3_transfer_manager::error::Error;
+    /// use aws_sdk_s3_transfer_manager::io::walk::S3Walker;
     ///
-    /// async fn download_bucket(
+    /// async fn download_photos(
     ///     client: &aws_sdk_s3_transfer_manager::Client,
     ///     dest: PathBuf
     /// ) -> Result<(), Error> {
@@ -517,6 +528,7 @@ impl Client {
     ///     let handle = client
     ///         .download_objects()
     ///         .bucket("my-bucket")
+    ///         .walker(S3Walker::builder().prefix("photos/").build())
     ///         .destination(dest)
     ///         .initiate()?;
     ///
@@ -838,9 +850,10 @@ mod tests {
                     .upload()
                     .bucket("test-bucket")
                     .key("file")
-                    .checksum_strategy(crate::operation::upload::ChecksumStrategy::with_crc32(
-                        &checksum,
-                    ))
+                    .checksum_strategy(
+                        crate::types::ChecksumStrategy::full_object(crate::types::checksum::Crc32)
+                            .with_expected_value(&checksum),
+                    )
                     .body(crate::io::InputStream::from_path(file.path()).unwrap())
                     .initiate()
                     .unwrap();

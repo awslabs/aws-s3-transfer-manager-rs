@@ -165,9 +165,9 @@ pub struct UploadInput {
     /// Required: building an upload without a body fails. To upload an empty object, pass an empty body such as [`InputStream::from_static(b"")`](crate::io::InputStream::from_static).
     #[cfg(not(s3_tm_out_of_tree))]
     pub body: crate::io::InputStream,
-    /// Checksum calculation or precalculated checksum policy.
+    /// The checksums the upload sends: algorithm, multipart checksum type and an optional expected value. Without one, the upload uses [`ChecksumStrategy::default`](crate::types::ChecksumStrategy::default) when the S3 client's request checksum calculation is `WhenSupported`.
     #[cfg(not(s3_tm_out_of_tree))]
-    pub checksum_strategy: ::std::option::Option<crate::operation::upload::ChecksumStrategy>,
+    pub checksum_strategy: ::std::option::Option<crate::types::ChecksumStrategy>,
     /// How to handle a failed multipart upload.
     #[cfg(not(s3_tm_out_of_tree))]
     pub failed_multipart_upload_policy:
@@ -475,11 +475,9 @@ impl crate::model::UploadInput {
     pub fn body(&self) -> &crate::io::InputStream {
         &self.body
     }
-    /// Checksum calculation or precalculated checksum policy.
+    /// The checksums the upload sends: algorithm, multipart checksum type and an optional expected value. Without one, the upload uses [`ChecksumStrategy::default`](crate::types::ChecksumStrategy::default) when the S3 client's request checksum calculation is `WhenSupported`.
     #[cfg(not(s3_tm_out_of_tree))]
-    pub fn checksum_strategy(
-        &self,
-    ) -> ::std::option::Option<&crate::operation::upload::ChecksumStrategy> {
+    pub fn checksum_strategy(&self) -> ::std::option::Option<&crate::types::ChecksumStrategy> {
         self.checksum_strategy.as_ref()
     }
     /// How to handle a failed multipart upload.
@@ -560,7 +558,7 @@ pub struct UploadInputBuilder {
     #[cfg(not(s3_tm_out_of_tree))]
     pub(crate) body: ::std::option::Option<crate::io::InputStream>,
     #[cfg(not(s3_tm_out_of_tree))]
-    pub(crate) checksum_strategy: ::std::option::Option<crate::operation::upload::ChecksumStrategy>,
+    pub(crate) checksum_strategy: ::std::option::Option<crate::types::ChecksumStrategy>,
     #[cfg(not(s3_tm_out_of_tree))]
     pub(crate) failed_multipart_upload_policy:
         ::std::option::Option<crate::types::FailedMultipartUploadPolicy>,
@@ -1423,26 +1421,24 @@ impl UploadInputBuilder {
     pub fn get_body(&self) -> &::std::option::Option<crate::io::InputStream> {
         &self.body
     }
-    /// Checksum calculation or precalculated checksum policy.
+    /// The checksums the upload sends: algorithm, multipart checksum type and an optional expected value. Without one, the upload uses [`ChecksumStrategy::default`](crate::types::ChecksumStrategy::default) when the S3 client's request checksum calculation is `WhenSupported`.
     #[cfg(not(s3_tm_out_of_tree))]
-    pub fn checksum_strategy(mut self, input: crate::operation::upload::ChecksumStrategy) -> Self {
+    pub fn checksum_strategy(mut self, input: crate::types::ChecksumStrategy) -> Self {
         self.checksum_strategy = ::std::option::Option::Some(input);
         self
     }
-    /// Checksum calculation or precalculated checksum policy.
+    /// The checksums the upload sends: algorithm, multipart checksum type and an optional expected value. Without one, the upload uses [`ChecksumStrategy::default`](crate::types::ChecksumStrategy::default) when the S3 client's request checksum calculation is `WhenSupported`.
     #[cfg(not(s3_tm_out_of_tree))]
     pub fn set_checksum_strategy(
         mut self,
-        input: ::std::option::Option<crate::operation::upload::ChecksumStrategy>,
+        input: ::std::option::Option<crate::types::ChecksumStrategy>,
     ) -> Self {
         self.checksum_strategy = input;
         self
     }
-    /// Checksum calculation or precalculated checksum policy.
+    /// The checksums the upload sends: algorithm, multipart checksum type and an optional expected value. Without one, the upload uses [`ChecksumStrategy::default`](crate::types::ChecksumStrategy::default) when the S3 client's request checksum calculation is `WhenSupported`.
     #[cfg(not(s3_tm_out_of_tree))]
-    pub fn get_checksum_strategy(
-        &self,
-    ) -> &::std::option::Option<crate::operation::upload::ChecksumStrategy> {
+    pub fn get_checksum_strategy(&self) -> &::std::option::Option<crate::types::ChecksumStrategy> {
         &self.checksum_strategy
     }
     /// How to handle a failed multipart upload.
