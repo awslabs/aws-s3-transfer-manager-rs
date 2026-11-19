@@ -57,7 +57,7 @@ license-files = [
 # More documentation about the 'bans' section can be found here:
 # https://embarkstudios.github.io/cargo-deny/checks/bans/cfg.html
 [bans]
-multiple-versions = "allow"
+multiple-versions = "warn"
 wildcards = "deny" # Don't allow wildcard dependencies
 allow-wildcard-paths = true # Allow wildcard for path or git dependencies
 highlight = "all"
