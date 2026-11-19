@@ -26,7 +26,7 @@ aws-credential-types = "1.3.0"
 aws-smithy-managed-http = { version = "0.1.0", path = "crates/aws-smithy-managed-http" }
 aws-smithy-async = "1.3.0"
 aws-smithy-execution = { version = "0.1.0", path = "crates/aws-smithy-execution" }
-aws-config = { version = "1.13.0", default-features = false }
+aws-config = { version = "1.13.3", default-features = false }
 aws-runtime = "1.10.4"
 # aws-sdk-s3's `default` features minus `rustls`, `default-https-client`, `rt-tokio`, and `sigv4a`;
 # re-derive the list from upstream `default` when bumping the version. `rustls` enables the legacy
