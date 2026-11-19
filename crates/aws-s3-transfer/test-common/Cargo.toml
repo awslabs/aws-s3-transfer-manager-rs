@@ -6,7 +6,7 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-tempfile = "3.12.0"
-bytes = "1.9.0"
+tempfile = "3.27.0"
+bytes = "1.11.1"
 aws-s3-transfer = { path = "../../aws-s3-transfer", version = "1.0.0" }
-uuid = { version = "1.11.0", features = ["v4"] }
+uuid = { version = "1.23.2", features = ["v4"] }
