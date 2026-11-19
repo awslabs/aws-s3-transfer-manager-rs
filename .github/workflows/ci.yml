@@ -49,6 +49,7 @@ jobs:
       - clippy
       - docs
       - minrust
+      - package-files
       - sdk-floor
       - check-external-types
       - check-deny
@@ -690,6 +691,28 @@ jobs:
         run: cargo check --locked --workspace --all-features
         env:
           RUSTFLAGS: "" # remove -Dwarnings
+
+  package-files:
+    name: license files in published packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - name: Every publishable crate packages LICENSE and NOTICE
+        run: |
+          status=0
+          for crate in $(cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.publish != []) | .name'); do
+            files=$(cargo package --list --allow-dirty --offline -p "$crate")
+            for f in LICENSE NOTICE; do
+              grep -qx "$f" <<<"$files" || { echo "$crate: $f missing from package" >&2; status=1; }
+            done
+          done
+          exit $status
 
   sdk-floor:
     # Every other job builds the lockfile's aws-sdk-s3, which can be newer than
