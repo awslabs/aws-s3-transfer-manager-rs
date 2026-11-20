@@ -483,10 +483,10 @@ impl fmt::Display for Error {
                 write!(f, "service error")?;
                 if let Some(m) = self.service() {
                     write!(f, " calling {}", m.operation)?;
-                    match (
-                        self.http_status(),
-                        m.message.as_deref().or(m.code.as_deref()),
-                    ) {
+                    // Only a failed HeadObject carries no S3 code of its own, so only it
+                    // shows the status.
+                    let status = self.http_status().filter(|_| m.operation == "HeadObject");
+                    match (status, m.code.as_deref().or(m.message.as_deref())) {
                         (Some(status), Some(detail)) => write!(f, " ({status}: {detail})")?,
                         (Some(status), None) => write!(f, " ({status})")?,
                         (None, _) => {
@@ -935,7 +935,7 @@ mod tests {
                 None,
                 Some("InternalError"),
                 Some("Internal Server Error"),
-                "(500: Internal Server Error)",
+                "(500: InternalError)",
             ),
             (
                 503,
@@ -943,7 +943,7 @@ mod tests {
                 None,
                 Some("SlowDown"),
                 Some("Service Unavailable"),
-                "(503: Service Unavailable)",
+                "(503: SlowDown)",
             ),
             (
                 404,
@@ -951,7 +951,7 @@ mod tests {
                 None,
                 Some("NotFound"),
                 Some("Not Found"),
-                "(404: Not Found)",
+                "(404: NotFound)",
             ),
             (
                 403,
@@ -959,7 +959,7 @@ mod tests {
                 Some("denied"),
                 Some("AccessDenied"),
                 Some("denied"),
-                "(403: denied)",
+                "(403: AccessDenied)",
             ),
             (
                 503,
@@ -967,7 +967,7 @@ mod tests {
                 None,
                 Some("ServiceUnavailable"),
                 Some("Service Unavailable"),
-                "(503: Service Unavailable)",
+                "(503: ServiceUnavailable)",
             ),
             (418, None, None, None, None, "(418)"),
         ];
@@ -993,6 +993,22 @@ mod tests {
                 "display for {status}"
             );
         }
+    }
+
+    #[test]
+    fn non_head_service_error_display_keeps_code_without_status() {
+        use aws_sdk_s3::operation::get_object::GetObjectError;
+        use aws_smithy_runtime_api::http::StatusCode;
+        use aws_smithy_types::{body::SdkBody, error::ErrorMetadata};
+
+        let sdk = SdkError::service_error(
+            GetObjectError::generic(ErrorMetadata::builder().code("NoSuchKey").build()),
+            HttpResponse::new(StatusCode::try_from(404).unwrap(), SdkBody::empty()),
+        );
+        assert_eq!(
+            service_error(sdk).to_string(),
+            "service error calling GetObject (NoSuchKey)"
+        );
     }
 
     #[test]
