@@ -151,7 +151,7 @@ impl ConfigLoader {
             .machine_profile(Some(profile))
             .s3_config(s3_config)
             .build()
-            .expect("the loader always sets s3_config, the only required field")
+            .unwrap_or_else(|error| panic!("invalid configuration: {error}"))
     }
 }
 
