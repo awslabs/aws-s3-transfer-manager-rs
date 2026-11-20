@@ -296,7 +296,10 @@ pub enum MemoryBudgetConfig {
     ///
     /// The resolved capacity never exceeds this value and may be smaller by
     /// less than one platform allocation unit. Values too small to fund one
-    /// allocation unit are rejected. The resolved capacity is reported by
+    /// allocation unit are rejected, and so is a pool that cannot fund one part
+    /// of the configured part size when it is passed to
+    /// [`MemoryConfig::Explicit`] and the config is built. The resolved capacity
+    /// is reported by
     /// [`MemoryMetrics::capacity_bytes`].
     ///
     /// [`MemoryMetrics::capacity_bytes`]:
