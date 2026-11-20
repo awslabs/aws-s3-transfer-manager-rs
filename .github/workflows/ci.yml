@@ -49,7 +49,7 @@ jobs:
       - clippy
       - docs
       - minrust
-      - package-files
+      - package-checks
       - minimal-versions
       - sdk-floor
       - check-external-types
@@ -693,8 +693,8 @@ jobs:
         env:
           RUSTFLAGS: "" # remove -Dwarnings
 
-  package-files:
-    name: license files in published packages
+  package-checks:
+    name: package checks
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
