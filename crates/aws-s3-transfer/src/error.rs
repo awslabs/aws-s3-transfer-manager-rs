@@ -301,12 +301,19 @@ impl Error {
     }
 
     /// The service error code, if any (e.g. `"NoSuchKey"`, `"AccessDenied"`).
+    ///
+    /// For a failed `HeadObject` the code may be derived from the HTTP status; see
+    /// [`http_status`](Self::http_status).
     pub fn code(&self) -> Option<&str> {
         self.service().and_then(|m| m.code.as_deref())
     }
 
     /// HTTP status of the service response, if the error has one.
-    pub(crate) fn http_status(&self) -> Option<u16> {
+    ///
+    /// S3 sends no error body for a failed `HeadObject`, so for those errors the status is
+    /// the only detail S3 gave, and [`code`](Self::code) and [`message`](Self::message) may be
+    /// derived from it.
+    pub fn http_status(&self) -> Option<u16> {
         self.extra.as_ref().and_then(|e| e.http_status)
     }
 
@@ -476,8 +483,17 @@ impl fmt::Display for Error {
                 write!(f, "service error")?;
                 if let Some(m) = self.service() {
                     write!(f, " calling {}", m.operation)?;
-                    if let Some(c) = &m.code {
-                        write!(f, " ({c})")?;
+                    match (
+                        self.http_status(),
+                        m.message.as_deref().or(m.code.as_deref()),
+                    ) {
+                        (Some(status), Some(detail)) => write!(f, " ({status}: {detail})")?,
+                        (Some(status), None) => write!(f, " ({status})")?,
+                        (None, _) => {
+                            if let Some(c) = &m.code {
+                                write!(f, " ({c})")?;
+                            }
+                        }
                     }
                 }
             }
@@ -740,35 +756,36 @@ pub(crate) fn service_error<E: SdkOperationError>(e: SdkError<E, HttpResponse>) 
 /// Converts a failed HeadObject into an [`ErrorKind::ServiceError`].
 ///
 /// S3 answers a failed HEAD with the status and request ids only. A HEAD response has
-/// no body, so it carries no error code or message. Where the status identifies a
-/// single S3 code, the code is filled in: 412 is `PreconditionFailed`, 304 is
-/// `NotModified`, and 416 is `InvalidRange`. Any other status keeps the code the SDK
-/// reported: `NotFound` for 404, and none otherwise.
+/// no body, so it carries no error code or message. The code is derived from the status
+/// where S3 uses one code for it (see `head_status`; a 500 or 503 can also carry another
+/// code), and the message becomes the status text. A code or message the SDK reported is
+/// kept: `NotFound` for 404, and none otherwise.
 pub(crate) fn head_object_error(e: SdkError<HeadObjectError, HttpResponse>) -> Error {
     let mut error = service_error(e);
-    let code = error
-        .extra
-        .as_ref()
-        .and_then(|extra| extra.http_status)
-        .and_then(head_status_code);
-    if let (Some(code), Some(service)) = (
-        code,
-        error
-            .extra
-            .as_mut()
-            .and_then(|extra| extra.service.as_mut()),
-    ) {
-        service.code.get_or_insert_with(|| code.to_owned());
+    if let Some(extra) = error.extra.as_mut() {
+        let status = extra.http_status.and_then(head_status);
+        if let (Some((code, text)), Some(service)) = (status, extra.service.as_mut()) {
+            if let Some(code) = code {
+                service.code.get_or_insert_with(|| code.to_owned());
+            }
+            service.message.get_or_insert_with(|| text.to_owned());
+        }
     }
     error
 }
 
-/// The S3 error code a failed HEAD's `status` alone identifies, if there is exactly one.
-fn head_status_code(status: u16) -> Option<&'static str> {
+/// The S3 error code (when `status` alone identifies exactly one) and the status text of a
+/// failed HEAD.
+fn head_status(status: u16) -> Option<(Option<&'static str>, &'static str)> {
     match status {
-        304 => Some("NotModified"),
-        412 => Some("PreconditionFailed"),
-        416 => Some("InvalidRange"),
+        304 => Some((Some("NotModified"), "Not Modified")),
+        400 => Some((None, "Bad Request")),
+        403 => Some((None, "Forbidden")),
+        404 => Some((None, "Not Found")),
+        412 => Some((Some("PreconditionFailed"), "Precondition Failed")),
+        416 => Some((Some("InvalidRange"), "Range Not Satisfiable")),
+        500 => Some((Some("InternalError"), "Internal Server Error")),
+        503 => Some((Some("SlowDown"), "Service Unavailable")),
         _ => None,
     }
 }
@@ -900,6 +917,73 @@ mod tests {
                 }),
                 ..Default::default()
             })),
+        }
+    }
+
+    #[test]
+    fn head_failure_derives_code_and_message_from_status() {
+        use aws_sdk_s3::operation::head_object::HeadObjectError;
+        use aws_smithy_runtime_api::http::StatusCode;
+        use aws_smithy_types::{body::SdkBody, error::ErrorMetadata};
+
+        // (status, code and message the SDK reported, expected code, message, Display)
+        let cases = [
+            (403, None, None, None, Some("Forbidden"), "(403: Forbidden)"),
+            (
+                500,
+                None,
+                None,
+                Some("InternalError"),
+                Some("Internal Server Error"),
+                "(500: Internal Server Error)",
+            ),
+            (
+                503,
+                None,
+                None,
+                Some("SlowDown"),
+                Some("Service Unavailable"),
+                "(503: Service Unavailable)",
+            ),
+            (
+                404,
+                Some("NotFound"),
+                None,
+                Some("NotFound"),
+                Some("Not Found"),
+                "(404: Not Found)",
+            ),
+            (
+                403,
+                Some("AccessDenied"),
+                Some("denied"),
+                Some("AccessDenied"),
+                Some("denied"),
+                "(403: denied)",
+            ),
+            (418, None, None, None, None, "(418)"),
+        ];
+        for (status, sdk_code, sdk_message, code, message, display) in cases {
+            let mut meta = ErrorMetadata::builder();
+            if let Some(c) = sdk_code {
+                meta = meta.code(c);
+            }
+            if let Some(m) = sdk_message {
+                meta = meta.message(m);
+            }
+            let sdk = SdkError::service_error(
+                HeadObjectError::generic(meta.build()),
+                HttpResponse::new(StatusCode::try_from(status).unwrap(), SdkBody::empty()),
+            );
+            let error = head_object_error(sdk);
+            assert_eq!(error.http_status(), Some(status), "status {status}");
+            assert_eq!(error.code(), code, "code for {status}");
+            assert_eq!(error.message(), message, "message for {status}");
+            assert_eq!(
+                error.to_string(),
+                format!("service error calling HeadObject {display}"),
+                "display for {status}"
+            );
         }
     }
 
