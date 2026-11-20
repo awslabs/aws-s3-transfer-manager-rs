@@ -708,7 +708,7 @@ jobs:
           status=0
           for crate in $(cargo metadata --no-deps --format-version 1 \
               | jq -r '.packages[] | select(.publish != []) | .name'); do
-            files=$(cargo package --list --allow-dirty --offline -p "$crate")
+            files=$(cargo package --list --allow-dirty -p "$crate")
             for f in LICENSE NOTICE; do
               grep -qx "$f" <<<"$files" || { echo "$crate: $f missing from package" >&2; status=1; }
             done
