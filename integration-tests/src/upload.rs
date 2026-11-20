@@ -14,7 +14,11 @@ use aws_s3_transfer::config::RuntimeConfig;
 use aws_s3_transfer::config::S3ClientConfig;
 use aws_s3_transfer::io::{InputStream, PartData, PartStream, SizeHint, StreamContext};
 use aws_s3_transfer::types::ByteSize;
-use aws_s3_transfer::types::{checksum::Crc32, ChecksumStrategy};
+use aws_s3_transfer::types::ChecksumAlgorithm;
+use aws_s3_transfer::types::{
+    checksum::{Crc32, Crc32C},
+    ChecksumStrategy,
+};
 use s3_mock_server::S3MockServer;
 use tokio::sync::mpsc;
 
@@ -294,6 +298,107 @@ impl PartStream for SinglePart {
     fn size_hint(&self) -> SizeHint {
         self.size_hint
     }
+}
+
+/// Helper function that builds a transfer manager whose S3 client uses `RequestChecksumCalculation::WhenRequired` and records
+/// every attempt, on a fresh mock server with a bucket named `test-bucket`.
+async fn when_required_tm() -> (
+    s3_mock_server::ServerHandle,
+    aws_s3_transfer::Client,
+    OperationRecorder,
+) {
+    let server = S3MockServer::builder()
+        .with_in_memory_store()
+        .build()
+        .expect("build mock server");
+    let handle = server.start().await.expect("start mock server");
+    server
+        .create_bucket("test-bucket")
+        .await
+        .expect("create bucket");
+
+    let recorder = OperationRecorder::default();
+    let s3_config = handle
+        .client()
+        .await
+        .config()
+        .to_builder()
+        .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
+        .interceptor(recorder.clone());
+    let tm = aws_s3_transfer::Client::new(
+        aws_s3_transfer::Config::builder()
+            .s3_config(S3ClientConfig::new(s3_config))
+            .build()
+            .expect("valid config"),
+    );
+    (handle, tm, recorder)
+}
+
+/// Under `WhenRequired`, a single-request upload with a CRC32C strategy sends a CRC32C
+/// checksum on `PutObject`: the caller set the algorithm, so the SDK calculates it.
+#[tokio::test]
+async fn test_when_required_calculated_crc32c_sends_put_object_checksum() {
+    let (handle, tm, recorder) = when_required_tm().await;
+    let content = deterministic_data(1024);
+
+    let output = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("when-required-put")
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32C))
+        .body(InputStream::from(content.clone()))
+        .initiate()
+        .expect("initiate upload")
+        .join()
+        .await
+        .expect("upload complete");
+    assert!(output.upload_id().is_none(), "expected a single PutObject");
+
+    let puts = recorder.attempts("PutObject");
+    assert!(!puts.is_empty(), "no PutObject was sent");
+    assert!(
+        puts.iter()
+            .all(|a| a.checksum == Some(ChecksumAlgorithm::Crc32C)),
+        "PutObject sent without a CRC32C checksum: {puts:?}"
+    );
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// Under `WhenRequired`, a multipart upload with a CRC32C strategy sends a CRC32C
+/// checksum on every `UploadPart`.
+#[tokio::test]
+async fn test_when_required_calculated_crc32c_sends_upload_part_checksums() {
+    let (handle, tm, recorder) = when_required_tm().await;
+    // 24 MiB = 3 parts at the default 8 MiB part size.
+    let content = deterministic_data(ByteSize::mib(24).as_usize());
+
+    let output = tm
+        .upload()
+        .bucket("test-bucket")
+        .key("when-required-mpu")
+        .checksum_strategy(ChecksumStrategy::full_object(Crc32C))
+        .body(InputStream::from(content.clone()))
+        .initiate()
+        .expect("initiate upload")
+        .join()
+        .await
+        .expect("upload complete");
+    assert!(output.upload_id().is_some(), "expected a multipart upload");
+
+    let parts = recorder.attempts("UploadPart");
+    assert!(
+        parts.len() >= 3,
+        "expected at least 3 UploadPart attempts: {parts:?}"
+    );
+    assert!(
+        parts
+            .iter()
+            .all(|a| a.checksum == Some(ChecksumAlgorithm::Crc32C)),
+        "UploadPart sent without a CRC32C checksum: {parts:?}"
+    );
+
+    handle.shutdown().await.expect("shutdown");
 }
 
 /// Base64 big-endian CRC32 of `data`, the encoding S3 expects in `x-amz-checksum-crc32`.
