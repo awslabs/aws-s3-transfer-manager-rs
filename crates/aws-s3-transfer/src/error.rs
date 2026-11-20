@@ -961,6 +961,14 @@ mod tests {
                 Some("denied"),
                 "(403: denied)",
             ),
+            (
+                503,
+                Some("ServiceUnavailable"),
+                None,
+                Some("ServiceUnavailable"),
+                Some("Service Unavailable"),
+                "(503: Service Unavailable)",
+            ),
             (418, None, None, None, None, "(418)"),
         ];
         for (status, sdk_code, sdk_message, code, message, display) in cases {
