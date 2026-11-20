@@ -11,6 +11,7 @@ Transfer Manager for Amazon S3 - a high-performance data plane client for upload
 """
 categories = ["asynchronous", "concurrency"]
 keywords = ["AWS", "Amazon", "S3", "high-performance", "transfer-manager"]
+include = ["src/**", "examples/**", "tests/**", "README.md", "LICENSE", "NOTICE"]
 
 # Not `all-features`: `__unstable_ext` is a version-coupled hook whose entry point is the extension
 # crate.
@@ -27,21 +28,21 @@ aws-runtime = { workspace = true }
 aws-smithy-checksums = { workspace = true }
 aws-smithy-types = { workspace = true }
 aws-types = { workspace = true }
-bytes = "1"
+bytes = "1.11.1"
 bytes-utils = "0.1.4"
 futures-util = "0.3.31"
 path-clean = "1.0.1"
 pin-project-lite = "0.2.16"
-tokio = { version = "1.43.0", features = ["rt", "io-util", "sync", "macros", "time"] }
-tracing = "0.1"
-tokio-util = "0.7.13"
+tokio = { version = "1.53.1", features = ["rt", "io-util", "sync", "macros", "time"] }
+tracing = "0.1.44"
+tokio-util = "0.7.18"
 crossbeam-skiplist = "0.1.3"
-crossbeam-utils = "0.8"
+crossbeam-utils = "0.8.18"
 parking_lot = "0.12"
 fastrand = "2.4"
-http-body-1x = { package = "http-body", version = "1" }
+http-body-1x = { package = "http-body", version = "1.0.1" }
 arc-swap = "1.9.2"
-smallvec = "1"
+smallvec = "1.15.0"
 
 # The SDK's default HTTPS client and credential providers, managed execution and its transport and
 # DNS resolver, tokio's multi-thread scheduler, and tokio's filesystem API, which needs a blocking
@@ -53,7 +54,7 @@ aws-smithy-execution = { workspace = true }
 aws-smithy-managed-http = { workspace = true, features = ["client"] }
 aws-smithy-http-client = { workspace = true, features = ["rustls-aws-lc", "rt-tokio"] }
 aws-smithy-dns = { workspace = true, features = ["hickory-dns"] }
-tokio = { version = "1.43.0", features = ["rt-multi-thread", "fs"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "fs"] }
 
 # The SDK's tokio sleep and filesystem body support, and SigV4a signing. The filesystem support
 # enables tokio's `fs` feature, which tokio rejects on wasm targets without `--cfg tokio_unstable`,
@@ -99,7 +100,7 @@ required-features = ["sdk-v1"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
-nix = { version = "0.31", features = ["uio", "fs", "resource"] }
+nix = { version = "0.31.2", features = ["uio", "fs", "resource"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 aws-smithy-runtime = { workspace = true, features = ["client", "rt-tokio"] }
@@ -110,7 +111,7 @@ windows-sys = { version = "0.59", features = ["Wdk_Storage_FileSystem", "Win32_F
 
 [dev-dependencies]
 # Reference implementation that tests check CRC combination against.
-crc-fast = "1.9"
+crc-fast = "1.10.0"
 static_assertions = "1"
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest", "test-util"] }
 aws-smithy-mocks = { workspace = true }
@@ -118,19 +119,19 @@ aws-smithy-runtime = { workspace = true, features = ["client", "test-util"] }
 aws-smithy-http-client = { workspace = true, features = ["test-util", "wire-mock", "rustls-aws-lc"] }
 clap = { version = "4.5.7", default-features = false, features = ["derive", "std", "help"] }
 console-subscriber = "0.5.0"
-http = "1"
-http-body-1x = { package = "http-body", version = "1" }
+http = "1.4.0"
+http-body-1x = { package = "http-body", version = "1.0.1" }
 fastrand = "2.4"
-futures-test = "0.3.30"
+futures-test = "0.3.31"
 md5 = "0.7.0"
 proptest = "1"
-tempfile = "3.12.0"
+tempfile = "3.27.0"
 walkdir = "2"
 test-common = { path = "./test-common" }
 tokio-test = "0.4.4"
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-serde_json = "1"
-serde = { version = "1", features = ["derive"] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+serde_json = "1.0.146"
+serde = { version = "1.0.229", features = ["derive"] }
 
 [target.'cfg(s3_tm_loom)'.dev-dependencies]
 loom = { version = "0.7", features = ["checkpoint"] }
@@ -146,7 +147,7 @@ aws-s3-transfer-ext = { path = "../aws-s3-transfer-ext" }
 # The `cp` example's dial9 tracing: build with RUSTFLAGS="--cfg s3_tm_dial9 ...".
 [target.'cfg(s3_tm_dial9)'.dev-dependencies]
 aws-s3-transfer-ext = { path = "../aws-s3-transfer-ext", features = ["dial9"] }
-dial9 = { version = "0.5", features = ["tokio", "cpu-profiling"] }
+dial9 = { version = "0.5.3", features = ["tokio", "cpu-profiling"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(e2e_test)', 'cfg(s3_tm_loom)', 'cfg(s3_tm_asan)', 'cfg(s3_tm_fuzz)', 'cfg(s3_tm_bench)', 'cfg(s3_tm_tsan)', 'cfg(s3_tm_out_of_tree)', 'cfg(s3_tm_dial9)'] }
