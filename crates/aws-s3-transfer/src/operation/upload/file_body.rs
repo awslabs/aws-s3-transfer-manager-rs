@@ -1003,7 +1003,7 @@ mod tests {
     #[test]
     fn chunk_to_read_does_not_truncate_at_the_four_gib_boundary() {
         let boundary = 1u64 << 32;
-        for remaining in [boundary - 1, boundary] {
+        for remaining in [boundary - 1, boundary, boundary + 1] {
             assert_eq!(
                 chunk_to_read(remaining),
                 FILE_BODY_CHUNK_SIZE,

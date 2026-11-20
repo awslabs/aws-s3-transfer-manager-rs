@@ -152,6 +152,20 @@ impl std::fmt::Debug for InFlight {
 /// Maximum number of parts that a single S3 multipart upload supports
 const MAX_PARTS: u64 = 10_000;
 
+/// Size of each part for a multipart upload of a body described by `size_hint`.
+///
+/// This is `configured`, raised where needed so the stream's upper bound fits
+/// in [`MAX_PARTS`] parts. A stream without an upper bound uses `configured`
+/// and enforces the limit as parts are produced. Returns `None` if the size
+/// doesn't fit `usize` on the target platform.
+fn multipart_part_size(configured: u64, size_hint: SizeHint) -> Option<usize> {
+    let part_size = match size_hint.upper() {
+        Some(upper) => cmp::max(configured, upper.div_ceil(MAX_PARTS)),
+        None => configured,
+    };
+    usize::try_from(part_size).ok()
+}
+
 /// Initial capacity for the completed-part list when the content length is unknown.
 ///
 /// There is no part count to size it by, so this only avoids a few early reallocations; the list
@@ -239,6 +253,14 @@ impl UploadTransfer {
             validate_content_md5_for_multipart(&request).map_err(crate::error::invalid_input)?;
             validate_composite_expected_value_for_multipart(&request)
                 .map_err(crate::error::invalid_input)?;
+            if multipart_part_size(ctx.handle.part_size_bytes(), size_hint).is_none() {
+                return Err(crate::error::invalid_input(format!(
+                    "an upload of up to {} bytes needs parts larger than this \
+                     platform can buffer ({} bytes)",
+                    size_hint.upper().unwrap_or_default(),
+                    usize::MAX
+                )));
+            }
         }
         let observability =
             UploadObservability::new(ctx.handle.config.diagnostics().transfer(), size_hint);
@@ -925,13 +947,9 @@ impl UploadTransfer {
 
         // An upper bound can size parts so a manager-produced body fits S3's part limit. A stream
         // without one uses the configured size and enforces the limit as parts are produced.
-        let part_size = match size_hint.upper() {
-            Some(upper) => cmp::max(
-                self.inner.ctx.handle.part_size_bytes(),
-                upper.div_ceil(MAX_PARTS),
-            ),
-            None => self.inner.ctx.handle.part_size_bytes(),
-        };
+        let part_len = multipart_part_size(self.inner.ctx.handle.part_size_bytes(), size_hint)
+            .expect("part size fits usize");
+        let part_size = part_len as u64;
         let plan = if reads_until_eof {
             PartPlan::UntilEof { size_hint }
         } else {
@@ -953,7 +971,7 @@ impl UploadTransfer {
         let part_reader = Arc::new(
             match PartReaderBuilder::new()
                 .stream(stream)
-                .part_size(part_size.try_into().expect("valid part size"))
+                .part_size(part_len)
                 .direct_io(self.inner.ctx.handle.runtime.components().direct_io())
                 .buffer_pool(self.inner.ctx.handle.buffer_pool.clone())
                 .metrics(std::sync::Arc::clone(&self.inner.ctx.metrics))
@@ -4082,5 +4100,33 @@ mod tests {
             Transfer::on_terminal(transfer);
         })
         .await;
+    }
+
+    #[test]
+    fn multipart_part_size_raises_the_configured_size_to_fit_max_parts() {
+        let configured = 8 * 1024 * 1024;
+        let fits = configured * MAX_PARTS;
+        assert_eq!(
+            multipart_part_size(configured, SizeHint::exact(fits)),
+            Some(configured as usize)
+        );
+        assert_eq!(
+            multipart_part_size(configured, SizeHint::exact(fits + 1)),
+            Some(configured as usize + 1)
+        );
+        assert_eq!(
+            multipart_part_size(configured, SizeHint::default()),
+            Some(configured as usize)
+        );
+    }
+
+    /// One byte more than `MAX_PARTS` parts of `usize::MAX` (`u32::MAX` on
+    /// this target) does not fit `usize`.
+    #[test]
+    #[cfg(target_pointer_width = "32")]
+    fn multipart_part_size_rejects_a_size_that_does_not_fit_usize() {
+        let upper = u64::from(u32::MAX) * MAX_PARTS + 1;
+        let size_hint = SizeHint::default().with_upper(Some(upper));
+        assert_eq!(multipart_part_size(8 * 1024 * 1024, size_hint), None);
     }
 }

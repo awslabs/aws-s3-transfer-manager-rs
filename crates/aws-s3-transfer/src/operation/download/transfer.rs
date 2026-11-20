@@ -470,10 +470,7 @@ impl DownloadTransfer {
                     // waits until the reservation future wakes us. The gate's `issued`
                     // bump stays: the blocked claim occupies its one window seat, so it
                     // holds exactly the slot it will fill.
-                    let range_len = match chunk_len(range, *part_size) {
-                        Ok(len) => len,
-                        Err(error) => return self.fail_memory_admission(state, error),
-                    };
+                    let range_len = chunk_len(range, *part_size);
                     match self.reserve_claim(range_len, pending) {
                         Ok(Some(slot)) => slot,
                         // Memory-blocked; `pending` now holds the claimed slot.
@@ -1707,19 +1704,14 @@ fn transferring_snapshot(
 /// reservation size for that chunk. Peek only — does not advance
 /// `remaining`.
 ///
-/// Returns [`ReserveError::CapacityOverflow`] when `part_size` does not
-/// fit `usize` on the target platform.
-fn chunk_len(
-    remaining: &std::ops::RangeInclusive<u64>,
-    part_size: u64,
-) -> Result<usize, ReserveError> {
-    if usize::try_from(part_size).is_err() {
-        return Err(ReserveError::CapacityOverflow);
-    }
-    let start = *remaining.start();
-    let end = *remaining.end();
-    let chunk_end = cmp::min(start + part_size - 1, end);
-    Ok((chunk_end - start + 1) as usize)
+/// # Panics
+///
+/// If `part_size` does not fit `usize`. Every source of part sizes in the
+/// download path is expected to have already rejected such a value.
+fn chunk_len(remaining: &std::ops::RangeInclusive<u64>, part_size: u64) -> usize {
+    let part_len = usize::try_from(part_size).expect("part size fits usize");
+    let left = *remaining.end() - *remaining.start() + 1;
+    usize::try_from(left).map_or(part_len, |left| left.min(part_len))
 }
 
 /// Copies one transport response into reserved pooled storage.
@@ -1910,17 +1902,20 @@ mod tests {
     const MB: u64 = 1024 * 1024;
 
     /// `chunk_len` returns a full `part_size` chunk when the remaining
-    /// range spans the 4 GiB boundary.
+    /// range spans the 4 GiB boundary. On a 32-bit target `len - 1` just
+    /// below the boundary exercises the `usize::try_from(left)` success
+    /// branch, and `len - 1` at or above the boundary exercises the
+    /// fallback branch; both pick `part_size`.
     #[test]
     fn chunk_len_does_not_truncate_a_remaining_that_crosses_four_gib() {
         let part_size = 8 * MB;
         let boundary = 1u64 << 32;
-        for len in [boundary - 1, boundary] {
+        for len in [boundary - 1, boundary, boundary + 1] {
             let range = 0..=(len - 1);
             assert_eq!(
-                chunk_len(&range, part_size).expect("chunk_len"),
+                chunk_len(&range, part_size),
                 part_size as usize,
-                "len={len}",
+                "len={len}"
             );
         }
     }
@@ -1934,22 +1929,7 @@ mod tests {
         let boundary = 1u64 << 32;
         // A range of exactly 3 bytes starting at 2^32 - 2.
         let range = (boundary - 2)..=boundary;
-        assert_eq!(chunk_len(&range, part_size).expect("chunk_len"), 3);
-    }
-
-    /// `chunk_len` surfaces a `part_size` that does not fit `usize` as
-    /// [`ReserveError::CapacityOverflow`] instead of silently truncating.
-    /// Only runs on a 32-bit target: on 64-bit no representable `part_size`
-    /// violates the invariant.
-    #[test]
-    #[cfg(target_pointer_width = "32")]
-    fn chunk_len_rejects_part_size_exceeding_usize() {
-        let part_size = 1u64 << 32;
-        let result = chunk_len(&(0..=(part_size + 100)), part_size);
-        assert!(
-            matches!(result, Err(ReserveError::CapacityOverflow)),
-            "expected CapacityOverflow, got {result:?}",
-        );
+        assert_eq!(chunk_len(&range, part_size), 3);
     }
 
     #[test]
