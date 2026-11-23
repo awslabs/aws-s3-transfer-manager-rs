@@ -179,6 +179,9 @@ impl FailedUpload {
     }
 
     /// Object key the source file was being uploaded to.
+    ///
+    /// `None` when the failure happened before the key was derived: a directory entry could not
+    /// be read, or the key could not be derived from the entry's path.
     pub fn key(&self) -> Option<&str> {
         self.key.as_deref()
     }
