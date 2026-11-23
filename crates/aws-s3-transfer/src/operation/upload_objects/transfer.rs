@@ -791,6 +791,7 @@ impl UploadObjectsTransfer {
                             input: None,
                             error: e,
                             source_path: Some(entry.path().to_path_buf()),
+                            key: None,
                         });
                         if *self.failure_policy() == FailedTransferPolicy::Abort {
                             self.abort(state, "key derivation failure");
@@ -811,6 +812,7 @@ impl UploadObjectsTransfer {
                         input: None,
                         error: e,
                         source_path: Some(entry.path().to_path_buf()),
+                        key: Some(key),
                     });
                     if *self.failure_policy() == FailedTransferPolicy::Abort {
                         self.abort(state, "stream creation failure");
@@ -829,6 +831,7 @@ impl UploadObjectsTransfer {
                     input: None,
                     error: e,
                     source_path: Some(entry.path().to_path_buf()),
+                    key: Some(key),
                 });
                 if *self.failure_policy() == FailedTransferPolicy::Abort {
                     self.abort(state, "key conflict");
@@ -924,6 +927,7 @@ impl UploadObjectsTransfer {
                         input: None,
                         error: e,
                         source_path: Some(source_path),
+                        key: Some(key),
                     });
                     if !aborted_in_batch && *self.failure_policy() == FailedTransferPolicy::Abort {
                         abort_result = Some(self.abort(state, "orchestration failure"));
@@ -1224,6 +1228,7 @@ impl UploadObjectsTransfer {
                 input: None,
                 error: crate::error::Error::from(we),
                 source_path,
+                key: None,
             });
             if *self.failure_policy() == FailedTransferPolicy::Abort {
                 // Transfer is aborting: drop the walker (no walk_back).
@@ -1356,6 +1361,7 @@ impl UploadObjectsTransfer {
                         input: None,
                         error: e,
                         source_path: Some(source_path),
+                        key: Some(key),
                     });
                     if let Some(cause) = abort_cause {
                         self.abort(&mut state, cause);
@@ -1897,6 +1903,7 @@ mod tests {
             let message = std::error::Error::source(failed[0].error())
                 .unwrap()
                 .to_string();
+            assert_eq!(failed[0].key(), Some("a---b"), "{policy:?}");
             let failed_path = failed[0].source_path().unwrap();
             let other = names
                 .iter()
@@ -1984,6 +1991,8 @@ mod tests {
         assert_eq!(transfer.successful_uploads(), 1);
         let failed = transfer.take_failed();
         assert!(!failed.is_empty());
+        // A walker error happens before any key is derived.
+        assert!(failed.iter().all(|f| f.key().is_none()), "{failed:?}");
     }
 
     #[cfg(unix)]
@@ -2033,7 +2042,10 @@ mod tests {
         .expect("transfer should complete within timeout");
 
         let failed = transfer.take_failed();
-        assert!(!failed.is_empty());
+        // Each failed child reports the key it was uploading to.
+        let mut keys: Vec<_> = failed.iter().map(|f| f.key()).collect();
+        keys.sort();
+        assert_eq!(keys, [Some("a.txt"), Some("b.txt")], "{failed:?}");
     }
 
     #[cfg_attr(miri, ignore)]
@@ -2862,6 +2874,8 @@ mod tests {
         assert_eq!(transfer.successful_uploads(), 1);
         let failed = transfer.take_failed();
         assert_eq!(failed.len(), 1);
+        // Key derivation failed, so no key is reported.
+        assert_eq!(failed[0].key(), None);
     }
 
     /// Under Abort policy, a pre-orchestration failure (derive_object_key)

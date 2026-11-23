@@ -399,9 +399,9 @@ async fn test_server_error_should_be_recorded_as_such_in_failed_transfers() {
         let output = handle.join().await.unwrap();
         assert_eq!(0, output.objects_uploaded());
         assert_eq!(1, output.failed_transfers().len());
-        // The new state machine records source_path for failed uploads; the UploadInput
-        // cannot be captured because the InputStream body is non-clonable.
+        // The UploadInput cannot be captured because the InputStream body is non-clonable.
         assert!(output.failed_transfers()[0].source_path().is_some());
+        assert_eq!(output.failed_transfers()[0].key(), Some("sample.jpg"));
         assert_eq!(0, output.metrics.network_tx);
     })
     .await
