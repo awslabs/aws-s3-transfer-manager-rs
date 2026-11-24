@@ -11,7 +11,7 @@ Transfer Manager for Amazon S3 - a high-performance data plane client for upload
 """
 categories = ["asynchronous", "concurrency"]
 keywords = ["AWS", "Amazon", "S3", "high-performance", "transfer-manager"]
-include = ["src/**", "examples/**", "tests/**", "README.md", "LICENSE", "NOTICE"]
+include = ["src/**", "examples/**", "README.md", "LICENSE", "NOTICE"]
 
 # Not `all-features`: `__unstable_ext` is a version-coupled hook whose entry point is the extension
 # crate.
