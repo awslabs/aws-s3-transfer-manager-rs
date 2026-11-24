@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The `aws-s3-transfer` package includes `LICENSE` and `NOTICE`, and no longer includes
+  development-only files such as `.gitignore`, `proptest-regressions/`, the external-types
+  configurations and the integration tests.
+- `aws-smithy-topology` requires `many_cpus` 2.4.16 or later instead of exactly 2.4.16.
+- Declared minimum dependency versions are raised to the versions the dependency graph needs, so a
+  build that resolves each dependency to its declared minimum succeeds.
+
 ## [release-2026-11-18]
 
 Transfer Manager for Amazon S3 1.0.0 is published as `aws-s3-transfer`, renamed from
