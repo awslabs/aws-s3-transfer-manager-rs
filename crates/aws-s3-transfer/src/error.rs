@@ -301,12 +301,18 @@ impl Error {
     }
 
     /// The service error code, if any (e.g. `"NoSuchKey"`, `"AccessDenied"`).
+    ///
+    /// A failed `HeadObject` has no response body, so S3 sends no code. For 404 the SDK
+    /// reports `NotFound`; for 304, 412 and 416 the code is derived from the status.
     pub fn code(&self) -> Option<&str> {
         self.service().and_then(|m| m.code.as_deref())
     }
 
     /// HTTP status of the service response, if the error has one.
-    pub(crate) fn http_status(&self) -> Option<u16> {
+    ///
+    /// S3 sends no error body for a failed `HeadObject`, so for those errors the status is
+    /// often the only detail S3 gave.
+    pub fn http_status(&self) -> Option<u16> {
         self.extra.as_ref().and_then(|e| e.http_status)
     }
 
@@ -476,8 +482,12 @@ impl fmt::Display for Error {
                 write!(f, "service error")?;
                 if let Some(m) = self.service() {
                     write!(f, " calling {}", m.operation)?;
-                    if let Some(c) = &m.code {
-                        write!(f, " ({c})")?;
+                    let status = self.http_status().filter(|_| m.operation == "HeadObject");
+                    match (status, m.code.as_deref()) {
+                        (Some(status), Some(code)) => write!(f, " ({status}: {code})")?,
+                        (Some(status), None) => write!(f, " ({status})")?,
+                        (None, Some(code)) => write!(f, " ({code})")?,
+                        (None, None) => {}
                     }
                 }
             }
@@ -901,6 +911,67 @@ mod tests {
                 ..Default::default()
             })),
         }
+    }
+
+    #[test]
+    fn head_failure_display_shows_status_and_code() {
+        use aws_sdk_s3::operation::head_object::HeadObjectError;
+        use aws_smithy_runtime_api::http::StatusCode;
+        use aws_smithy_types::{body::SdkBody, error::ErrorMetadata};
+
+        // (status, code the SDK reported, expected code, Display)
+        let cases = [
+            (403, None, None, "(403)"),
+            (503, None, None, "(503)"),
+            (404, Some("NotFound"), Some("NotFound"), "(404: NotFound)"),
+            (
+                403,
+                Some("AccessDenied"),
+                Some("AccessDenied"),
+                "(403: AccessDenied)",
+            ),
+            (
+                412,
+                None,
+                Some("PreconditionFailed"),
+                "(412: PreconditionFailed)",
+            ),
+        ];
+        for (status, sdk_code, code, display) in cases {
+            let mut meta = ErrorMetadata::builder();
+            if let Some(c) = sdk_code {
+                meta = meta.code(c);
+            }
+            let sdk = SdkError::service_error(
+                HeadObjectError::generic(meta.build()),
+                HttpResponse::new(StatusCode::try_from(status).unwrap(), SdkBody::empty()),
+            );
+            let error = head_object_error(sdk);
+            assert_eq!(error.http_status(), Some(status), "status {status}");
+            assert_eq!(error.code(), code, "code for {status}");
+            assert_eq!(error.message(), None, "message for {status}");
+            assert_eq!(
+                error.to_string(),
+                format!("service error calling HeadObject {display}"),
+                "display for {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_head_service_error_display_keeps_code_without_status() {
+        use aws_sdk_s3::operation::get_object::GetObjectError;
+        use aws_smithy_runtime_api::http::StatusCode;
+        use aws_smithy_types::{body::SdkBody, error::ErrorMetadata};
+
+        let sdk = SdkError::service_error(
+            GetObjectError::generic(ErrorMetadata::builder().code("NoSuchKey").build()),
+            HttpResponse::new(StatusCode::try_from(404).unwrap(), SdkBody::empty()),
+        );
+        assert_eq!(
+            service_error(sdk).to_string(),
+            "service error calling GetObject (NoSuchKey)"
+        );
     }
 
     #[test]
