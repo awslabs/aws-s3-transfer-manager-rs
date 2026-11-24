@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `Display` of a failed HeadObject includes the HTTP status: `(404: NotFound)`, or `(403)` when
   there is no error code. A HEAD response has no body, so S3 sends no code for most failures. Other
   operations display as before.
+- `Config::builder().build()` returns an error when `MemoryConfig::Explicit` is a pool smaller than
+  one part of the configured part size (8 MiB when `Auto`), and `ConfigLoader::load` panics. Such a
+  client used to build, and every transfer then failed with `ErrorKind::RuntimeError`.
 
 ### Fixed
 
