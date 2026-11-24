@@ -138,7 +138,19 @@ impl FailedDownload {
     }
 }
 
-/// Detailed information about a failed upload
+/// Detailed information about a failed upload.
+///
+/// [`error`](Self::error) is always present. The other fields are present only
+/// when the failure happened at a point where their value was known:
+///
+/// - [`key`](Self::key) is absent when the failure happened before the object
+///   key was derived: a directory entry could not be read, or the key could not
+///   be derived from the entry's path.
+/// - [`source_path`](Self::source_path) is absent when a directory entry could
+///   not be read and the error names no path.
+/// - [`input`](Self::input) is absent for every failure recorded by
+///   `upload_objects`, because the request body is not retained after a
+///   failure.
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct FailedUpload {
@@ -146,6 +158,8 @@ pub struct FailedUpload {
     pub(crate) error: crate::error::Error,
     /// Local filesystem path of the source file that failed to upload.
     pub(crate) source_path: Option<std::path::PathBuf>,
+    /// Object key the source file maps to.
+    pub(crate) key: Option<String>,
 }
 
 impl FailedUpload {
@@ -162,6 +176,11 @@ impl FailedUpload {
     /// Local filesystem path of the source file that failed to upload.
     pub fn source_path(&self) -> Option<&std::path::Path> {
         self.source_path.as_deref()
+    }
+
+    /// Object key the source file maps to. See [`FailedUpload`] for when this is `None`.
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
     }
 }
 

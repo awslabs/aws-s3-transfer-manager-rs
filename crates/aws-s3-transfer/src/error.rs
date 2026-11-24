@@ -1029,11 +1029,13 @@ mod tests {
                 input: None,
                 error: Error::new(ErrorKind::ServiceError, "boom"),
                 source_path: Some(std::path::PathBuf::from("/data/a.bin")),
+                key: Some("a.bin".to_owned()),
             },
             FailedUpload {
                 input: None,
                 error: Error::new(ErrorKind::ServiceError, "boom"),
                 source_path: Some(std::path::PathBuf::from("/data/b.bin")),
+                key: Some("b.bin".to_owned()),
             },
         ];
         let e = Error::new(ErrorKind::ChildOperationFailed, "aborted").with_failed_uploads(failed);
@@ -1050,6 +1052,7 @@ mod tests {
             input: None,
             error: Error::new(ErrorKind::ServiceError, "boom"),
             source_path: None,
+            key: None,
         }];
         let e = Error::new(ErrorKind::ChildOperationFailed, "aborted").with_failed_uploads(failed);
         assert_eq!(e.to_string(), "child operation failed: 1 object");
@@ -1114,11 +1117,13 @@ mod tests {
                 input: None,
                 error: Error::new(ErrorKind::ServiceError, "first"),
                 source_path: None,
+                key: None,
             },
             FailedUpload {
                 input: None,
                 error: Error::new(ErrorKind::ServiceError, "second"),
                 source_path: None,
+                key: None,
             },
         ];
         let e = Error::new(ErrorKind::ChildOperationFailed, "aborted").with_failed_uploads(failed);

@@ -394,6 +394,7 @@ async fn upload_objects_rejected_child_continue() {
         failed[0].source_path(),
         Some(source.path().join(rejected).as_path())
     );
+    assert_eq!(failed[0].key(), Some(t.key(rejected).as_str()));
     assert_eq!(failed[0].error().code(), Some("BadDigest"), "{failed:?}");
     assert_eq!(output.objects_uploaded(), 2);
     assert_nothing_stored(&t, rejected).await;
