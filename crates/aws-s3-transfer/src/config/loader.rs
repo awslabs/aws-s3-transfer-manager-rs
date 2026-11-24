@@ -135,6 +135,11 @@ impl ConfigLoader {
     /// attempt with 500 ms connect and read timeouts. Setting
     /// `AWS_EC2_METADATA_DISABLED` to `true`, `1`, `yes` or `on`
     /// (case-insensitive) suppresses it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`memory`](Self::memory) is a [`MemoryConfig::Explicit`] pool that cannot fund one
+    /// part of the configured part size. Use [`Config::builder`] to get the error instead.
     pub async fn load(self) -> Config {
         let s3_config = match self.s3_config {
             Some(config) => config,
@@ -151,7 +156,7 @@ impl ConfigLoader {
             .machine_profile(Some(profile))
             .s3_config(s3_config)
             .build()
-            .expect("the loader always sets s3_config, the only required field")
+            .unwrap_or_else(|error| panic!("invalid configuration: {error}"))
     }
 }
 

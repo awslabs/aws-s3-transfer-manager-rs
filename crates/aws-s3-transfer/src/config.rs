@@ -413,8 +413,26 @@ impl Builder {
     ///
     /// # Errors
     ///
-    /// Returns a [`BuildError`] if [`s3_config`](Self::s3_config) was not set.
+    /// Returns a [`BuildError`] if [`s3_config`](Self::s3_config) was not set, or if
+    /// [`memory`](Self::memory) is a [`MemoryConfig::Explicit`] pool whose capacity cannot
+    /// fund one part of the configured part size, which `Auto` takes as 8 MiB.
     pub fn build(self) -> Result<Config, BuildError> {
+        if let MemoryConfig::Explicit(pool) = &self.memory {
+            let capacity = pool.metrics().capacity_bytes();
+            let part_size = match &self.target_part_size {
+                PartSize::Target(size) => size.as_u64(),
+                PartSize::Auto => crate::runtime::sizing::DEFAULT_PART_SIZE,
+            };
+            if capacity < part_size {
+                return Err(BuildError::invalid_field(
+                    "memory",
+                    format!(
+                        "pool capacity of {capacity} bytes cannot fund one {part_size}-byte part; \
+                         raise the memory limit or lower the part size"
+                    ),
+                ));
+            }
+        }
         let s3_client_source = match (self.client, self.s3_client_config) {
             (Some(client), _) => S3ClientSource::Provided(client),
             (None, Some(config)) => S3ClientSource::FromConfig(Box::new(config)),
@@ -502,6 +520,27 @@ mod tests {
             .build()
             .expect("valid config");
         assert!(provided.runtime_http(64).is_none());
+    }
+
+    #[test]
+    fn build_rejects_pool_smaller_than_one_part() {
+        let build = |limit: ByteSize, part_size: PartSize| {
+            let pool = crate::runtime::buffer_pool::BufferPool::builder()
+                .memory_budget(MemoryBudgetConfig::Limit(limit))
+                .build()
+                .expect("valid pool");
+            Config::builder()
+                .sdk_client(aws_smithy_mocks::mock_client!(aws_sdk_s3, []))
+                .memory(MemoryConfig::Explicit(pool))
+                .part_size(part_size)
+                .build()
+        };
+
+        let auto_part = build(ByteSize::mib(4), PartSize::Auto).expect_err("4 MiB < 8 MiB");
+        assert!(auto_part.to_string().contains("memory"), "{auto_part}");
+        assert!(build(ByteSize::mib(8), PartSize::Auto).is_ok());
+        assert!(build(ByteSize::mib(8), PartSize::Target(ByteSize::mib(16))).is_err());
+        assert!(build(ByteSize::mib(16), PartSize::Target(ByteSize::mib(16))).is_ok());
     }
 
     #[test]
