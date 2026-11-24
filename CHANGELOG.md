@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Error::http_status` returns the HTTP status of a failed service response.
+
+### Changed
+
+- The `Display` of a failed HeadObject includes the HTTP status: `(404: NotFound)`, or `(403)` when
+  there is no error code. A HEAD response has no body, so S3 sends no code for most failures. Other
+  operations display as before.
+
 ### Fixed
 
 - The `aws-s3-transfer` package includes `LICENSE` and `NOTICE`, and no longer includes

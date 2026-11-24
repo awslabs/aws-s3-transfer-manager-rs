@@ -482,8 +482,6 @@ impl fmt::Display for Error {
                 write!(f, "service error")?;
                 if let Some(m) = self.service() {
                     write!(f, " calling {}", m.operation)?;
-                    // Only a failed HeadObject carries no S3 code of its own, so only it
-                    // shows the status.
                     let status = self.http_status().filter(|_| m.operation == "HeadObject");
                     match (status, m.code.as_deref()) {
                         (Some(status), Some(code)) => write!(f, " ({status}: {code})")?,
