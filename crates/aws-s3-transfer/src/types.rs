@@ -158,7 +158,7 @@ pub struct FailedUpload {
     pub(crate) error: crate::error::Error,
     /// Local filesystem path of the source file that failed to upload.
     pub(crate) source_path: Option<std::path::PathBuf>,
-    /// Object key the source file was being uploaded to.
+    /// Object key the source file maps to.
     pub(crate) key: Option<String>,
 }
 
@@ -178,10 +178,7 @@ impl FailedUpload {
         self.source_path.as_deref()
     }
 
-    /// Object key the source file was being uploaded to.
-    ///
-    /// `None` when the failure happened before the key was derived: a directory entry could not
-    /// be read, or the key could not be derived from the entry's path.
+    /// Object key the source file maps to. See [`FailedUpload`] for when this is `None`.
     pub fn key(&self) -> Option<&str> {
         self.key.as_deref()
     }
