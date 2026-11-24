@@ -1700,13 +1700,18 @@ fn transferring_snapshot(
     }
 }
 
-/// Bytes in the next chunk sliced from `remaining` at `part_size`: the reservation
-/// size for that chunk. Peek only — does not advance `remaining`.
+/// Bytes in the next chunk sliced from `remaining` at `part_size`: the
+/// reservation size for that chunk. Peek only — does not advance
+/// `remaining`.
+///
+/// # Panics
+///
+/// If `part_size` does not fit `usize`. Every source of part sizes in the
+/// download path is expected to have already rejected such a value.
 fn chunk_len(remaining: &std::ops::RangeInclusive<u64>, part_size: u64) -> usize {
-    let start = *remaining.start();
-    let end = *remaining.end();
-    let chunk_end = cmp::min(start + part_size - 1, end);
-    (chunk_end - start + 1) as usize
+    let part_len = usize::try_from(part_size).expect("part size fits usize");
+    let left = *remaining.end() - *remaining.start() + 1;
+    usize::try_from(left).map_or(part_len, |left| left.min(part_len))
 }
 
 /// Copies one transport response into reserved pooled storage.
@@ -1895,6 +1900,37 @@ mod tests {
     use aws_smithy_types::error::metadata::ErrorMetadata;
 
     const MB: u64 = 1024 * 1024;
+
+    /// `chunk_len` returns a full `part_size` chunk when the remaining
+    /// range spans the 4 GiB boundary. On a 32-bit target `len - 1` just
+    /// below the boundary exercises the `usize::try_from(left)` success
+    /// branch, and `len - 1` at or above the boundary exercises the
+    /// fallback branch; both pick `part_size`.
+    #[test]
+    fn chunk_len_does_not_truncate_a_remaining_that_crosses_four_gib() {
+        let part_size = 8 * MB;
+        let boundary = 1u64 << 32;
+        for len in [boundary - 1, boundary, boundary + 1] {
+            let range = 0..=(len - 1);
+            assert_eq!(
+                chunk_len(&range, part_size),
+                part_size as usize,
+                "len={len}"
+            );
+        }
+    }
+
+    /// The final chunk shrinks to what is left in the range, never the
+    /// configured part size. A range that ends just before the 4 GiB
+    /// boundary must still produce a non-zero, non-truncated length.
+    #[test]
+    fn chunk_len_handles_short_final_range_near_four_gib() {
+        let part_size = 8 * MB;
+        let boundary = 1u64 << 32;
+        // A range of exactly 3 bytes starting at 2^32 - 2.
+        let range = (boundary - 2)..=boundary;
+        assert_eq!(chunk_len(&range, part_size), 3);
+    }
 
     #[test]
     fn download_state_snapshot_classifies_execution_and_occupancy() {

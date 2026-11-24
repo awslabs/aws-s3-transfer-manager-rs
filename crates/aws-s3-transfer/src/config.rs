@@ -413,8 +413,23 @@ impl Builder {
     ///
     /// # Errors
     ///
-    /// Returns a [`BuildError`] if [`s3_config`](Self::s3_config) was not set.
+    /// Returns a [`BuildError`] if [`s3_config`](Self::s3_config) was not
+    /// set, or if [`part_size`](Self::part_size) is a [`PartSize::Target`]
+    /// value above `usize::MAX` on the target platform.
     pub fn build(self) -> Result<Config, BuildError> {
+        if let PartSize::Target(bytes) = self.target_part_size {
+            if usize::try_from(bytes.as_u64()).is_err() {
+                return Err(BuildError::invalid_field(
+                    "part_size",
+                    format!(
+                        "part size {bytes} exceeds the maximum \
+                         representable buffer size on this platform \
+                         ({} bytes)",
+                        usize::MAX
+                    ),
+                ));
+            }
+        }
         let s3_client_source = match (self.client, self.s3_client_config) {
             (Some(client), _) => S3ClientSource::Provided(client),
             (None, Some(config)) => S3ClientSource::FromConfig(Box::new(config)),
@@ -512,6 +527,25 @@ mod tests {
         assert!(
             error.to_string().contains("s3_config"),
             "error does not name the missing field: {error}"
+        );
+    }
+
+    /// On a 32-bit target, `Config::build` rejects a part size that does not fit `usize`.
+    #[test]
+    #[cfg(target_pointer_width = "32")]
+    fn build_part_size_rejected_above_usize_max() {
+        let too_large = (usize::MAX as u64) + 1;
+        let outcome = Config::builder()
+            .s3_config(S3ClientConfig::from_sdk_builder(s3_config_builder()))
+            .part_size(PartSize::Target(ByteSize::new(too_large)))
+            .build();
+        let error = match outcome {
+            Err(error) => error,
+            Ok(_) => panic!("expected build to reject {too_large} on 32-bit"),
+        };
+        assert!(
+            error.to_string().contains("part_size"),
+            "error does not name the invalid field: {error}",
         );
     }
 }

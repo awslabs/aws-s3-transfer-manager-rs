@@ -38,6 +38,17 @@ use crate::memory::{BufferPool, SegmentedBytes};
 /// limit (5 GB); without chunking, the body would buffer the entire payload.
 pub(crate) const FILE_BODY_CHUNK_SIZE: usize = 1024 * 1024;
 
+/// Bytes to read for the next chunk given `remaining` body bytes.
+///
+/// Bounds the value in `u64` before narrowing to `usize`, so a `remaining`
+/// value that does not fit in `usize` (e.g. `2^32` on a 32-bit target) still
+/// yields [`FILE_BODY_CHUNK_SIZE`] rather than truncating to zero. The
+/// constant fits `usize` by definition, so the final cast is lossless.
+#[inline]
+fn chunk_to_read(remaining: u64) -> usize {
+    remaining.min(FILE_BODY_CHUNK_SIZE as u64) as usize
+}
+
 /// Channel capacity for [`OffloadedFileBody`]. Bounds the number of chunks
 /// the reader task may stage ahead of the HTTP layer. Pool accounting remains
 /// authoritative when body frames are retained downstream.
@@ -182,7 +193,7 @@ impl Body for DirectFileBody {
                 ))));
             }
 
-            let to_read = (this.unread as usize).min(FILE_BODY_CHUNK_SIZE);
+            let to_read = chunk_to_read(this.unread);
             let buffer = this
                 .buffer
                 .get_or_insert_with(|| PartBuffer::new(&this.source.pool, to_read));
@@ -366,7 +377,7 @@ async fn read_task(
     let mut remaining = length;
 
     while remaining > 0 {
-        let to_read = (remaining as usize).min(FILE_BODY_CHUNK_SIZE);
+        let to_read = chunk_to_read(remaining);
         let read_offset = offset;
         let mut buffer = PartBuffer::new(&source.pool, to_read);
         if let Err(error) = poll_fn(|cx| buffer.poll_acquire(cx, to_read)).await {
@@ -985,5 +996,38 @@ mod tests {
                 .unwrap();
             assert_eq!(collect_body(body).await.unwrap(), b"through a link");
         }
+    }
+
+    /// `chunk_to_read` yields one full chunk around the 4 GiB boundary,
+    /// where a 32-bit `usize` cannot hold `remaining`.
+    #[test]
+    fn chunk_to_read_does_not_truncate_at_the_four_gib_boundary() {
+        let boundary = 1u64 << 32;
+        for remaining in [boundary - 1, boundary, boundary + 1] {
+            assert_eq!(
+                chunk_to_read(remaining),
+                FILE_BODY_CHUNK_SIZE,
+                "remaining={remaining}",
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_to_read_clamps_to_remaining_when_small() {
+        assert_eq!(chunk_to_read(0), 0);
+        assert_eq!(chunk_to_read(1), 1);
+        assert_eq!(
+            chunk_to_read(FILE_BODY_CHUNK_SIZE as u64 - 1),
+            FILE_BODY_CHUNK_SIZE - 1,
+        );
+        assert_eq!(
+            chunk_to_read(FILE_BODY_CHUNK_SIZE as u64),
+            FILE_BODY_CHUNK_SIZE,
+        );
+    }
+
+    #[test]
+    fn chunk_to_read_clamps_u64_max_to_chunk_size() {
+        assert_eq!(chunk_to_read(u64::MAX), FILE_BODY_CHUNK_SIZE);
     }
 }
