@@ -658,7 +658,8 @@ async fn test_custom_stream_uploads_segmented_part_data() {
 
 #[tokio::test]
 async fn test_custom_stream_resumes_after_part_buffer_admission() {
-    const CAPACITY: usize = 1024 * 1024;
+    // One default 8 MiB part; a smaller pool fails `Config::build`.
+    const CAPACITY: usize = 8 * 1024 * 1024;
 
     let pool = BufferPool::builder()
         .memory_budget(MemoryBudgetConfig::Limit(ByteSize::new(CAPACITY as u64)))
