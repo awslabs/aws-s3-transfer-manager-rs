@@ -11,7 +11,9 @@
     missing_docs,
     rustdoc::missing_crate_level_docs,
     unreachable_pub,
-    rust_2018_idioms
+    rust_2018_idioms,
+    // Modules with children use `foo.rs` next to a `foo/` directory, not `foo/mod.rs`.
+    clippy::mod_module_files
 )]
 
 //! Transfer Manager for Amazon S3 - a high-performance data plane client for uploading and downloading
@@ -261,7 +263,11 @@ pub mod error;
 pub mod types;
 
 /// Modeled S3 values and builders.
+// `model` and `sdk_v1` are generated directories that tools/scripts/install_model.py
+// replaces whole, each with a `mod.rs`.
+#[allow(clippy::mod_module_files)]
 pub(crate) mod model;
+#[allow(clippy::mod_module_files)]
 pub(crate) mod sdk_v1;
 
 /// Upload bodies, custom part streams, and walkers for local directories and S3 buckets.
