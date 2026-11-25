@@ -11,10 +11,10 @@
     missing_docs,
     rustdoc::missing_crate_level_docs,
     unreachable_pub,
-    rust_2018_idioms
+    rust_2018_idioms,
+    // Modules with children use `foo.rs` next to a `foo/` directory, not `foo/mod.rs`.
+    clippy::mod_module_files
 )]
-// Modules with children use `foo.rs` next to a `foo/` directory, not `foo/mod.rs`.
-#![warn(clippy::mod_module_files)]
 
 //! Transfer Manager for Amazon S3 - a high-performance data plane client for uploading and downloading
 //! objects and directories.
