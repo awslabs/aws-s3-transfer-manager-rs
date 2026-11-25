@@ -1,9 +1,12 @@
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
 
 name: CI
 
 # Allow one instance of this workflow per pull request, and cancel older runs when new changes are pushed
+# Each merge group has its own commit, so merge queue runs never cancel each other.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
@@ -109,7 +112,8 @@ jobs:
       - name: Detect release preparation
         id: changes
         env:
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # In a merge group, HEAD^1 is main plus the pull requests ahead of this one.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || 'HEAD^1' }}
         run: |
           if git diff --quiet "$PR_BASE_SHA" HEAD -- release.toml; then
             echo "record=false" >> "$GITHUB_OUTPUT"
