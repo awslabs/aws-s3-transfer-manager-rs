@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Error::http_status` returns the HTTP status of a failed service response.
+
+### Changed
+
+- The `Display` of a failed HeadObject includes the HTTP status: `(404: NotFound)`, or `(403)` when
+  there is no error code. A HEAD response has no body, so S3 sends no code for most failures. Other
+  operations display as before.
+- `Config::builder().build()` returns an error when `MemoryConfig::Explicit` is a pool smaller than
+  one part of the configured part size (8 MiB when `Auto`), and `ConfigLoader::load` panics. Such a
+  client used to build, and every transfer then failed with `ErrorKind::RuntimeError`.
+
+### Fixed
+
+- The `aws-s3-transfer` package includes `LICENSE` and `NOTICE`, and no longer includes
+  development-only files such as `.gitignore`, `proptest-regressions/`, the external-types
+  configurations and the integration tests.
+- `aws-smithy-topology` requires `many_cpus` 2.4.16 or later instead of exactly 2.4.16.
+- Declared minimum dependency versions are raised to the versions the dependency graph needs, so a
+  build that resolves each dependency to its declared minimum succeeds.
+
 ## [release-2026-11-18]
 
 Transfer Manager for Amazon S3 1.0.0 is published as `aws-s3-transfer`, renamed from

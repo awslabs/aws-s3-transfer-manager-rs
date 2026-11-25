@@ -49,6 +49,8 @@ jobs:
       - clippy
       - docs
       - minrust
+      - package-checks
+      - minimal-versions
       - sdk-floor
       - check-external-types
       - check-deny
@@ -688,6 +690,54 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: "check --workspace"
         run: cargo check --locked --workspace --all-features
+        env:
+          RUSTFLAGS: "" # remove -Dwarnings
+
+  package-checks:
+    name: package checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_stable }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_stable }}
+      - name: Every publishable crate packages LICENSE and NOTICE
+        run: |
+          status=0
+          for crate in $(cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.publish != []) | .name'); do
+            files=$(cargo package --list --allow-dirty -p "$crate")
+            for f in LICENSE NOTICE; do
+              grep -qx "$f" <<<"$files" || { echo "$crate: $f missing from package" >&2; status=1; }
+            done
+          done
+          exit $status
+
+  minimal-versions:
+    # Every other job builds the lockfile's newest versions, which hide a declared floor that is
+    # lower than what the dependency graph needs.
+    name: direct minimal versions
+    needs: basics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.rust_min }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.rust_min }}
+      - name: Install Rust ${{ env.rust_nightly }}
+        run: rustup toolchain install "$rust_nightly" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      # Internal members declare floors that never reach a customer's graph.
+      - name: Resolve the published crates to their declared minimums
+        run: |
+          sed -i '/# internal/,/^]/{/^]/!d}' Cargo.toml
+          cargo "+$rust_nightly" update -Z direct-minimal-versions
+      - name: check --workspace at MSRV
+        run: cargo check --workspace --all-features --tests
         env:
           RUSTFLAGS: "" # remove -Dwarnings
 

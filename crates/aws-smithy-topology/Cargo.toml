@@ -15,8 +15,8 @@ keywords = ["aws", "smithy", "topology", "numa"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-many_cpus = { version = "=2.4.16", default-features = false }
+many_cpus = { version = "2.4.16", default-features = false }
 
 [dev-dependencies]
-many_cpus = { version = "=2.4.16", default-features = false, features = ["test-util"] }
+many_cpus = { version = "2.4.16", default-features = false, features = ["test-util"] }
 tempfile = "3.27.0"
